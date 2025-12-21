@@ -201,7 +201,6 @@ def train_alternating(opt):
             )
             resume_epoch = int(e)
             print(f"✓ reprise depuis epoch {e}")
-            # Optionnel : tu peux aussi ajuster state["epoch"] plus bas si tu veux reprendre exactement
 
     out_dir = Path(opt.save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -262,7 +261,10 @@ def train_alternating(opt):
     for p in state["T_B"].parameters():
         p.requires_grad_(False)
 
-    # --- Branche de contenu sémantique (ResNet50 + MoCo + JEPA-content) ---
+    # =====================================================================================
+    #  SEMANTIC CONTENT BRANCH (ResNet50 + MoCo + optional JEPA-content)
+    #  + NEW: load external pretrained weights path (e.g., MoCo v3 resnet50 checkpoint)
+    # =====================================================================================
     sem_enable = bool(getattr(opt, "sem_content", False) and mode == "auto")
     state["SEM"] = None
     state["opt_SEM"] = None
@@ -277,9 +279,18 @@ def train_alternating(opt):
         )
 
         # Quand sem_content est actif, on redirige JEPA-content vers la branche sémantique
-        # et on désactive JEPA-content sur les features UNet (trop "brutes"/locales).
-        jepa_on_content_raw = bool(getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False))
+        jepa_on_content_raw = bool(
+            getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False)
+        )
         sem_jepa_on = bool(jepa_on_content_raw)
+
+        # >>> NEW OPTIONS (semantic_moco_jepa.py updated):
+        #   opt.sem_pretrained_path: path to external checkpoint (MoCo v3, etc.)
+        #   opt.sem_pretrained_strict: strict load_state_dict for backbone (default 0)
+        #   opt.sem_pretrained_verbose: print logs (default 1)
+        sem_pretrained_path = getattr(opt, "sem_pretrained_path", None)
+        sem_pretrained_strict = bool(int(getattr(opt, "sem_pretrained_strict", 0)) != 0)
+        sem_pretrained_verbose = bool(int(getattr(opt, "sem_pretrained_verbose", 1)) != 0)
 
         sem_model = SemanticMoCoJEPA(
             dim=int(getattr(opt, "sem_dim", 256)),
@@ -288,6 +299,9 @@ def train_alternating(opt):
             m=float(getattr(opt, "sem_m", 0.999)),
             T=float(getattr(opt, "sem_t", 0.2)),
             pretrained=bool(int(getattr(opt, "sem_pretrained", 1)) != 0),
+            pretrained_path=sem_pretrained_path,
+            pretrained_strict=sem_pretrained_strict,
+            pretrained_verbose=sem_pretrained_verbose,
             aug_cfg=aug_cfg,
             img_size=int(getattr(opt, "crop_size", 256)),
             jepa_use=sem_jepa_on,
@@ -302,10 +316,17 @@ def train_alternating(opt):
         sem_params = [p for p in sem_model.parameters() if p.requires_grad]
         _lr_sem = getattr(opt, "lr_sem", None)
         sem_lr = float(_lr_sem) if _lr_sem is not None else float(getattr(opt, "lr", 2e-4))
-        opt_sem = torch.optim.AdamW(sem_params, lr=sem_lr, betas=(0.9, 0.999), weight_decay=1e-4)
+        opt_sem = torch.optim.AdamW(
+            sem_params, lr=sem_lr, betas=(0.9, 0.999), weight_decay=1e-4
+        )
 
         state["SEM"] = sem_model
         state["opt_SEM"] = opt_sem
+
+        print(
+            f"[SEM] sem_content enabled | pretrained={getattr(opt, 'sem_pretrained', 1)} "
+            f"| sem_pretrained_path={sem_pretrained_path} | strict={int(sem_pretrained_strict)}"
+        )
 
     # --- Si reprise et SEM activé : charger aussi la branche sémantique ---
     if sem_enable and (resume_epoch is not None) and state.get("SEM", None) is not None:
@@ -350,8 +371,8 @@ def train_alternating(opt):
     layer_w = [
         float(w)
         for w in (
-                getattr(opt, "nce_layer_weights", None)
-                or ",".join(["1"] * len(nce_layers))
+            getattr(opt, "nce_layer_weights", None)
+            or ",".join(["1"] * len(nce_layers))
         ).split(",")
     ]
     if len(layer_w) < len(nce_layers):
@@ -402,22 +423,19 @@ def train_alternating(opt):
     cfg["spectral_noise"] = spectral_noise
 
     # --- Style A / B + gains (avec scheduler pour λ_style_A) ---
-    # Valeurs brutes venant des options
     λ_style_max = float(getattr(opt, "style_lambda", 10.0))
     λ_style_min = float(getattr(opt, "style_lambda_min", λ_style_max))
     style_sched_type = str(getattr(opt, "style_lambda_sched", "none")).lower().strip()
     style_warmup_ep = int(getattr(opt, "style_lambda_warmup", 0))
 
-    # Config du scheduler de style (utilisé par get_style_lambda)
     cfg["style_sched"] = {
         "lambda_max": λ_style_max,
         "lambda_min": λ_style_min,
-        "type": style_sched_type,  # 'none' | 'linear' | 'cosine' | 'exp' | 'piecewise'
+        "type": style_sched_type,
         "warmup_epochs": style_warmup_ep,
         "T_total": int(getattr(opt, "epochs", 1)),
     }
 
-    # Valeur initiale par défaut (sera mise à jour à chaque epoch par get_style_lambda)
     cfg["λ_style_A"] = λ_style_max
     cfg["style_gain_A"] = float(getattr(opt, "style_gain_A", cfg["λ_style_A"]))
 
@@ -472,7 +490,9 @@ def train_alternating(opt):
     cfg["sem_two_styles"] = bool(getattr(opt, "sem_two_styles", False))
     cfg["sem_detach_far"] = int(getattr(opt, "sem_detach_far", 1))
     cfg["sem_use_aug"] = bool(getattr(opt, "sem_use_aug", False))
-    cfg["sem_jepa_on"] = bool(sem_enable and getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False))
+    cfg["sem_jepa_on"] = bool(
+        sem_enable and getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False)
+    )
 
     cfg["jepa_on"] = jepa_on_style or jepa_on_content
 
@@ -635,14 +655,10 @@ def train_alternating(opt):
             else:
                 λ_style_now = cfg.get("λ_style_A", λ_style_max)
         except Exception:
-            # en cas de problème, on garde la valeur max par défaut
             λ_style_now = cfg.get("λ_style_A", λ_style_max)
 
         cfg["λ_style_A"] = float(λ_style_now)
-        # style_gain_A : soit verrouillé à λ_style_A, soit fixé via opt.style_gain_A
-        cfg["style_gain_A"] = float(
-            getattr(opt, "style_gain_A", cfg["λ_style_A"])
-        )
+        cfg["style_gain_A"] = float(getattr(opt, "style_gain_A", cfg["λ_style_A"]))
 
         budgets = cycle_sched.budgets()
         print(
@@ -699,9 +715,9 @@ def train_alternating(opt):
 
                     # --- Sauvegarde en mode "step" ---
                     if (
-                            save_freq_mode == "step"
-                            and save_freq_interval is not None
-                            and state["global_step"] % save_freq_interval == 0
+                        save_freq_mode == "step"
+                        and save_freq_interval is not None
+                        and state["global_step"] % save_freq_interval == 0
                     ):
                         save_checkpoint(
                             epoch,
@@ -718,12 +734,7 @@ def train_alternating(opt):
                             sem_model=state.get("SEM", None),
                             opt_sem=state.get("opt_SEM", None),
                         )
-                        save_state_json(
-                            epoch,
-                            state["global_step"],
-                            opt,
-                            Path(opt.save_dir),
-                        )
+                        save_state_json(epoch, state["global_step"], opt, Path(opt.save_dir))
 
                 except Exception as ex:
                     msg = (
@@ -765,11 +776,10 @@ def train_alternating(opt):
                 global_step=state["global_step"],
             )
 
-            # Sauvegarde step possible aussi pendant la phase C
             if (
-                    save_freq_mode == "step"
-                    and save_freq_interval is not None
-                    and state["global_step"] % save_freq_interval == 0
+                save_freq_mode == "step"
+                and save_freq_interval is not None
+                and state["global_step"] % save_freq_interval == 0
             ):
                 save_checkpoint(
                     epoch,
@@ -786,12 +796,7 @@ def train_alternating(opt):
                     sem_model=state.get("SEM", None),
                     opt_sem=state.get("opt_SEM", None),
                 )
-                save_state_json(
-                    epoch,
-                    state["global_step"],
-                    opt,
-                    Path(opt.save_dir),
-                )
+                save_state_json(epoch, state["global_step"], opt, Path(opt.save_dir))
 
         # --- EMA pour D_B éventuel ---
         if ema_tau > 0:
@@ -822,7 +827,6 @@ def train_alternating(opt):
             if (epoch + 1) % save_freq_interval == 0:
                 do_save_epoch = True
         elif save_freq_mode in ("none", "step"):
-            # En mode 'none' ou 'step', on garde au moins le dernier epoch
             if (epoch + 1) == opt.epochs:
                 do_save_epoch = True
 

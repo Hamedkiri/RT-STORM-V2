@@ -1,6 +1,6 @@
 # data.py
 import os, json, random
-from typing import Optional
+from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 
 import torch
@@ -8,12 +8,79 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import datasets, transforms
 from PIL import Image
 
+
+# -----------------------------
+# Utils
+# -----------------------------
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+def is_image_path(p: Path) -> bool:
+    return p.suffix.lower() in IMG_EXTS
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.benchmark = True
+
+
+# -----------------------------
+# Unlabeled dataset (folder flat)
+# -----------------------------
+class UnlabeledImageDataset(Dataset):
+    """
+    Dataset pour auto-supervisé quand on a un dossier SANS classes.
+    - root peut contenir des images directement OU en sous-dossiers arbitraires.
+    - retourne (image_tensor, 0)
+    """
+    def __init__(self, root: str, transform=None, recursive: bool = True):
+        self.root = str(root)
+        self.transform = transform
+        root_p = Path(self.root)
+
+        if not root_p.exists():
+            raise FileNotFoundError(f"[UnlabeledImageDataset] root introuvable: {self.root}")
+
+        if recursive:
+            paths = [p for p in root_p.rglob("*") if p.is_file() and is_image_path(p)]
+        else:
+            paths = [p for p in root_p.glob("*") if p.is_file() and is_image_path(p)]
+
+        if len(paths) == 0:
+            raise FileNotFoundError(
+                f"[UnlabeledImageDataset] Aucune image trouvée dans: {self.root} "
+                f"(extensions supportées: {sorted(list(IMG_EXTS))})"
+            )
+
+        self.samples = [str(p) for p in sorted(paths)]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, 0  # label dummy
+
+
+# -----------------------------
+# JSON datasets (supervised multitask / or unsupervised paths-only)
+# -----------------------------
 class MultiTaskDataset(torch.utils.data.Dataset):
+    """
+    Dataset multitâche supervisé basé sur:
+      - data_json: dict {folder: {img_name: {image_path: ..., task1:..., task2:...}}}
+      - classes_json: dict {task: [class names]}
+    Retourne: (img_tensor, labels_dict)
+    """
     def __init__(self, data_json, classes_json, transform=None, search_folder=None, find_images_by_sub_folder=None):
         with open(data_json, 'r') as f:
             self.data = json.load(f)
         with open(classes_json, 'r') as f:
             self.classes = json.load(f)
+
         self.transform = transform
         self.search_folder = search_folder
         self.find_images_by_sub_folder = find_images_by_sub_folder
@@ -33,8 +100,6 @@ class MultiTaskDataset(torch.utils.data.Dataset):
                 if self.search_folder:
                     image_identifier = os.path.join(self.search_folder, os.path.basename(orig_path))
                 elif self.find_images_by_sub_folder:
-                    # Extraire le sous-dossier juste avant le nom de l'image dans le chemin d'origine
-                    # ex: .../training_13052025/sun/2025xxx.jpg -> subfolder = 'sun'
                     subfolder = os.path.basename(os.path.dirname(orig_path))
                     image_identifier = os.path.join(
                         self.find_images_by_sub_folder,
@@ -48,12 +113,13 @@ class MultiTaskDataset(torch.utils.data.Dataset):
                 for task in self.classes:
                     label_val = img_info.get(task)
                     if label_val is not None:
-                        lbl = label_val.lower()
+                        lbl = str(label_val).lower()
                         labels[task] = self.class_to_idx[task].get(lbl)
                         if labels[task] is None:
                             print(f"Warning: label '{lbl}' for task '{task}' not found")
                     else:
                         labels[task] = None
+
                 self.samples.append((image_identifier, labels))
 
     def __len__(self):
@@ -69,14 +135,76 @@ class MultiTaskDataset(torch.utils.data.Dataset):
         return img, labels
 
 
-def set_seed(seed=42):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.backends.cudnn.benchmark = True
+class UnsupervisedJsonDataset(Dataset):
+    """
+    Dataset auto-supervisé basé sur data_json, sans classes_json.
+    Il ignore tout sauf image_path.
+    Retourne (img_tensor, 0)
+    """
+    def __init__(self, data_json: str, transform=None, search_folder=None, find_images_by_sub_folder=None):
+        with open(data_json, "r") as f:
+            data = json.load(f)
+
+        self.transform = transform
+        self.samples = []
+        self.search_folder = search_folder
+        self.find_images_by_sub_folder = find_images_by_sub_folder
+
+        for folder, images in data.items():
+            for img_name, img_info in images.items():
+                orig_path = img_info["image_path"]
+                if self.search_folder:
+                    path = os.path.join(self.search_folder, os.path.basename(orig_path))
+                elif self.find_images_by_sub_folder:
+                    subfolder = os.path.basename(os.path.dirname(orig_path))
+                    path = os.path.join(self.find_images_by_sub_folder, subfolder, os.path.basename(orig_path))
+                else:
+                    path = orig_path
+                self.samples.append(path)
+
+        if len(self.samples) == 0:
+            raise RuntimeError(f"[UnsupervisedJsonDataset] Aucun sample dans {data_json}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path = self.samples[idx]
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Image not found: {path}")
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, 0
 
 
+# -----------------------------
+# ImageFolder structure detection
+# -----------------------------
+def _has_class_subfolders(root: str) -> bool:
+    """
+    Détecte si root ressemble à un ImageFolder:
+    root/
+      classA/...
+      classB/...
+    """
+    rp = Path(root)
+    if (not rp.exists()) or (not rp.is_dir()):
+        return False
+    subdirs = [p for p in rp.iterdir() if p.is_dir()]
+    if len(subdirs) == 0:
+        return False
+    # au moins un sous-dossier qui contient une image
+    for sd in subdirs:
+        for f in sd.rglob("*"):
+            if f.is_file() and is_image_path(f):
+                return True
+    return False
 
 
+# -----------------------------
+# Main: build_dataloader
+# -----------------------------
 def build_dataloader(opt):
     """
     Retourne une **liste** de DataLoader, de longueur k_folds.
@@ -95,7 +223,7 @@ def build_dataloader(opt):
         return []
 
     # ------------------------------------------------------------------
-    # 2) Cas normal : auto-supervisé / style → on construit le dataset
+    # 2) Transforms (comme avant)
     # ------------------------------------------------------------------
     tf = transforms.Compose([
         transforms.Resize(286, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -105,47 +233,77 @@ def build_dataloader(opt):
         transforms.Normalize([0.5] * 3, [0.5] * 3),
     ])
 
-    data_json   = getattr(opt, "data_json", None)
+    data_json    = getattr(opt, "data_json", None)
     classes_json = getattr(opt, "classes_json", None)
-    data_root   = getattr(opt, "data", None)
+    data_root    = getattr(opt, "data", None)
 
-    # ------- 1. Construction du Dataset complet ----------
-    if data_json:                       # --- mode JSON ---
-        assert classes_json, "--classes_json requis avec --data_json"
-        full_ds = MultiTaskDataset(
-            data_json=data_json,
-            classes_json=classes_json,
-            transform=tf,
-            search_folder=getattr(opt, "search_folder", None),
-            find_images_by_sub_folder=getattr(opt, "find_images_by_sub_folder", None),
-        )
-    else:                               # --- mode dossier ---
+    # ------------------------------------------------------------------
+    # 3) Construction dataset
+    # ------------------------------------------------------------------
+    if data_json:
+        # JSON mode
+        if classes_json:
+            full_ds = MultiTaskDataset(
+                data_json=data_json,
+                classes_json=classes_json,
+                transform=tf,
+                search_folder=getattr(opt, "search_folder", None),
+                find_images_by_sub_folder=getattr(opt, "find_images_by_sub_folder", None),
+            )
+        else:
+            # Auto-supervisé: pas besoin des classes
+            full_ds = UnsupervisedJsonDataset(
+                data_json=data_json,
+                transform=tf,
+                search_folder=getattr(opt, "search_folder", None),
+                find_images_by_sub_folder=getattr(opt, "find_images_by_sub_folder", None),
+            )
+    else:
+        # Folder mode
         if data_root is None:
             raise ValueError(
                 "Ni --data_json ni --data n'ont été fournis, "
                 "et le mode n'est pas 'detect_*'. Impossible de construire le dataset."
             )
-        full_ds = datasets.ImageFolder(root=data_root, transform=tf)
 
-    # ------- 2. Découpage k-folds (shuffle stable) -------
+        # ✅ Fix principal : si pas de folders classes → dataset unlabeled
+        if _has_class_subfolders(data_root):
+            full_ds = datasets.ImageFolder(root=data_root, transform=tf)
+        else:
+            # Auto-supervisé / style: on accepte un dossier flat
+            # (et même en hybrid/sup_freeze on avertit)
+            if mode in ("hybrid", "sup_freeze"):
+                print(
+                    "[WARN][data] mode supervisé/hybride mais dataset sans classes détecté. "
+                    "La phase C risque de ne pas fonctionner. Utilise --data_json/--classes_json ou un ImageFolder."
+                )
+            full_ds = UnlabeledImageDataset(root=data_root, transform=tf, recursive=True)
+
+    # ------------------------------------------------------------------
+    # 4) k-fold split
+    # ------------------------------------------------------------------
     k = max(1, int(getattr(opt, "k_folds", 1)))
     if k == 1:
         subsets = [full_ds]
     else:
         indices = list(range(len(full_ds)))
-        seed_val = getattr(opt, "seed", 42)  # valeur par défaut
+        seed_val = getattr(opt, "seed", 42)
         random.Random(seed_val).shuffle(indices)
 
         fold_sizes = [len(indices) // k] * k
         for i in range(len(indices) % k):
             fold_sizes[i] += 1
+
         splits, pos = [], 0
         for sz in fold_sizes:
-            splits.append(indices[pos:pos+sz])
+            splits.append(indices[pos:pos + sz])
             pos += sz
+
         subsets = [Subset(full_ds, idxs) for idxs in splits]
 
-    # ------- 3. DataLoaders --------------------------------
+    # ------------------------------------------------------------------
+    # 5) Dataloaders
+    # ------------------------------------------------------------------
     loaders = [
         DataLoader(
             sub,
@@ -153,27 +311,32 @@ def build_dataloader(opt):
             shuffle=True,
             num_workers=getattr(opt, "num_workers", 4),
             drop_last=True,
+            pin_memory=True,
         )
         for sub in subsets
     ]
     return loaders
 
 
-
-
 def infer_tasks_from_dataset(loader, opt):
     # récupère le dataset réel si Subset
     ds = loader.dataset.dataset if isinstance(loader.dataset, torch.utils.data.Subset) else loader.dataset
+
     # MultiTaskDataset -> .task_classes: dict {task: [class names]}
     if hasattr(ds, "task_classes") and isinstance(ds.task_classes, dict) and ds.task_classes:
         return {task: len(cls_list) for task, cls_list in ds.task_classes.items()}
+
     # ImageFolder -> .classes: list
     if hasattr(ds, "classes") and isinstance(ds.classes, (list, tuple)) and len(ds.classes) > 0:
         return {"default": len(ds.classes)}
-    # fallback
+
+    # UnlabeledImageDataset / UnsupervisedJsonDataset -> fallback
     return {"default": int(getattr(opt, "sup_num_classes", 2))}
 
 
+# ---------------------------------------------------------------------------------------
+# (Le reste : CocoStyleDetectionDataset + build_detection_dataloader inchangé)
+# ---------------------------------------------------------------------------------------
 
 class CocoStyleDetectionDataset(Dataset):
     """
@@ -181,13 +344,6 @@ class CocoStyleDetectionDataset(Dataset):
       - ann_file : JSON avec "images", "annotations", "categories"
       - img_root : dossier contenant les images
     Chaque item retourne : image_tensor, target_dict
-      target = {
-        "boxes": Tensor[n, 4] en xyxy (pixels),
-        "labels": Tensor[n],
-        "image_id": Tensor[1],
-        "area": Tensor[n],
-        "iscrowd": Tensor[n]
-      }
     """
     def __init__(self, img_root, ann_file, transforms=None, class_ids=None):
         super().__init__()
@@ -198,18 +354,14 @@ class CocoStyleDetectionDataset(Dataset):
         with open(ann_file, "r") as f:
             coco = json.load(f)
 
-        # mapping image_id -> infos
         self.images = {img["id"]: img for img in coco["images"]}
 
-        # mapping cat_id -> idx [1..num_classes]
         cats = coco.get("categories", [])
         if class_ids is None:
             self.cat2label = {c["id"]: i + 1 for i, c in enumerate(cats)}
         else:
-            # si tu veux imposer un ordre / sous-ensemble
             self.cat2label = {cid: i + 1 for i, cid in enumerate(class_ids)}
 
-        # regroupe les annotations par image_id
         self.ann_by_img = {img_id: [] for img_id in self.images.keys()}
         for ann in coco["annotations"]:
             img_id = ann["image_id"]
@@ -219,7 +371,6 @@ class CocoStyleDetectionDataset(Dataset):
                 continue
             self.ann_by_img[img_id].append(ann)
 
-        # liste d'ids triés pour un index stable
         self.ids = sorted(self.images.keys())
 
     def __len__(self):
@@ -234,10 +385,7 @@ class CocoStyleDetectionDataset(Dataset):
         img = Image.open(path).convert("RGB")
 
         anns = self.ann_by_img.get(img_id, [])
-        boxes = []
-        labels = []
-        area = []
-        iscrowd = []
+        boxes, labels, area, iscrowd = [], [], [], []
 
         for ann in anns:
             x, y, w, h = ann["bbox"]
@@ -268,49 +416,24 @@ class CocoStyleDetectionDataset(Dataset):
 
 
 def det_collate_fn(batch):
-    """
-    Collate pour détection :
-      batch = [(img, target), ...]
-    """
     imgs = [b[0] for b in batch]
     targets = [b[1] for b in batch]
     return torch.stack(imgs, dim=0), targets
 
 
 def build_detection_dataloader(opt):
-    """
-    Construit les DataLoader pour la détection à partir d'options genre :
+    from torchvision import transforms as T
 
-      opt.det_train_img_root
-      opt.det_train_ann
-      opt.det_val_img_root
-      opt.det_val_ann
-      opt.batch_size
-      opt.num_workers
-
-    On suppose que les transforms de base sont les mêmes que pour ton style,
-    sinon tu peux adapter ici.
-    """
-    from torchvision import transforms
-
-    train_tf = transforms.Compose([
-        transforms.Resize((getattr(opt, "det_img_h", 256),
-                           getattr(opt, "det_img_w", 256))),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.5, 0.5, 0.5],
-            std=[0.5, 0.5, 0.5],
-        ),
+    train_tf = T.Compose([
+        T.Resize((getattr(opt, "det_img_h", 256), getattr(opt, "det_img_w", 256))),
+        T.ToTensor(),
+        T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
-    val_tf = transforms.Compose([
-        transforms.Resize((getattr(opt, "det_img_h", 256),
-                           getattr(opt, "det_img_w", 256))),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.5, 0.5, 0.5],
-            std=[0.5, 0.5, 0.5],
-        ),
+    val_tf = T.Compose([
+        T.Resize((getattr(opt, "det_img_h", 256), getattr(opt, "det_img_w", 256))),
+        T.ToTensor(),
+        T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
     train_ds = CocoStyleDetectionDataset(
