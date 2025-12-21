@@ -1,0 +1,96 @@
+python CUT_Destroy_reconstruction_SPADE_SEAN_fine_improve.py   --data_json /media/hamed/8TO_2/sauvegardes_28_06_2024/Annotations_files/fusion/4FOUR/fusion_annotations20062025.json    --epochs 200 --save_freq 10   --save_dir all_data_30082025   --tb   --k_folds 2   --nce_layers "bot,skip64,skip32"   --nce_layer_weights "1,1,1"   --ema_tau 0.00    --adv_boost 0 --b_boost 0   --style_lambda 10   --lambda_nce_a_mix 0   --lambda_nce_b 10   --lambda_reg_a_mix 0.0   --lambda_idt_b 10   --nce_intra --nce_inter --skip_amix   --nce_max_patches 100    --lambda_nce_a_adv 0.5   --lambda_reg_a_adv 0.05   --fold_epochs 4   --mode auto      --sup_feat_type tok6   --feat_switch_epoch 4   --tex_sigma 3   --tex_gamma 2   --tex_use_fft 1   --tex_use_swd 1  --adv_enable_A 1  --mixswap_fft_p 0.3   --jepa_tokens    --sup_tasks_json datas/classes_small.json --lambda_jepa 0.5  --classes_json datas/classes.json
+
+
+ python main.py  --data /media/hamed/8TO_2/weather_measure/four_classification_17062024/train    --epochs 200 --save_freq 10   --save_dir fast_test   --tb   --k_folds 2   --nce_layers "bot,skip64,skip32"   --nce_layer_weights "1,1,1"   --ema_tau 0.00    --adv_boost 0 --b_boost 0   --style_lambda 10   --lambda_nce_a_mix 0   --lambda_nce_b 10   --lambda_reg_a_mix 0.0   --lambda_idt_b 10   --nce_intra --nce_inter --skip_amix   --nce_max_patches 100    --lambda_nce_a_adv 0.5   --lambda_reg_a_adv 0.05   --fold_epochs 4   --mode auto      --sup_feat_type tok6   --feat_switch_epoch 4   --tex_sigma 3   --tex_gamma 2   --tex_use_fft 1   --tex_use_swd 1  --adv_enable_A 1  --mixswap_fft_p 0.3   --jepa_tokens    --sup_tasks_json datas/classes_small.json --lambda_jepa 0.5  --classes_json datas/classes.json --jepa_every 1 --style_gain_A 10
+
+
+ python main.py   --mode sup_freeze   --resume_dir old_weight   --save_dir X_cls   --data /media/hamed/8TO_2/sauvegardes_28_06_2024/other_dataset/PetImages/train --freeze_backbone 1 --sup_feat_type cont_tok
+
+
+ python main.py   --data /media/hamed/8TO_2/weather_measu
+re/four_classification_17062024/train   --epochs 200   --save_freq 100   --save_dir Self_Learning_07122025_amp_fft   --tb   --k_folds 2   --nce_layers "bot,skip64,skip32"   --nce_layer_weights "1,1,1"   --ema_tau 0.00   --adv_boost 1   --b_boost 1   --style_lambda 10   --lambda_nce_a_mix 0   --lambda_nce_b 10   --lambda_reg_a_mix 0.0   --lambda_idt_b 10   --nce_intra   --nce_inter   --skip_amix   --nce_max_patches 100   --lambda_nce_a_adv 0.5   --lambda_reg_a_adv 0.05   --fold_epochs 4   --mode auto   --sup_feat_type tok6   --feat_switch_epoch 4     --tex_enable   --tex_apply_A   --tex_sigma 4   --tex_gamma 2   --tex_use_fft   --tex_use_swd     --adv_enable_A       --mixswap_enable   --mixswap_token_p 0.7   --mixswap_fft_p 0.3     --jepa_tokens   --sup_tasks_json datas/classes_small.json   --lambda_jepa 0.5   --classes_json data/Tasks.json     --jepa_on_style    --adv_type "lsgan" --style_lambda 50 --style_lambda_min 5 --style_lambda_sched "linear" --jepa_on_style --jepa_on_content --content_nce_enable --lambda_content_
+nce 1 --replay_size 1000 --replay_ratio 0.1
+
+ python main.py \
+  --data_json /media/sti-innovators/HDD_4TO_1/dataset_principal/Weather_detection/training_13052025/Annotations_new_20062025/All/train_test_heterogeneity/train.json \
+  --epochs 200 \
+  --save_freq 10 \
+  --save_dir Self_Learning_07122025_amp_fft \
+  --tb \
+  --k_folds 2 \
+  --nce_layers "bot,skip64,skip32" \
+  --nce_layer_weights "1,1,1" \
+  --ema_tau 0.00 \
+  --adv_boost 1 \
+  --b_boost 1 \
+  --style_lambda 10 \
+  --lambda_nce_a_mix 0 \
+  --lambda_nce_b 10 \
+  --lambda_reg_a_mix 0.0 \
+  --lambda_idt_b 10 \
+  --nce_intra \
+  --nce_inter \
+  --skip_amix \
+  --nce_max_patches 100 \
+  --lambda_nce_a_adv 0.5 \
+  --lambda_reg_a_adv 0.05 \
+  --fold_epochs 4 \
+  --mode auto \
+  --sup_feat_type tok6 \
+  --feat_switch_epoch 4 \
+  \
+  --tex_enable \
+  --tex_apply_A \
+  --tex_sigma 3 \
+  --tex_gamma 2 \
+  --tex_use_fft \
+  --tex_use_swd \
+  \
+  --adv_enable_A \
+  --adv_enable_B \
+  \
+  --mixswap_enable \
+  --mixswap_token_p 0.7 \
+  --mixswap_fft_p 0.3 \
+  \
+  --jepa_tokens \
+  --sup_tasks_json datas/classes_small.json \
+  --lambda_jepa 0.5 \
+  --classes_json data/Tasks.json \
+  --content_nce_enable \
+  --lambda_content_nce 1.0 \
+  --jepa_on_style \
+  --jepa_on_content
+
+
+  $ python CUT_Destroy_reconstruction_SPADE_SEAN_fine_improve.p
+y   --data /media/sti-innovators/HDD_4TO_1/dataset_principal/other_dataset/archive_cat_dog/training_set/training_set    --epochs 200 --save_freq 10   --save_dir Self_learning_Cat_Dog   --tb   --k_folds 2   --nce_layers "bot,skip64,skip32"   --nce_layer_weights "1,1,1"   --ema_tau 0.00    --adv_boost 0 --b_boost 0   --style_lambda 10   --lambda_nce_a_mix 0   --lambda_nce_b 10   --lambda_reg_a_mix 0.0   --lambda_idt_b 10   --nce_intra --nce_inter --skip_amix   --nce_max_patches 100    --lambda_nce_a_adv 0.5   --lambda_reg_a_adv 0.05   --fold_epochs 4   --mode auto      --sup_feat_type tok6      --tex_sigma 4   --tex_gamma 2   --tex_use_fft 1    --tex_use_swd 1  --adv_enable_A 1  --mixswap_fft_p 0.3   --jepa_tokens    --sup_tasks_json datas/classes_small.json --lambda_jepa 0.5  --classes_json datas/classes.json
+
+
+
+
+
+Pour ta tête custom (UNet + SimpleDETRHead) :
+"det_head_type": "simple_unet",
+"det_feat_branch": "content",
+"det_freeze_backbone": false,
+"save_freq": "epoch:5"
+
+
+Pour DETR ResNet50 (torchvision) :
+
+"det_head_type": "detr_resnet50",
+"det_freeze_backbone": false,
+"save_freq": "step:1000"
+
+python main.py   --mode detect_transformer   --save_dir X_detection_content   --batch_size 4   --det_train_img_root /media/sti-innovators/HDD_4TO_1/coco/coco_datasets/train2017   --det_train_ann /media/sti-innovators/HDD_4TO_1/coco/coco_datasets/annotations_trainval2017/annotations/instances_train2017.json   --det_val_img_root /media/sti-innovators/HDD_4TO_1/coco/coco_datasets/val2017   --det_val_ann /media/sti-innovators/HDD_4TO_1/coco/coco_datasets/annotations_trainval2017/annotations/instances_val2017.json   --det_feat_branch content   --det_num_classes 91   --det_epochs 20   --det_lr 1e-4   --det_weight_decay 1e-4 --resume_dir Self_Learning_07122025 --det_backbone_ckpt Self_Learning_07122025/G_B_epoch9.pt --det_freeze_backbone 1
+
+
+
+
+
+
+
+
+
+

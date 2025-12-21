@@ -1,0 +1,17 @@
+style_project/
+├── train_style_disentangle.py        # script principal (CLI)
+├── data.py                           # datasets + dataloaders (style)
+├── models/
+│   ├── __init__.py
+│   ├── generator.py                  # UNetGenerator
+│   ├── discriminator.py              # PatchDiscriminator
+│   ├── backbone.py                   # ConvBlock, Down, ResBlock, SPADELayer, StylePyramidEncoder
+│   ├── sup_heads.py                  # SupHeads + ScaleMixer
+│   ├── jepa.py                       # TokenJEPA
+│   └── losses_nce.py                 # PatchNCELoss
+├── training/
+│   ├── scheduler.py                  # CycleScheduler
+│   ├── checkpoint.py                 # last_epoch / save_checkpoint / load_checkpoint / save_state_json
+│   ├── texture_fft_swd.py            # fft_texture_loss, swd_loss_images, spectral_noise, etc.
+│   └── adv_utils.py                  # fonctions D/G adversarial + highpass
+├── helpers.py

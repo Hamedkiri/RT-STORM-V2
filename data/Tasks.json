@@ -1,0 +1,78 @@
+{
+  "Weather Type": [
+    "Clear",
+    "Sun and Clear",
+    "Rain",
+    "Snow",
+    "Fog",
+    "Fog and Rain",
+    "Fog and Snow",
+    "None"
+  ],
+  "Weather Intensity": [
+    "Low",
+    "Average",
+    "High",
+    "None"
+  ],
+  "Visibility": [
+    "Very Low",
+    "Low",
+    "Average",
+    "Good"
+  ],
+  "Sky Condition": [
+    "Unknown",
+    "Clear Sky",
+    "Partly Cloudy",
+    "Cloudy",
+    "Overcast",
+    "Partly Overcast"
+  ],
+  "Precipitation Presence": [
+    "None",
+    "Rain",
+    "Snow",
+    "Hail"
+  ],
+  "Precipitation Intensity": [
+    "None",
+    "Low",
+    "Average",
+    "High"
+  ],
+  "Ground Condition": [
+    "Dry",
+    "Wet",
+    "Partly Wet",
+    "Snowy",
+    "Partly Snowy",
+    "Wet and Snowy",
+    "Unknown"
+  ],
+  "Glare or Reflections": [
+    "Absent",
+    "Present"
+  ],
+  "Light Conditions": [
+    "Day",
+    "Night",
+    "Sunset",
+    "Sunrise",
+    "artificial"
+  ],
+  "Road Spray": [
+    "Absent",
+    "Present"
+  ],
+  "Water On Window": [
+    "Absent",
+    "Present",
+    "None"
+  ],
+  "Snow On Window": [
+    "Absent",
+    "Present",
+    "None"
+  ]
+}
