@@ -993,7 +993,7 @@ def train_step_phase_A(
     opt_GA = state["opt_GA"]
     opt_DA = state["opt_DA"]
 
-    global_step = state["global_step"]
+    global_step = int(state["global_step"])
 
     l1_loss = cfg["l1_loss"]
     nce_loss = cfg["nce_loss"]
@@ -1030,7 +1030,7 @@ def train_step_phase_A(
     spade_marg = cfg["spade_margin"]
 
     # Nouveau poids pour le contrastif contenu sur deux styles
-    λ_content_nce2 = cfg.get("lambda_content_nce_two_styles", 0.0)
+    λ_content_nce2 = float(cfg.get("lambda_content_nce_two_styles", 0.0))
 
     mixswap_enable = cfg["mixswap_enable"]
     mixswap_token_p = cfg["mixswap_token_p"]
@@ -1040,16 +1040,16 @@ def train_step_phase_A(
     fft_amp_mix_fn = cfg["fft_amp_mix"]
 
     # --- JEPA config ---
-    jepa_on_style = cfg.get("jepa_on_style", False)
-    jepa_on_content = cfg.get("jepa_on_content", False)
-    jepa_every = cfg["jepa_every"]
+    jepa_on_style = bool(cfg.get("jepa_on_style", False))
+    jepa_on_content = bool(cfg.get("jepa_on_content", False))
+    jepa_every = int(cfg["jepa_every"])
     jepa_scale_base = cfg["jepa_scale_w"]  # tensor ou float
-    jepa_mask_ratio = cfg["jepa_mask_ratio"]
-    jepa_bias_high = cfg["jepa_bias_high"]
-    jepa_use_teacher = cfg["jepa_use_teacher"]
-    λ_jepa_style = cfg.get("lambda_jepa_style", cfg.get("lambda_jepa", 0.0))
-    λ_jepa_content = cfg.get("lambda_jepa_content", 0.0)
-    λ_jepa_kd = cfg.get("lambda_jepa_kd", 0.0)
+    jepa_mask_ratio = float(cfg["jepa_mask_ratio"])
+    jepa_bias_high = float(cfg["jepa_bias_high"])
+    jepa_use_teacher = bool(cfg["jepa_use_teacher"])
+    λ_jepa_style = float(cfg.get("lambda_jepa_style", cfg.get("lambda_jepa", 0.0)))
+    λ_jepa_content = float(cfg.get("lambda_jepa_content", 0.0))
+    λ_jepa_kd = float(cfg.get("lambda_jepa_kd", 0.0))
 
     tok_jepa_A_style = state.get("tok_jepa_A_style", None)
     tok_jepa_A_content = state.get("tok_jepa_A_content", None)
@@ -1060,14 +1060,6 @@ def train_step_phase_A(
     # Helper : adapte jepa_scale_w à la longueur de séquence S
     # ------------------------------------------------------------------
     def _make_jepa_w_for_seq(S, device):
-        """
-        Construit un vecteur w de longueur S à partir de cfg['jepa_scale_w'].
-
-        - Si jepa_scale_base est un tenseur 1D de taille K:
-            - si K == S: on le renvoie tel quel
-            - sinon: on prend la moyenne et on répète S fois
-        - Si c'est un float/int: on remplit un vecteur de taille S avec cette valeur
-        """
         base = jepa_scale_base
         if isinstance(base, torch.Tensor):
             w_vec = base.to(device).flatten()
@@ -1111,7 +1103,7 @@ def train_step_phase_A(
         perm = torch.randperm(x.size(0), device=x.device)
         y_alt = y[perm]
 
-        # perturbation FFT en phase A (optionnelle, avec les vraies fonctions FFT)
+        # perturbation FFT en phase A (optionnelle)
         if mixswap_fft_p > 0.0 and (random.random() < mixswap_fft_p):
             alpha_fft = random.uniform(mixswap_alpha_lo, mixswap_alpha_hi)
             y = fft_amp_mix_fn(y, y_alt, alpha_fft).clamp(-1, 1)
@@ -1135,12 +1127,12 @@ def train_step_phase_A(
         style_cond_A = cfg["build_style_cond"](G_A, y)
         style_target_for_loss = ("image", y)
 
-    # ---------- Style gain (rampe) appliqué sur les tokens de style ----------
+    # ---------- Style gain ----------
     style_gain_A = float(cfg.get("style_gain_A", 1.0))
     style_cond_A = apply_style_gain(style_cond_A, style_gain_A)
 
     # ---------- D_A ----------
-    adv_enable_A = cfg["adv_enable_A"]
+    adv_enable_A = bool(cfg["adv_enable_A"])
     if adv_enable_A:
         with torch.no_grad():
             far_det = G_A(x, style=style_cond_A)
@@ -1158,7 +1150,7 @@ def train_step_phase_A(
         loss_DA.backward()
         opt_DA.step()
     else:
-        dstatsA = {"real_mean": 0, "fake_mean": 0}
+        dstatsA = {"real_mean": 0, "fake_mean": 0, "r1": 0.0}
         loss_DA = torch.tensor(0.0, device=dev)
 
     # ---------- G_A ----------
@@ -1175,7 +1167,7 @@ def train_step_phase_A(
             highpass_fn=highpass_fn
         )
 
-    # NCE (contenu x vs. far(x, style y))
+    # NCE (contenu x vs. far)
     if use_B_feats:
         feats_x = nce_feats_dict(T_B, x, normalize=True, no_grad=False)
         feats_f = nce_feats_dict(T_B, far, normalize=True, no_grad=False)
@@ -1188,10 +1180,9 @@ def train_step_phase_A(
     for l, w in zip(nce_layers, layer_w):
         nce_total += w * nce_loss(feats_x[l], feats_f[l])
 
-    # NCE contenu sur deux styles différents (même contenu x)
+    # NCE contenu sur deux styles différents
     content_nce_2 = torch.tensor(0.0, device=dev)
     if λ_content_nce2 > 0.0 and x.size(0) > 1:
-        # On prend un deuxième style en permutant y
         perm2 = torch.randperm(x.size(0), device=x.device)
         y2 = y[perm2]
         style_cond_A2 = cfg["build_style_cond"](G_A, y2)
@@ -1212,7 +1203,7 @@ def train_step_phase_A(
             layer_w=layer_w,
         )
 
-    # Style / texture (tokens)
+    # Style tokens loss
     if style_target_for_loss[0] == "image":
         styA = style_loss_tokens(far, style_target_for_loss[1], teacher_G=T_A)
     else:
@@ -1224,7 +1215,8 @@ def train_step_phase_A(
     if tex_enable and tex_apply_A:
         if tex_use_fft and λ_fft > 0:
             tex_A_total += λ_fft * fft_texture_loss_fn(
-                far, y, log_mag=True, per_channel=True)
+                far, y, log_mag=True, per_channel=True
+            )
         if tex_use_swd and λ_swd > 0:
             tex_A_total += λ_swd * swd_loss_images_fn(
                 far, y,
@@ -1243,12 +1235,11 @@ def train_step_phase_A(
     jepa_contentA = torch.tensor(0.0, device=dev)
     jepa_contentA_kd = torch.tensor(0.0, device=dev)
 
-    # NEW: stats attention JEPA pour TensorBoard
+    # NEW: stats attention JEPA
     jepa_attn_styleA_H = None
     jepa_attn_contentA_H = None
 
     do_jepa = (jepa_on_style or jepa_on_content) and ((global_step % jepa_every) == 0)
-
     if do_jepa:
         from models.jepa import TokenJEPA
 
@@ -1256,10 +1247,7 @@ def train_step_phase_A(
         if jepa_on_style:
             style_sigma = float(tex_sigma)
             style_gamma = float(tex_gamma)
-            # Vraies perturbations style = bruit spectral
-            y_v1, y_v2 = two_style_views(
-                y, sigma=style_sigma, gamma=style_gamma, flip_p=0.5
-            )
+            y_v1, y_v2 = two_style_views(y, sigma=style_sigma, gamma=style_gamma, flip_p=0.5)
 
             with torch.no_grad():
                 if jepa_use_teacher:
@@ -1267,8 +1255,10 @@ def train_step_phase_A(
                 else:
                     _, toks_tA, tokG_tA = G_A.style_enc(y_v2)
                 TtA = stack_tokens_for_jepa(toks_tA, tokG_tA)
+
             _, toks_sA, tokG_sA = G_A.style_enc(y_v1)
             TsA = stack_tokens_for_jepa(toks_sA, tokG_sA)
+
             if (TtA is not None) and (TsA is not None):
                 Bsz, Ssz, Dsz = TsA.shape
                 if tok_jepa_A_style is None:
@@ -1281,42 +1271,42 @@ def train_step_phase_A(
                         cov_lambda=cfg["lambda_jepa_cov"]
                     ).to(dev)
                     state["tok_jepa_A_style"] = tok_jepa_A_style
+
                 maskA = bias_mask(Bsz, Ssz, jepa_mask_ratio, jepa_bias_high, device=dev)
                 w_styleA = _make_jepa_w_for_seq(Ssz, dev)
                 LjA, infoA = tok_jepa_A_style(TsA, TtA.detach(), maskA, w=w_styleA)
                 jepa_styleA = LjA
+
                 if λ_jepa_kd > 0:
                     jepa_styleA_kd = kd_logits_supheads_if_available(
                         G_A, infoA.get("pred_raw", TsA), TtA.detach()
                     )
 
-                # NEW: attention entropy si dispo
                 if isinstance(infoA, dict):
                     H = infoA.get("attn_entropy", None)
                     if H is None and "attn" in infoA:
-                        att = infoA["attn"]  # [B,H,S,S] attendu
+                        att = infoA["attn"]
                         if torch.is_tensor(att):
                             p = att.clamp_min(1e-8)
                             H = -(p * p.log()).sum(-1).mean()
                     if H is not None:
-                        if torch.is_tensor(H):
-                            H = float(H.detach().cpu().item())
-                        jepa_attn_styleA_H = H
+                        jepa_attn_styleA_H = float(H.detach().cpu().item()) if torch.is_tensor(H) else float(H)
 
         # --- JEPA CONTENU multi-échelle ---
         if jepa_on_content:
-            x_v1c, x_v2c = two_style_views(
-                x, sigma=0.0, gamma=1.0, flip_p=0.5
-            )
+            x_v1c, x_v2c = two_style_views(x, sigma=0.0, gamma=1.0, flip_p=0.5)
+
             with torch.no_grad():
                 if jepa_use_teacher:
                     feats_t = nce_feats_dict(T_A, x_v2c, normalize=False, no_grad=True)
                 else:
                     feats_t = nce_feats_dict(G_A, x_v2c, normalize=False, no_grad=True)
+
             feats_s = nce_feats_dict(G_A, x_v1c, normalize=False, no_grad=False)
 
             TtA_c = stack_content_tokens_multiscale_for_jepa(feats_t, ref_key="bot")
             TsA_c = stack_content_tokens_multiscale_for_jepa(feats_s, ref_key="bot")
+
             if (TtA_c is not None) and (TsA_c is not None):
                 Bsz, Ssz, Dsz = TsA_c.shape
                 if tok_jepa_A_content is None:
@@ -1329,18 +1319,17 @@ def train_step_phase_A(
                         cov_lambda=cfg["lambda_jepa_cov"]
                     ).to(dev)
                     state["tok_jepa_A_content"] = tok_jepa_A_content
+
                 maskA_c = bias_mask(Bsz, Ssz, jepa_mask_ratio, jepa_bias_high, device=dev)
                 w_contA = _make_jepa_w_for_seq(Ssz, dev)
-                LjA_c, infoA_c = tok_jepa_A_content(
-                    TsA_c, TtA_c.detach(), maskA_c, w=w_contA
-                )
+                LjA_c, infoA_c = tok_jepa_A_content(TsA_c, TtA_c.detach(), maskA_c, w=w_contA)
                 jepa_contentA = LjA_c
+
                 if λ_jepa_kd > 0:
                     jepa_contentA_kd = kd_logits_supheads_if_available(
                         G_A, infoA_c.get("pred_raw", TsA_c), TtA_c.detach()
                     )
 
-                # NEW: attention entropy contenu
                 if isinstance(infoA_c, dict):
                     Hc = infoA_c.get("attn_entropy", None)
                     if Hc is None and "attn" in infoA_c:
@@ -1349,25 +1338,23 @@ def train_step_phase_A(
                             p = attc.clamp_min(1e-8)
                             Hc = -(p * p.log()).sum(-1).mean()
                     if Hc is not None:
-                        if torch.is_tensor(Hc):
-                            Hc = float(Hc.detach().cpu().item())
-                        jepa_attn_contentA_H = Hc
+                        jepa_attn_contentA_H = float(Hc.detach().cpu().item()) if torch.is_tensor(Hc) else float(Hc)
 
     jepa_totalA = (
-            λ_jepa_style * jepa_styleA
-            + λ_jepa_content * jepa_contentA
-            + λ_jepa_kd * (jepa_styleA_kd + jepa_contentA_kd)
+        λ_jepa_style * jepa_styleA
+        + λ_jepa_content * jepa_contentA
+        + λ_jepa_kd * (jepa_styleA_kd + jepa_contentA_kd)
     )
 
     totalA = (
-            advA
-            + λN * nce_total
-            + λ_content_nce2 * content_nce_2
-            + λ_style_A * styA
-            + λR * regA
-            + λ_spade * gateA
-            + tex_A_total
-            + jepa_totalA
+        advA
+        + λN * nce_total
+        + λ_content_nce2 * content_nce_2
+        + λ_style_A * styA
+        + λR * regA
+        + λ_spade * gateA
+        + tex_A_total
+        + jepa_totalA
     )
 
     if torch.is_tensor(totalA):
@@ -1375,8 +1362,8 @@ def train_step_phase_A(
         opt_GA.step()
 
     # --- EMA des teachers ---
-    if (global_step % cfg["ema_every"]) == 0:
-        nce_m = cfg["nce_m"]
+    if (global_step % int(cfg["ema_every"])) == 0:
+        nce_m = float(cfg["nce_m"])
         for src, tgt in [(state["G_B"], T_B), (G_A, T_A)]:
             for po, pt in zip(src.parameters(), tgt.parameters()):
                 pt.data.mul_(nce_m).add_(po.data, alpha=1.0 - nce_m)
@@ -1384,6 +1371,7 @@ def train_step_phase_A(
     state["replay"].extend(far.detach().cpu())
     state["style_bank"].extend(y.detach().cpu())
 
+    # --- meters epoch (A) ---
     if adv_enable_A:
         epoch_meters["A"]["D_loss"].add(float(loss_DA.item()))
     epoch_meters["A"]["G_adv"].add(float(advA.item()))
@@ -1398,32 +1386,44 @@ def train_step_phase_A(
     if torch.is_tensor(totalA):
         epoch_meters["A"]["total"].add(float(totalA.item()))
 
-    # --- Branche contenu sémantique (MoCo + JEPA-content) ---
-    if cfg.get("sem_enable", False) and ("SEM" in state):
+    # =============================================================================
+    # ✅ BRANCHE CONTENU SÉMANTIQUE (MoCo + JEPA-content) + LOGS TB + TERMINAL
+    # =============================================================================
+    sem_loss_val = None
+    sem_stats = None
+    if bool(cfg.get("sem_enable", False)) and ("SEM" in state):
         try:
             sem_out = semantic_content_step_moco_jepa(x, far, y, state, cfg)
             if sem_out is not None:
-                sem_loss, sem_stats = sem_out
+                sem_loss_val, sem_stats = sem_out  # sem_loss_val = float, sem_stats = dict
                 epoch_meters["SEM"]["MoCo"].add(float(sem_stats.get("moco", 0.0)))
                 epoch_meters["SEM"]["JEPA_content"].add(float(sem_stats.get("jepa", 0.0)))
-                epoch_meters["SEM"]["total"].add(float(sem_loss))
+                epoch_meters["SEM"]["total"].add(float(sem_loss_val))
+                epoch_meters["SEM"]["λ_sem"].add(float(sem_stats.get("lam_sem", cfg.get("lambda_sem", 0.0))))
+                epoch_meters["SEM"]["λ_sem_jepa"].add(float(sem_stats.get("lam_jepa", cfg.get("lambda_jepa_content", 0.0))))
         except Exception:
             # Ne doit jamais casser l'entraînement principal
-            pass
+            sem_loss_val = None
+            sem_stats = None
 
     # --- Logging TensorBoard ---
-    if writer and (state["global_step"] % cfg["tb_freq"] == 0):
+    tb_freq = int(cfg["tb_freq"])
+    tb_freq_sem = int(cfg.get("tb_freq_sem", tb_freq))
+    sem_print_every = int(cfg.get("sem_print_every", tb_freq_sem))
+
+    if writer and (global_step % tb_freq == 0):
         if adv_enable_A:
             writer.add_scalars(
                 "A/D",
                 {
                     "loss": float(loss_DA.item()),
-                    "real_mean": dstatsA["real_mean"],
-                    "fake_mean": dstatsA.get("fake_mean", 0.0),
-                    "r1": dstatsA.get("r1", 0.0),
+                    "real_mean": float(dstatsA.get("real_mean", 0.0)),
+                    "fake_mean": float(dstatsA.get("fake_mean", 0.0)),
+                    "r1": float(dstatsA.get("r1", 0.0)),
                 },
-                state["global_step"]
+                global_step
             )
+
         writer.add_scalars(
             "A/G",
             {
@@ -1436,10 +1436,11 @@ def train_step_phase_A(
                 "L1": float(regA.item()),
                 "spade_gate": float(gateA.item()),
                 "tex": float(tex_A_total if not torch.is_tensor(tex_A_total) else tex_A_total.item()),
-                "total": float(totalA.item()) if torch.isfinite(totalA) else float("nan"),
+                "total": float(totalA.item()) if torch.is_tensor(totalA) else float(totalA),
             },
-            state["global_step"]
+            global_step
         )
+
         writer.add_scalars(
             "A/JEPA",
             {
@@ -1449,33 +1450,68 @@ def train_step_phase_A(
                 "content_kd": float(jepa_contentA_kd.item()),
                 "total": float(jepa_totalA.item()),
             },
-            state["global_step"]
+            global_step
         )
+
         jepa_attn_scalars = {}
         if jepa_attn_styleA_H is not None:
             jepa_attn_scalars["style_attn_H"] = float(jepa_attn_styleA_H)
         if jepa_attn_contentA_H is not None:
             jepa_attn_scalars["content_attn_H"] = float(jepa_attn_contentA_H)
         if jepa_attn_scalars:
-            writer.add_scalars("A/JEPA_attn", jepa_attn_scalars, state["global_step"])
+            writer.add_scalars("A/JEPA_attn", jepa_attn_scalars, global_step)
 
         xa = cfg["_denorm"](x)
         ya = cfg["_denorm"](y)
         fa = cfg["_denorm"](far)
-        writer.add_images("A/imgs/x_content", xa[:4], state["global_step"])
-        writer.add_images("A/imgs/y_style", ya[:4], state["global_step"])
-        writer.add_images("A/imgs/far(x→y)", fa[:4], state["global_step"])
+        writer.add_images("A/imgs/x_content", xa[:4], global_step)
+        writer.add_images("A/imgs/y_style", ya[:4], global_step)
+        writer.add_images("A/imgs/far(x→y)", fa[:4], global_step)
         try:
             trip_A = cfg["_triplet_grid"](xa, ya, fa, max_k=4, nrow=3)
-            writer.add_image("A/triplet_[x | y | far]", trip_A, state["global_step"])
+            writer.add_image("A/triplet_[x | y | far]", trip_A, global_step)
         except Exception:
             pass
+
+    # --- ✅ LOGS SEM TensorBoard + terminal ---
+    if sem_loss_val is not None and sem_stats is not None:
+        if writer and (global_step % tb_freq_sem == 0):
+            writer.add_scalars(
+                "SEM/A",
+                {
+                    "MoCo": float(sem_stats.get("moco", 0.0)),
+                    "JEPA_content": float(sem_stats.get("jepa", 0.0)),
+                    "loss_total": float(sem_loss_val),
+                    "λ_sem": float(sem_stats.get("lam_sem", cfg.get("lambda_sem", 0.0))),
+                    "λ_sem_jepa": float(sem_stats.get("lam_jepa", cfg.get("lambda_jepa_content", 0.0))),
+                },
+                global_step,
+            )
+
+        if (global_step % sem_print_every) == 0:
+            # tqdm.write = n'abîme pas la barre tqdm si utilisée plus haut
+            try:
+                tqdm.write(
+                    f"[SEM/A] step={global_step}  "
+                    f"MoCo={float(sem_stats.get('moco', 0.0)):.4f}  "
+                    f"JEPAc={float(sem_stats.get('jepa', 0.0)):.4f}  "
+                    f"total={float(sem_loss_val):.4f}  "
+                    f"λ_sem={float(sem_stats.get('lam_sem', cfg.get('lambda_sem', 0.0))):.3g}  "
+                    f"λ_jepa={float(sem_stats.get('lam_jepa', cfg.get('lambda_jepa_content', 0.0))):.3g}"
+                )
+            except Exception:
+                print(
+                    f"[SEM/A] step={global_step}  "
+                    f"MoCo={float(sem_stats.get('moco', 0.0)):.4f}  "
+                    f"JEPAc={float(sem_stats.get('jepa', 0.0)):.4f}  "
+                    f"total={float(sem_loss_val):.4f}"
+                )
+
 
 
 # =========================================================================================
 #           Phase B
 # =========================================================================================
-
 def train_step_phase_B(
         x,
         state,
@@ -1493,7 +1529,7 @@ def train_step_phase_B(
     opt_GB = state["opt_GB"]
     opt_DB = state["opt_DB"]
 
-    global_step = state["global_step"]
+    global_step = int(state["global_step"])
 
     replay = state["replay"]
     style_bank = state["style_bank"]
@@ -1527,24 +1563,24 @@ def train_step_phase_B(
     λ_nce_B = cfg["lambda_nce_b"]
     λ_idt_B = cfg["lambda_idt_b"]
 
-    λ_style_B_dyn = state["λ_style_B_dyn"]
-    λ_style_B_min = cfg["λ_style_B_min"]
-    λ_style_B_max = cfg["λ_style_B_max"]
-    style_B_warmup_ep = cfg["style_B_warmup_ep"]
-    style_target = cfg["style_balance_target"]
-    style_alpha = cfg["style_balance_alpha"]
+    λ_style_B_dyn = float(state["λ_style_B_dyn"])
+    λ_style_B_min = float(cfg["λ_style_B_min"])
+    λ_style_B_max = float(cfg["λ_style_B_max"])
+    style_B_warmup_ep = int(cfg["style_B_warmup_ep"])
+    style_target = float(cfg["style_balance_target"])
+    style_alpha = float(cfg["style_balance_alpha"])
 
     # --- JEPA config ---
-    jepa_on_style = cfg.get("jepa_on_style", False)
-    jepa_on_content = cfg.get("jepa_on_content", False)
-    jepa_every = cfg["jepa_every"]
+    jepa_on_style = bool(cfg.get("jepa_on_style", False))
+    jepa_on_content = bool(cfg.get("jepa_on_content", False))
+    jepa_every = int(cfg["jepa_every"])
     jepa_scale_base = cfg["jepa_scale_w"]
-    jepa_mask_ratio = cfg["jepa_mask_ratio"]
-    jepa_bias_high = cfg["jepa_bias_high"]
-    jepa_use_teacher = cfg["jepa_use_teacher"]
-    λ_jepa_style = cfg.get("lambda_jepa_style", cfg.get("lambda_jepa", 0.0))
-    λ_jepa_content = cfg.get("lambda_jepa_content", 0.0)
-    λ_jepa_kd = cfg.get("lambda_jepa_kd", 0.0)
+    jepa_mask_ratio = float(cfg["jepa_mask_ratio"])
+    jepa_bias_high = float(cfg["jepa_bias_high"])
+    jepa_use_teacher = bool(cfg["jepa_use_teacher"])
+    λ_jepa_style = float(cfg.get("lambda_jepa_style", cfg.get("lambda_jepa", 0.0)))
+    λ_jepa_content = float(cfg.get("lambda_jepa_content", 0.0))
+    λ_jepa_kd = float(cfg.get("lambda_jepa_kd", 0.0))
 
     tok_jepa_B_style = state.get("tok_jepa_B_style", None)
     tok_jepa_B_content = state.get("tok_jepa_B_content", None)
@@ -1582,9 +1618,9 @@ def train_step_phase_B(
             maps.append(f)
         if not maps:
             return None
-        f_cat = torch.cat(maps, dim=1)  # B x C_tot x H_ref x W_ref
+        f_cat = torch.cat(maps, dim=1)
         Bc, C_tot, Hr, Wr = f_cat.shape
-        Ts = f_cat.view(Bc, C_tot, Hr * Wr).transpose(1, 2)  # B x S_ref x C_tot
+        Ts = f_cat.view(Bc, C_tot, Hr * Wr).transpose(1, 2)
         return Ts
 
     # Gain / poids de style effectif pour B (warmup + dynamique)
@@ -1593,7 +1629,7 @@ def train_step_phase_B(
     else:
         λ_style_B_eff = λ_style_B_dyn
 
-    # Pas assez de styles en banque : on saute la phase B
+    # Pas assez de styles en banque : on saute
     if len(style_bank) < x.size(0):
         state["global_step"] += 1
         return
@@ -1618,18 +1654,17 @@ def train_step_phase_B(
 
     spectral_noise_fn = cfg["spectral_noise"]
     if tex_enable and tex_sigma > 0.0:
-        # bruit spectral sur far_mix
         far_mix_noisy = spectral_noise_fn(far_mix, tex_sigma, tex_gamma)
     else:
         far_mix_noisy = far_mix
 
-    # ---------- Style condition pour B + style_gain_B effectif ----------
+    # ---------- Style condition pour B + style_gain_B ----------
     style_cond_B = cfg["build_style_cond"](G_B, x_mix)
     style_gain_B = float(cfg.get("style_gain_B", λ_style_B_eff))
     style_cond_B = apply_style_gain(style_cond_B, style_gain_B)
 
     # ---------- D_B ----------
-    adv_enable_B = cfg["adv_enable_B"]
+    adv_enable_B = bool(cfg["adv_enable_B"])
     if adv_enable_B:
         with torch.no_grad():
             recon_det = G_B(far_mix_noisy, style=style_cond_B)
@@ -1647,7 +1682,7 @@ def train_step_phase_B(
         loss_DB.backward()
         opt_DB.step()
     else:
-        dstatsB = {"real_mean": 0, "fake_mean": 0}
+        dstatsB = {"real_mean": 0, "fake_mean": 0, "r1": 0.0}
         loss_DB = torch.tensor(0.0, device=dev)
 
     # ---------- G_B ----------
@@ -1680,7 +1715,8 @@ def train_step_phase_B(
     if tex_enable:
         if tex_use_fft and λ_fft > 0:
             tex_B_total += λ_fft * fft_texture_loss_fn(
-                recon, x_mix, log_mag=True, per_channel=True)
+                recon, x_mix, log_mag=True, per_channel=True
+            )
         if tex_use_swd and λ_swd > 0:
             tex_B_total += λ_swd * swd_loss_images_fn(
                 recon, x_mix,
@@ -1698,12 +1734,10 @@ def train_step_phase_B(
     jepa_contentB = torch.tensor(0.0, device=dev)
     jepa_contentB_kd = torch.tensor(0.0, device=dev)
 
-    # NEW: stats attention JEPA B
     jepa_attn_styleB_H = None
     jepa_attn_contentB_H = None
 
     do_jepa = (jepa_on_style or jepa_on_content) and ((global_step % jepa_every) == 0)
-
     if do_jepa:
         from models.jepa import TokenJEPA
 
@@ -1711,17 +1745,18 @@ def train_step_phase_B(
         if jepa_on_style:
             style_sigma = float(tex_sigma)
             style_gamma = float(tex_gamma)
-            x_v1, x_v2 = two_style_views(
-                x_mix, sigma=style_sigma, gamma=style_gamma, flip_p=0.5
-            )
+            x_v1, x_v2 = two_style_views(x_mix, sigma=style_sigma, gamma=style_gamma, flip_p=0.5)
+
             with torch.no_grad():
                 if jepa_use_teacher:
                     _, toks_tB, tokG_tB = T_B.style_enc(x_v2)
                 else:
                     _, toks_tB, tokG_tB = G_B.style_enc(x_v2)
                 TtB = stack_tokens_for_jepa(toks_tB, tokG_tB)
+
             _, toks_sB, tokG_sB = G_B.style_enc(x_v1)
             TsB = stack_tokens_for_jepa(toks_sB, tokG_sB)
+
             if (TtB is not None) and (TsB is not None):
                 Bsz, Ssz, Dsz = TsB.shape
                 if tok_jepa_B_style is None:
@@ -1734,16 +1769,17 @@ def train_step_phase_B(
                         cov_lambda=cfg["lambda_jepa_cov"]
                     ).to(dev)
                     state["tok_jepa_B_style"] = tok_jepa_B_style
+
                 maskB = bias_mask(Bsz, Ssz, jepa_mask_ratio, jepa_bias_high, device=dev)
                 w_styleB = _make_jepa_w_for_seq(Ssz, dev)
                 LjB, infoB = tok_jepa_B_style(TsB, TtB.detach(), maskB, w=w_styleB)
                 jepa_styleB = LjB
+
                 if λ_jepa_kd > 0:
                     jepa_styleB_kd = kd_logits_supheads_if_available(
                         G_B, infoB.get("pred_raw", TsB), TtB.detach()
                     )
 
-                # NEW: attention entropy
                 if isinstance(infoB, dict):
                     Hb = infoB.get("attn_entropy", None)
                     if Hb is None and "attn" in infoB:
@@ -1752,24 +1788,23 @@ def train_step_phase_B(
                             p = attb.clamp_min(1e-8)
                             Hb = -(p * p.log()).sum(-1).mean()
                     if Hb is not None:
-                        if torch.is_tensor(Hb):
-                            Hb = float(Hb.detach().cpu().item())
-                        jepa_attn_styleB_H = Hb
+                        jepa_attn_styleB_H = float(Hb.detach().cpu().item()) if torch.is_tensor(Hb) else float(Hb)
 
         # --- JEPA CONTENU multi-échelle ---
         if jepa_on_content:
-            x_v1c, x_v2c = two_style_views(
-                x_mix, sigma=0.0, gamma=1.0, flip_p=0.5
-            )
+            x_v1c, x_v2c = two_style_views(x_mix, sigma=0.0, gamma=1.0, flip_p=0.5)
+
             with torch.no_grad():
                 if jepa_use_teacher:
                     feats_tB = nce_feats_dict(T_B, x_v2c, normalize=False, no_grad=True)
                 else:
                     feats_tB = nce_feats_dict(G_B, x_v2c, normalize=False, no_grad=True)
+
             feats_sB = nce_feats_dict(G_B, x_v1c, normalize=False, no_grad=False)
 
             TtB_c = stack_content_tokens_multiscale_for_jepa(feats_tB, ref_key="bot")
             TsB_c = stack_content_tokens_multiscale_for_jepa(feats_sB, ref_key="bot")
+
             if (TtB_c is not None) and (TsB_c is not None):
                 Bsz, Ssz, Dsz = TsB_c.shape
                 if tok_jepa_B_content is None:
@@ -1782,18 +1817,17 @@ def train_step_phase_B(
                         cov_lambda=cfg["lambda_jepa_cov"]
                     ).to(dev)
                     state["tok_jepa_B_content"] = tok_jepa_B_content
+
                 maskB_c = bias_mask(Bsz, Ssz, jepa_mask_ratio, jepa_bias_high, device=dev)
                 w_contB = _make_jepa_w_for_seq(Ssz, dev)
-                LjB_c, infoB_c = tok_jepa_B_content(
-                    TsB_c, TtB_c.detach(), maskB_c, w=w_contB
-                )
+                LjB_c, infoB_c = tok_jepa_B_content(TsB_c, TtB_c.detach(), maskB_c, w=w_contB)
                 jepa_contentB = LjB_c
+
                 if λ_jepa_kd > 0:
                     jepa_contentB_kd = kd_logits_supheads_if_available(
                         G_B, infoB_c.get("pred_raw", TsB_c), TtB_c.detach()
                     )
 
-                # NEW: attention entropy contenu B
                 if isinstance(infoB_c, dict):
                     Hbc = infoB_c.get("attn_entropy", None)
                     if Hbc is None and "attn" in infoB_c:
@@ -1802,42 +1836,71 @@ def train_step_phase_B(
                             p = attbc.clamp_min(1e-8)
                             Hbc = -(p * p.log()).sum(-1).mean()
                     if Hbc is not None:
-                        if torch.is_tensor(Hbc):
-                            Hbc = float(Hbc.detach().cpu().item())
-                        jepa_attn_contentB_H = Hbc
+                        jepa_attn_contentB_H = float(Hbc.detach().cpu().item()) if torch.is_tensor(Hbc) else float(Hbc)
 
     jepa_totalB = (
-            λ_jepa_style * jepa_styleB
-            + λ_jepa_content * jepa_contentB
-            + λ_jepa_kd * (jepa_styleB_kd + jepa_contentB_kd)
+        λ_jepa_style * jepa_styleB
+        + λ_jepa_content * jepa_contentB
+        + λ_jepa_kd * (jepa_styleB_kd + jepa_contentB_kd)
     )
 
-    totalB = advB + λ_nce_B * nceB + λ_idt_B * idtB + λ_style_B_eff * styB + cfg["λ_spade"] * gateB \
-             + tex_B_total + jepa_totalB
+    totalB = (
+        advB
+        + λ_nce_B * nceB
+        + λ_idt_B * idtB
+        + λ_style_B_eff * styB
+        + cfg["λ_spade"] * gateB
+        + tex_B_total
+        + jepa_totalB
+    )
 
     if torch.is_tensor(totalB):
         totalB.backward()
         opt_GB.step()
 
     # EMA T_B
-    if (global_step % cfg["ema_every"]) == 0:
-        nce_m = cfg["nce_m"]
+    if (global_step % int(cfg["ema_every"])) == 0:
+        nce_m = float(cfg["nce_m"])
         for po, pt in zip(G_B.parameters(), T_B.parameters()):
             pt.data.mul_(nce_m).add_(po.data, alpha=1.0 - nce_m)
 
-    if writer and (global_step % cfg["tb_freq"] == 0):
+    # =============================================================================
+    # ✅ BRANCHE CONTENU SÉMANTIQUE (optionnelle en B) + LOGS TB + TERMINAL
+    #    - utile si tu veux vérifier que recon conserve le contenu sémantique de x_mix
+    # =============================================================================
+    sem_loss_val_B = None
+    sem_stats_B = None
+    sem_on_B = bool(cfg.get("sem_on_B", True))  # tu peux le mettre à False si tu veux
+    if sem_on_B and bool(cfg.get("sem_enable", False)) and ("SEM" in state):
+        try:
+            # On force sem_two_styles=False ici pour éviter de dépendre de "y"
+            cfg_semB = dict(cfg)
+            cfg_semB["sem_two_styles"] = False
+            sem_outB = semantic_content_step_moco_jepa(x_mix, recon, y=None, state=state, cfg=cfg_semB)
+            if sem_outB is not None:
+                sem_loss_val_B, sem_stats_B = sem_outB
+                epoch_meters["SEM"]["MoCo_B"].add(float(sem_stats_B.get("moco", 0.0)))
+                epoch_meters["SEM"]["JEPA_content_B"].add(float(sem_stats_B.get("jepa", 0.0)))
+                epoch_meters["SEM"]["total_B"].add(float(sem_loss_val_B))
+        except Exception:
+            sem_loss_val_B = None
+            sem_stats_B = None
+
+    # --- TB dynamic λ_style_B_dyn update + logs ---
+    tb_freq = int(cfg["tb_freq"])
+    tb_freq_sem = int(cfg.get("tb_freq_sem", tb_freq))
+    sem_print_every = int(cfg.get("sem_print_every", tb_freq_sem))
+
+    if writer and (global_step % tb_freq == 0):
         # adaptation dynamique λ_style_B_dyn (affectera les itérations suivantes)
         if state["epoch"] >= style_B_warmup_ep:
             with torch.no_grad():
                 d_rx = style_dist_tokens(T_B, recon, x_mix)
                 err = float(d_rx.item()) - style_target
                 scale = 1.0 + style_alpha * (err / max(style_target, 1e-6))
-                λ_style_B_dyn = float(
-                    np.clip(λ_style_B_dyn * scale, λ_style_B_min, λ_style_B_max)
-                )
+                λ_style_B_dyn = float(np.clip(λ_style_B_dyn * scale, λ_style_B_min, λ_style_B_max))
                 state["λ_style_B_dyn"] = λ_style_B_dyn
 
-        # Scalars B/G
         writer.add_scalars(
             "B/G",
             {
@@ -1852,6 +1915,7 @@ def train_step_phase_B(
             },
             global_step,
         )
+
         writer.add_scalars(
             "B/JEPA",
             {
@@ -1863,6 +1927,7 @@ def train_step_phase_B(
             },
             global_step,
         )
+
         jepa_attn_scalars_B = {}
         if jepa_attn_styleB_H is not None:
             jepa_attn_scalars_B["style_attn_H"] = float(jepa_attn_styleB_H)
@@ -1883,19 +1948,50 @@ def train_step_phase_B(
         except Exception:
             pass
 
+    # --- ✅ SEM logs TB + terminal (B) ---
+    if sem_loss_val_B is not None and sem_stats_B is not None:
+        if writer and (global_step % tb_freq_sem == 0):
+            writer.add_scalars(
+                "SEM/B",
+                {
+                    "MoCo": float(sem_stats_B.get("moco", 0.0)),
+                    "JEPA_content": float(sem_stats_B.get("jepa", 0.0)),
+                    "loss_total": float(sem_loss_val_B),
+                    "λ_sem": float(sem_stats_B.get("lam_sem", cfg.get("lambda_sem", 0.0))),
+                    "λ_sem_jepa": float(sem_stats_B.get("lam_jepa", cfg.get("lambda_jepa_content", 0.0))),
+                },
+                global_step,
+            )
+
+        if (global_step % sem_print_every) == 0:
+            try:
+                tqdm.write(
+                    f"[SEM/B] step={global_step}  "
+                    f"MoCo={float(sem_stats_B.get('moco', 0.0)):.4f}  "
+                    f"JEPAc={float(sem_stats_B.get('jepa', 0.0)):.4f}  "
+                    f"total={float(sem_loss_val_B):.4f}"
+                )
+            except Exception:
+                print(
+                    f"[SEM/B] step={global_step}  "
+                    f"MoCo={float(sem_stats_B.get('moco', 0.0)):.4f}  "
+                    f"JEPAc={float(sem_stats_B.get('jepa', 0.0)):.4f}  "
+                    f"total={float(sem_loss_val_B):.4f}"
+                )
+
+    # --- meters epoch (B) ---
     if adv_enable_B:
         epoch_meters["B"]["D_loss"].add(float(loss_DB.item()))
     epoch_meters["B"]["G_adv"].add(float(advB.item()))
     epoch_meters["B"]["NCE"].add(float(nceB.item()))
     epoch_meters["B"]["L1_idt"].add(float(idtB.item()))
     epoch_meters["B"]["styleTok_B"].add(float(styB.item()))
-    epoch_meters["B"]["λ_style_B_dyn"].add(float(λ_style_B_dyn))
+    epoch_meters["B"]["λ_style_B_dyn"].add(float(state.get("λ_style_B_dyn", λ_style_B_dyn)))
     epoch_meters["B"]["style_gain_B"].add(float(λ_style_B_eff))
     epoch_meters["B"]["JEPA_style"].add(float(jepa_styleB.item()))
     epoch_meters["B"]["JEPA_content"].add(float(jepa_contentB.item()))
     if torch.is_tensor(totalB):
         epoch_meters["B"]["total"].add(float(totalB.item()))
-
 
 # =========================================================================================
 #           Utilitaires GAN / NCE / style / JEPA

@@ -1,8 +1,11 @@
 # file: train_style_disentangle.py
+# -*- coding: utf-8 -*-
 
 import json
+import time
 from collections import deque, defaultdict
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -38,6 +41,140 @@ from helpers import (
     new_epoch_meters,
     get_style_lambda,  # scheduler de λ_style_A
 )
+
+# =========================================================================================
+#   Terminal + TensorBoard logging helpers
+# =========================================================================================
+
+def _is_finite_number(x: float) -> bool:
+    try:
+        return torch.isfinite(torch.tensor(float(x))).item()
+    except Exception:
+        return False
+
+
+def _to_float(v: Any) -> Optional[float]:
+    """Convertit proprement vers float (tensor/np/number), sinon None."""
+    if v is None:
+        return None
+    try:
+        if torch.is_tensor(v):
+            if v.numel() == 1:
+                return float(v.detach().float().cpu().item())
+            return float(v.detach().float().mean().cpu().item())
+        return float(v)
+    except Exception:
+        return None
+
+
+def _meter_value(m: Any) -> Optional[float]:
+    """
+    Récupère une valeur (avg de préférence) depuis des formats courants :
+      - objet avec .avg / .value
+      - dict {'avg':..} / {'value':..} / {'val':..}
+      - nombre / tensor
+    """
+    if m is None:
+        return None
+
+    # objets type SmoothedValue
+    for attr in ("avg", "value", "val", "mean"):
+        if hasattr(m, attr):
+            return _to_float(getattr(m, attr))
+
+    # dicts
+    if isinstance(m, dict):
+        for k in ("avg", "value", "val", "mean"):
+            if k in m:
+                return _to_float(m[k])
+        # fallback: first numeric value
+        for _, vv in m.items():
+            x = _to_float(vv)
+            if x is not None:
+                return x
+
+    # fallback direct
+    return _to_float(m)
+
+
+def _meters_to_scalars(epoch_meters: Any) -> Dict[str, float]:
+    """
+    Convertit epoch_meters (souvent dict) en {name: float} filtré.
+    """
+    out: Dict[str, float] = {}
+    if isinstance(epoch_meters, dict):
+        for k, v in epoch_meters.items():
+            x = _meter_value(v)
+            if x is None:
+                continue
+            if _is_finite_number(x):
+                out[str(k)] = float(x)
+    return out
+
+
+def _get_lrs(optimizers: Dict[str, torch.optim.Optimizer]) -> Dict[str, float]:
+    lrs = {}
+    for name, opt in optimizers.items():
+        if opt is None:
+            continue
+        try:
+            lr = opt.param_groups[0].get("lr", None)
+            lr = _to_float(lr)
+            if lr is not None:
+                lrs[f"lr/{name}"] = float(lr)
+        except Exception:
+            pass
+    return lrs
+
+
+def _tb_add_scalars(writer: Optional[SummaryWriter], scalars: Dict[str, float], step: int, prefix: str = ""):
+    if writer is None:
+        return
+    for k, v in scalars.items():
+        tag = f"{prefix}{k}" if prefix else k
+        try:
+            writer.add_scalar(tag, float(v), step)
+        except Exception:
+            # ne jamais casser l'entraînement à cause d'un log
+            pass
+
+
+def _tb_add_text(writer: Optional[SummaryWriter], tag: str, text: str, step: int):
+    if writer is None:
+        return
+    try:
+        writer.add_text(tag, text, step)
+    except Exception:
+        pass
+
+
+def _tb_maybe_flush(writer: Optional[SummaryWriter], every_steps: int, step: int):
+    if writer is None:
+        return
+    if every_steps <= 0:
+        return
+    if step % every_steps == 0:
+        try:
+            writer.flush()
+        except Exception:
+            pass
+
+
+def _format_postfix(values: Dict[str, float], keys: Tuple[str, ...]) -> str:
+    parts = []
+    for k in keys:
+        if k in values:
+            parts.append(f"{k}={values[k]:.3f}")
+    return " ".join(parts)
+
+
+def _print_kv_line(title: str, d: Dict[str, float], keys: Tuple[str, ...]):
+    items = []
+    for k in keys:
+        if k in d:
+            items.append(f"{k}={d[k]:.4f}")
+    if items:
+        print(f"{title} " + " | ".join(items))
 
 
 # =========================================================================================
@@ -137,20 +274,16 @@ def train_alternating(opt):
     #  MODE: détection transformer (DETR-like / simple_unet) → on sort tout de suite
     # =====================================================================================
     if mode == "detect_transformer":
-        # Résoudre le gel de backbone pour la détection
         freeze_det = resolve_backbone_freeze(opt, mode="detect_transformer")
-        # On force l'option (utile si non passée en CLI)
         opt.det_freeze_backbone = int(freeze_det)
         print(f"[DET] det_freeze_backbone (effectif) = {freeze_det}")
-
-        # Appel direct au script de détection (gère det_head_type, save_freq, etc.)
         return train_detection_transformer(opt, dev)
 
     # =====================================================================================
     #  MODES: auto / hybrid / sup_freeze  → pipeline style + JEPA
     # =====================================================================================
 
-    # --- Dataloaders principaux A/B (style / auto / hybrid / sup_freeze)
+    # --- Dataloaders principaux A/B
     loaders = build_dataloader(opt)
     k_folds = len(loaders)
     if k_folds == 0:
@@ -170,13 +303,10 @@ def train_alternating(opt):
     adv_lrD_mult = float(getattr(opt, "adv_lrD_mult", 0.5))
     opt_GA = torch.optim.Adam(G_A.parameters(), lr=base_lr, betas=(0.5, 0.999))
     opt_GB = torch.optim.Adam(G_B.parameters(), lr=base_lr, betas=(0.5, 0.999))
-    opt_DA = torch.optim.Adam(
-        D_A.parameters(), lr=base_lr * adv_lrD_mult, betas=(0.5, 0.999)
-    )
-    opt_DB = torch.optim.Adam(
-        D_B.parameters(), lr=base_lr * adv_lrD_mult, betas=(0.5, 0.999)
-    )
+    opt_DA = torch.optim.Adam(D_A.parameters(), lr=base_lr * adv_lrD_mult, betas=(0.5, 0.999))
+    opt_DB = torch.optim.Adam(D_B.parameters(), lr=base_lr * adv_lrD_mult, betas=(0.5, 0.999))
 
+    # --- TensorBoard
     writer = SummaryWriter(opt.save_dir) if getattr(opt, "tb", False) else None
 
     resume_epoch = None
@@ -188,14 +318,8 @@ def train_alternating(opt):
             load_checkpoint(
                 opt.resume_dir,
                 e,
-                G_A,
-                D_A,
-                G_B,
-                D_B,
-                opt_GA,
-                opt_DA,
-                opt_GB,
-                opt_DB,
+                G_A, D_A, G_B, D_B,
+                opt_GA, opt_DA, opt_GB, opt_DB,
                 device=str(dev),
                 strict=False,
             )
@@ -204,22 +328,30 @@ def train_alternating(opt):
 
     out_dir = Path(opt.save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "train_cfg.json").write_text(
-        json.dumps({"static_hparams": vars(opt)}, indent=2)
-    )
+    (out_dir / "train_cfg.json").write_text(json.dumps({"static_hparams": vars(opt)}, indent=2))
 
+    # --- TB: hparams (texte + scalars)
     if writer:
-        writer.add_text("run/mode", f"{mode} – {mode_help.get(mode, '')}", 0)
-        writer.add_scalar("hparams/batch_size", float(opt.batch_size), 0)
+        _tb_add_text(writer, "run/mode", f"{mode} – {mode_help.get(mode, '')}", 0)
+        _tb_add_text(writer, "run/device", str(dev), 0)
+        try:
+            _tb_add_text(writer, "run/opt_json", json.dumps(vars(opt), indent=2), 0)
+        except Exception:
+            pass
+        writer.add_scalar("hparams/batch_size", float(getattr(opt, "batch_size", 0)), 0)
         writer.add_scalar("hparams/lr", float(base_lr), 0)
 
-    tb_freq = int(getattr(opt, "tb_freq", 100))
-    tb_freq_C = int(getattr(opt, "tb_freq_C", tb_freq))
+    # --- Fréquences d'affichage
+    tb_freq = int(getattr(opt, "tb_freq", 100))          # scalars TB / flush
+    tb_freq_C = int(getattr(opt, "tb_freq_C", tb_freq))  # pour supervision hybride (helpers)
+    print_freq = int(getattr(opt, "print_freq", 50))     # prints terminal (hors tqdm)
+    postfix_keys = tuple(
+        k.strip() for k in str(getattr(opt, "postfix_keys", "loss_G,loss_D,loss_nce,loss_jepa,loss_idt,loss_reg")).split(",")
+        if k.strip()
+    )
 
     # ------------------------- Gestion globale de save_freq -------------------------
-    save_freq_mode, save_freq_interval = _parse_save_freq(
-        getattr(opt, "save_freq", "epoch")
-    )
+    save_freq_mode, save_freq_interval = _parse_save_freq(getattr(opt, "save_freq", "epoch"))
     epoch_ckpt_interval = getattr(opt, "epoch_ckpt_interval", None)
     if save_freq_mode == "epoch" and epoch_ckpt_interval is not None:
         try:
@@ -227,8 +359,7 @@ def train_alternating(opt):
         except Exception:
             pass
 
-    print(f"[CKPT] save_freq = {getattr(opt, 'save_freq', 'epoch')} "
-          f"→ mode={save_freq_mode}, interval={save_freq_interval}")
+    print(f"[CKPT] save_freq = {getattr(opt, 'save_freq', 'epoch')} → mode={save_freq_mode}, interval={save_freq_interval}")
 
     # --- État global de l'entraînement ---
     state = {
@@ -250,24 +381,25 @@ def train_alternating(opt):
         "tok_jepa_B_style": None,
         "tok_jepa_B_content": None,
         "λ_style_B_dyn": float(getattr(opt, "lambda_style_b", 0.5)),
+        # optional: last batch time
+        "_last_step_wall": None,
     }
 
     import copy as _copy
     state["T_A"] = _copy.deepcopy(G_A).eval()
     for p in state["T_A"].parameters():
         p.requires_grad_(False)
-
     state["T_B"] = _copy.deepcopy(G_B).eval()
     for p in state["T_B"].parameters():
         p.requires_grad_(False)
 
     # =====================================================================================
     #  SEMANTIC CONTENT BRANCH (ResNet50 + MoCo + optional JEPA-content)
-    #  + NEW: load external pretrained weights path (e.g., MoCo v3 resnet50 checkpoint)
     # =====================================================================================
     sem_enable = bool(getattr(opt, "sem_content", False) and mode == "auto")
     state["SEM"] = None
     state["opt_SEM"] = None
+
     if sem_enable:
         aug_cfg = SemAugConfig(
             use_aug=bool(getattr(opt, "sem_use_aug", False)),
@@ -278,16 +410,9 @@ def train_alternating(opt):
             blur_p=float(getattr(opt, "sem_blur", 0.1)),
         )
 
-        # Quand sem_content est actif, on redirige JEPA-content vers la branche sémantique
-        jepa_on_content_raw = bool(
-            getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False)
-        )
+        jepa_on_content_raw = bool(getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False))
         sem_jepa_on = bool(jepa_on_content_raw)
 
-        # >>> NEW OPTIONS (semantic_moco_jepa.py updated):
-        #   opt.sem_pretrained_path: path to external checkpoint (MoCo v3, etc.)
-        #   opt.sem_pretrained_strict: strict load_state_dict for backbone (default 0)
-        #   opt.sem_pretrained_verbose: print logs (default 1)
         sem_pretrained_path = getattr(opt, "sem_pretrained_path", None)
         sem_pretrained_strict = bool(int(getattr(opt, "sem_pretrained_strict", 0)) != 0)
         sem_pretrained_verbose = bool(int(getattr(opt, "sem_pretrained_verbose", 1)) != 0)
@@ -312,13 +437,10 @@ def train_alternating(opt):
             jepa_cov=float(getattr(opt, "lambda_jepa_cov", 0.05)),
         ).to(dev)
 
-        # Optimiseur (query encoder + projections + JEPA predictor si actif)
         sem_params = [p for p in sem_model.parameters() if p.requires_grad]
         _lr_sem = getattr(opt, "lr_sem", None)
         sem_lr = float(_lr_sem) if _lr_sem is not None else float(getattr(opt, "lr", 2e-4))
-        opt_sem = torch.optim.AdamW(
-            sem_params, lr=sem_lr, betas=(0.9, 0.999), weight_decay=1e-4
-        )
+        opt_sem = torch.optim.AdamW(sem_params, lr=sem_lr, betas=(0.9, 0.999), weight_decay=1e-4)
 
         state["SEM"] = sem_model
         state["opt_SEM"] = opt_sem
@@ -327,6 +449,11 @@ def train_alternating(opt):
             f"[SEM] sem_content enabled | pretrained={getattr(opt, 'sem_pretrained', 1)} "
             f"| sem_pretrained_path={sem_pretrained_path} | strict={int(sem_pretrained_strict)}"
         )
+
+        if writer:
+            writer.add_scalar("SEM/enabled", 1.0, 0)
+            if sem_pretrained_path:
+                _tb_add_text(writer, "SEM/pretrained_path", str(sem_pretrained_path), 0)
 
     # --- Si reprise et SEM activé : charger aussi la branche sémantique ---
     if sem_enable and (resume_epoch is not None) and state.get("SEM", None) is not None:
@@ -346,7 +473,7 @@ def train_alternating(opt):
             print(f"[WARN] reprise SEM impossible: {e}")
 
     # --- Config partagée pour helpers / phases ---
-    cfg = {}
+    cfg: Dict[str, Any] = {}
     cfg["device"] = dev
     cfg["opt"] = opt
     cfg["writer"] = writer
@@ -363,16 +490,10 @@ def train_alternating(opt):
         max_patches=getattr(opt, "nce_max_patches", None),
     )
 
-    nce_layers = [
-        l.strip()
-        for l in str(getattr(opt, "nce_layers", "bot,skip64,skip32")).split(",")
-        if l.strip()
-    ]
+    nce_layers = [l.strip() for l in str(getattr(opt, "nce_layers", "bot,skip64,skip32")).split(",") if l.strip()]
     layer_w = [
-        float(w)
-        for w in (
-            getattr(opt, "nce_layer_weights", None)
-            or ",".join(["1"] * len(nce_layers))
+        float(w) for w in (
+            getattr(opt, "nce_layer_weights", None) or ",".join(["1"] * len(nce_layers))
         ).split(",")
     ]
     if len(layer_w) < len(nce_layers):
@@ -414,7 +535,7 @@ def train_alternating(opt):
     λ_reg_AMIX = getattr(opt, "lambda_reg_a_mix", 0.5)
     λ_nce_B = getattr(opt, "lambda_nce_b", 1.0)
     λ_idt_B = getattr(opt, "lambda_idt_b", getattr(opt, "lambda_reg_b", 10.0))
-    # NCE supplémentaire sur contenu (invariance au style)
+
     cfg["content_nce_enable"] = bool(getattr(opt, "content_nce_enable", 0))
     cfg["lambda_content_nce"] = float(getattr(opt, "lambda_content_nce", 0.0))
 
@@ -444,16 +565,13 @@ def train_alternating(opt):
 
     cfg["λ_style_B_min"] = float(getattr(opt, "lambda_style_b_min", 0.0001))
     cfg["λ_style_B_max"] = float(getattr(opt, "lambda_style_b_max", 2.0))
-
     cfg["style_gain_B"] = float(getattr(opt, "style_gain_B", 1.0))
 
     cfg["style_B_warmup_ep"] = int(getattr(opt, "style_b_warmup_epochs", 1))
     cfg["style_balance_target"] = float(getattr(opt, "style_balance_target", 0.06))
     cfg["style_balance_alpha"] = float(getattr(opt, "style_balance_alpha", 0.10))
     cfg["lambda_nce_b"] = float(getattr(opt, "lambda_nce_b", 1.0))
-    cfg["lambda_idt_b"] = float(
-        getattr(opt, "lambda_idt_b", getattr(opt, "lambda_reg_b", 10.0))
-    )
+    cfg["lambda_idt_b"] = float(getattr(opt, "lambda_idt_b", getattr(opt, "lambda_reg_b", 10.0)))
 
     # --- MixSwap (tokens / FFT) ---
     cfg["mixswap_enable"] = bool(getattr(opt, "mixswap_enable", 0))
@@ -490,16 +608,11 @@ def train_alternating(opt):
     cfg["sem_two_styles"] = bool(getattr(opt, "sem_two_styles", False))
     cfg["sem_detach_far"] = int(getattr(opt, "sem_detach_far", 1))
     cfg["sem_use_aug"] = bool(getattr(opt, "sem_use_aug", False))
-    cfg["sem_jepa_on"] = bool(
-        sem_enable and getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False)
-    )
+    cfg["sem_jepa_on"] = bool(sem_enable and getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False))
 
     cfg["jepa_on"] = jepa_on_style or jepa_on_content
-
     cfg["jepa_mask_ratio"] = float(getattr(opt, "jepa_mask_ratio", 0.6))
-    cfg["lambda_jepa_style"] = float(
-        getattr(opt, "lambda_jepa_style", getattr(opt, "lambda_jepa", 0.15))
-    )
+    cfg["lambda_jepa_style"] = float(getattr(opt, "lambda_jepa_style", getattr(opt, "lambda_jepa", 0.15)))
     cfg["lambda_jepa_content"] = float(getattr(opt, "lambda_jepa_content", 0.15))
     cfg["lambda_jepa_var"] = float(getattr(opt, "lambda_jepa_var", 0.05))
     cfg["lambda_jepa_cov"] = float(getattr(opt, "lambda_jepa_cov", 0.05))
@@ -512,33 +625,17 @@ def train_alternating(opt):
     cfg["jepa_bias_high"] = float(getattr(opt, "jepa_mask_bias_high", 2.0))
 
     try:
-        _usr = [
-            float(x)
-            for x in str(
-                getattr(opt, "jepa_scale_weights", "2,2,1.5,1,0.75,0.5")
-            ).split(",")
-            if x.strip()
-        ]
+        _usr = [float(x) for x in str(getattr(opt, "jepa_scale_weights", "2,2,1.5,1,0.75,0.5")).split(",") if x.strip()]
         if _usr:
             jepa_scale_w = torch.tensor(_usr, dtype=torch.float32, device=dev)
         else:
-            jepa_scale_w = torch.tensor(
-                [2.0, 2.0, 1.5, 1.0, 0.75, 0.5],
-                dtype=torch.float32,
-                device=dev,
-            )
+            jepa_scale_w = torch.tensor([2.0, 2.0, 1.5, 1.0, 0.75, 0.5], dtype=torch.float32, device=dev)
     except Exception:
-        jepa_scale_w = torch.tensor(
-            [2.0, 2.0, 1.5, 1.0, 0.75, 0.5],
-            dtype=torch.float32,
-            device=dev,
-        )
+        jepa_scale_w = torch.tensor([2.0, 2.0, 1.5, 1.0, 0.75, 0.5], dtype=torch.float32, device=dev)
 
     cfg["jepa_scale_w"] = jepa_scale_w
 
-    cfg["feat_switch_epoch"] = int(
-        getattr(opt, "feat_switch_epoch", getattr(opt, "recon_epochs", 2))
-    )
+    cfg["feat_switch_epoch"] = int(getattr(opt, "feat_switch_epoch", getattr(opt, "recon_epochs", 2)))
     cfg["ema_every"] = int(getattr(opt, "ema_update_every", 1))
     cfg["nce_m"] = float(getattr(opt, "nce_m", 0.999))
 
@@ -566,10 +663,7 @@ def train_alternating(opt):
         return style_img
 
     def _build_style_cond_from_tokens(toks, tokG, for_G="A"):
-        if for_G == "A":
-            G = state["G_A"]
-        else:
-            G = state["G_B"]
+        G = state["G_A"] if for_G == "A" else state["G_B"]
         if hasattr(G, "build_style_cond_from_tokens"):
             return G.build_style_cond_from_tokens(toks, tokG)
         return (toks, tokG)
@@ -584,7 +678,7 @@ def train_alternating(opt):
     rounds_on_this_fold = 0
     fold_switch_every_rounds = int(getattr(opt, "fold_epochs", 4))
 
-    # --- Runtime pour la supervision (hybrid / sup_freeze) ---
+    # --- Runtime supervision (hybrid / sup_freeze) ---
     sup_runtime = {
         "inited": False,
         "G_sup": None,
@@ -608,32 +702,41 @@ def train_alternating(opt):
         run_sup_freeze_mode(
             opt=opt,
             loaders=loaders,
-            G_A=G_A,
-            G_B=G_B,
-            D_A=D_A,
-            D_B=D_B,
-            opt_GA=opt_GA,
-            opt_DA=opt_DA,
-            opt_GB=opt_GB,
-            opt_DB=opt_DB,
+            G_A=G_A, G_B=G_B,
+            D_A=D_A, D_B=D_B,
+            opt_GA=opt_GA, opt_DA=opt_DA,
+            opt_GB=opt_GB, opt_DB=opt_DB,
             dev=dev,
             writer=writer,
             tb_freq_C=tb_freq_C,
             global_step_start=state["global_step"],
         )
         if writer:
+            writer.flush()
             writer.close()
         return
 
     # =====================================================================================
-    #  MODES: auto / hybrid  (style + JEPA + sup hybride)
+    #  MODES: auto / hybrid
     # =====================================================================================
     ema_tau = float(getattr(opt, "ema_tau", 0.0))
     cycle_sched = cfg["cycle_sched"]
 
+    # --- Pour le logging throughput
+    epoch_wall_start = time.time()
+    last_step_wall = time.time()
+
+    # --- Optimizers dict pour log LR
+    optimizers = {
+        "GA": opt_GA,
+        "GB": opt_GB,
+        "DA": opt_DA,
+        "DB": opt_DB,
+        "SEM": state.get("opt_SEM", None),
+    }
+
     while state["epoch"] < opt.epochs:
         epoch = state["epoch"]
-
         epoch_meters = new_epoch_meters()
 
         src_iter, tgt_iter = iter(src_loader), iter(tgt_loader)
@@ -647,7 +750,7 @@ def train_alternating(opt):
         cfg["phase_current"] = phase
         cfg["epoch"] = epoch
 
-        # --- Mise à jour de λ_style_A / style_gain_A via le scheduler ---
+        # --- Mise à jour de λ_style_A
         try:
             style_sched_cfg = cfg.get("style_sched", None)
             if style_sched_cfg is not None:
@@ -668,16 +771,18 @@ def train_alternating(opt):
             f" | λN={λN:.3f} λL1/ID={λR:.3f} λ_style_A={cfg['λ_style_A']:.3f}"
         )
 
+        # --- TB epoch header
         if writer:
             writer.add_scalar("phase/epoch", epoch, state["global_step"])
             writer.add_scalar("A/style_lambda_epoch", float(cfg["λ_style_A"]), epoch)
+            _tb_add_scalars(writer, _get_lrs(optimizers), epoch, prefix="epoch_")
 
         # =================================================================================
         #  Boucle A/B : style + JEPA
         # =================================================================================
         if mode in ["auto", "hybrid"]:
             pbar = tqdm(range(nbatchs), ncols=180, leave=False)
-            for _ in pbar:
+            for it in pbar:
                 try:
                     x, _ = next(src_iter)
                 except StopIteration:
@@ -690,9 +795,10 @@ def train_alternating(opt):
                     tgt_iter = iter(tgt_loader)
                     y, _ = next(tgt_iter)
 
-                x, y = x.to(dev), y.to(dev)
+                x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
 
                 try:
+                    # --- train step
                     if phase.startswith("A"):
                         train_step_phase_A(
                             x=x,
@@ -713,45 +819,64 @@ def train_alternating(opt):
 
                     state["global_step"] += 1
 
-                    # --- Sauvegarde en mode "step" ---
+                    # --- Terminal + TB logging (scalars)
+                    step = state["global_step"]
+                    now = time.time()
+                    dt = max(1e-6, now - last_step_wall)
+                    last_step_wall = now
+
+                    scalars = _meters_to_scalars(epoch_meters)
+                    # throughput rough (batch/sec). Si tu veux image/sec: *batch_size
+                    scalars["time/batch_sec"] = float(dt)
+                    bs = int(getattr(opt, "batch_size", 0) or 0)
+                    if bs > 0:
+                        scalars["time/img_sec"] = float(bs / dt)
+
+                    # tqdm postfix
+                    postfix = _format_postfix(scalars, postfix_keys)
+                    if postfix:
+                        pbar.set_postfix_str(postfix)
+
+                    # prints terminal périodiques
+                    if print_freq > 0 and (step % print_freq == 0):
+                        _print_kv_line(f"[step {step}]",
+                                       scalars,
+                                       tuple(list(postfix_keys) + ["time/batch_sec", "time/img_sec"]))
+
+                    # TB: scalars périodiques
+                    if writer and tb_freq > 0 and (step % tb_freq == 0):
+                        # log aussi les LR au pas
+                        step_lrs = _get_lrs(optimizers)
+                        _tb_add_scalars(writer, step_lrs, step)
+                        _tb_add_scalars(writer, scalars, step, prefix="train/")
+                        _tb_maybe_flush(writer, every_steps=tb_freq, step=step)
+
+                    # --- Sauvegarde en mode "step"
                     if (
                         save_freq_mode == "step"
                         and save_freq_interval is not None
-                        and state["global_step"] % save_freq_interval == 0
+                        and step % save_freq_interval == 0
                     ):
                         save_checkpoint(
                             epoch,
-                            G_A,
-                            D_A,
-                            G_B,
-                            D_B,
-                            opt_GA,
-                            opt_DA,
-                            opt_GB,
-                            opt_DB,
-                            state["global_step"],
+                            G_A, D_A, G_B, D_B,
+                            opt_GA, opt_DA, opt_GB, opt_DB,
+                            step,
                             Path(opt.save_dir),
                             sem_model=state.get("SEM", None),
                             opt_sem=state.get("opt_SEM", None),
                         )
-                        save_state_json(epoch, state["global_step"], opt, Path(opt.save_dir))
+                        save_state_json(epoch, step, opt, Path(opt.save_dir))
 
                 except Exception as ex:
-                    msg = (
-                        f"[ERROR] step={state['global_step']} epoch={epoch} "
-                        f"{type(ex).__name__}: {ex}"
-                    )
+                    msg = f"[ERROR] step={state['global_step']} epoch={epoch} {type(ex).__name__}: {ex}"
                     tqdm.write(msg)
                     if getattr(opt, "print_trace_on_error", False):
                         import traceback as _tb
                         tqdm.write(_tb.format_exc())
                     if writer:
                         import traceback as _tb
-                        writer.add_text(
-                            "errors/exception",
-                            f"{msg}\n{_tb.format_exc()}",
-                            state["global_step"],
-                        )
+                        _tb_add_text(writer, "errors/exception", f"{msg}\n{_tb.format_exc()}", state["global_step"])
                     state["global_step"] += 1
                     continue
 
@@ -783,14 +908,8 @@ def train_alternating(opt):
             ):
                 save_checkpoint(
                     epoch,
-                    G_A,
-                    D_A,
-                    G_B,
-                    D_B,
-                    opt_GA,
-                    opt_DA,
-                    opt_GB,
-                    opt_DB,
+                    G_A, D_A, G_B, D_B,
+                    opt_GA, opt_DA, opt_GB, opt_DB,
                     state["global_step"],
                     Path(opt.save_dir),
                     sem_model=state.get("SEM", None),
@@ -807,7 +926,17 @@ def train_alternating(opt):
         if writer:
             writer.add_scalar("EMA/tau", float(ema_tau), epoch)
 
+        # --- Résumé epoch (terminal)
         print_epoch_summary(epoch, epoch_meters)
+
+        # --- TB: log averages epoch (si epoch_meters expose avg)
+        if writer:
+            epoch_scalars = _meters_to_scalars(epoch_meters)
+            _tb_add_scalars(writer, epoch_scalars, epoch, prefix="epoch/")
+            # temps écoulé depuis début run
+            wall = time.time() - epoch_wall_start
+            writer.add_scalar("time/wall_sec", float(wall), epoch)
+            writer.flush()
 
         # --- Step scheduler / folds ---
         cycle_sched.step_epoch()
@@ -821,7 +950,7 @@ def train_alternating(opt):
                 print(f"🔁 SWITCH FOLD → {current_fold}")
             cycle_sched.next_round()
 
-        # --- Sauvegarde périodique en mode "epoch" / "none" ---
+        # --- Sauvegarde périodique en mode "epoch" / "none"
         do_save_epoch = False
         if save_freq_mode == "epoch" and save_freq_interval is not None:
             if (epoch + 1) % save_freq_interval == 0:
@@ -833,14 +962,8 @@ def train_alternating(opt):
         if do_save_epoch:
             save_checkpoint(
                 epoch,
-                G_A,
-                D_A,
-                G_B,
-                D_B,
-                opt_GA,
-                opt_DA,
-                opt_GB,
-                opt_DB,
+                G_A, D_A, G_B, D_B,
+                opt_GA, opt_DA, opt_GB, opt_DB,
                 state["global_step"],
                 Path(opt.save_dir),
                 sem_model=state.get("SEM", None),
@@ -851,4 +974,5 @@ def train_alternating(opt):
         state["epoch"] += 1
 
     if writer:
+        writer.flush()
         writer.close()
