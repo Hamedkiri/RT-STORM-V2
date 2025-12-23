@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -------------------------------------------------------------
-#  test_style_tsne.py – t-SNE interactif, metrics, sup_predict,
+#  test.py – t-SNE interactif, metrics, sup_predict,
 #                       style transfer, cls_tokens, detect_transformer
 # -------------------------------------------------------------
 from __future__ import annotations
@@ -40,11 +40,11 @@ from tests.functions_for_test import (
     _save_tensor_as_image,
     spectral_noise_like,
     # nouveaux helpers détection
-    load_detection_model,
-    build_detection_dataloader,
-    compute_detection_metrics,
-    run_detection_on_camera,
+
 )
+
+
+
 
 
 def main() -> None:
