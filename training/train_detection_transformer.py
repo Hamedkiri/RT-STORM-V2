@@ -137,6 +137,46 @@ def _get_coco_cat_mapping(coco) -> Dict[int, str]:
     except Exception:
         return {}
 
+def _filter_empty_targets(images: torch.Tensor, targets: List[Dict[str, torch.Tensor]], dev, debug=False):
+    """
+    images: (B,C,H,W)
+    targets: list of dicts with at least "boxes" and "labels"
+    Return: list_images, list_targets, stats dict
+    """
+    B = images.shape[0]
+    imgs_list = []
+    tgts_list = []
+
+    total = B
+    used = 0
+    ignored = 0
+
+    for i in range(B):
+        t = targets[i]
+        boxes = t.get("boxes", None)
+        labels = t.get("labels", None)
+
+        ok = True
+        if boxes is None or labels is None:
+            ok = False
+        else:
+            if torch.is_tensor(boxes):
+                ok = boxes.numel() > 0 and boxes.shape[-1] == 4
+            else:
+                ok = False
+
+        if not ok:
+            ignored += 1
+            if debug:
+                print(f"[DEBUG DET] ignore img[{i}] (no valid boxes/labels)")
+            continue
+
+        imgs_list.append(images[i].to(dev))
+        tgts_list.append({k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in t.items()})
+        used += 1
+
+    stats = {"total": total, "used": used, "ignored": ignored}
+    return imgs_list, tgts_list, stats
 
 # --------------------------------------------------------------------------------------
 # HParams captured in ckpts
@@ -417,52 +457,108 @@ def _build_detector(
         return det_model, backbone_module, None
 
     # ------------------------------ FastRNN (custom RNN RoI head) ------------------------------
+    # ------------------------------ FastRNN (FCOS-like head with small RNN head) ------------------------------
     if head == "fastrnn":
         from models.detection.fastrnn_detector import FastRNNDetector
+        import torchvision.models as tvm
+        from torchvision.models._utils import IntermediateLayerGetter
+        import torch.nn as nn
 
-        # Choose backbone source
-        if feat_source == "semantic":
-            backbone = _SemanticResNetBackbone(pretrained=bool(getattr(opt, "sem_pretrained", 1)))
+        # ---------------- semantic ResNet50 backbone (traditional detection style) ----------------
+        class _SemanticResNetBackbone(nn.Module):
+            """
+            ResNet50 backbone returning ONE feature map from layer2/layer3/layer4 using IntermediateLayerGetter.
+            Output is a dict {"0": feat} (as expected by FastRNNDetector._extract_feat).
+            """
+
+            def __init__(self, return_layer: str = "layer4", pretrained: bool = True):
+                super().__init__()
+                return_layer = str(return_layer).lower().strip()
+                assert return_layer in ("layer2", "layer3", "layer4")
+
+                # weights API may differ depending torchvision version; keep it robust:
+                weights = None
+                try:
+                    if pretrained:
+                        weights = tvm.ResNet50_Weights.DEFAULT
+                except Exception:
+                    weights = "IMAGENET1K_V1" if pretrained else None
+
+                resnet = tvm.resnet50(weights=weights)
+                # remove classification head
+                resnet.avgpool = nn.Identity()
+                resnet.fc = nn.Identity()
+
+                self.body = IntermediateLayerGetter(resnet, {return_layer: "0"})
+                self.return_layer = return_layer
+                self.out_channels = {"layer2": 512, "layer3": 1024, "layer4": 2048}[return_layer]
+
+            def forward(self, x: torch.Tensor):
+                return self.body(x)  # dict {"0": feat}
+
+        # ---------------- choose feat source ----------------
+        feat_source = str(getattr(opt, "det_feat_source", "sem_resnet50")).lower().strip()
+        det_backbone_ckpt = getattr(opt, "det_backbone_ckpt", None)
+
+        if feat_source == "sem_resnet50":
+            return_layer = str(getattr(opt, "det_sem_return_layer", "layer4")).lower().strip()
+            sem_pretrained = bool(getattr(opt, "sem_pretrained", 1))
+
+            backbone = _SemanticResNetBackbone(return_layer=return_layer, pretrained=sem_pretrained).to(dev)
+
+            # optional load ckpt into the resnet body (best-effort)
             if det_backbone_ckpt:
-                _load_backbone_weights_from_ckpt(backbone.backbone, det_backbone_ckpt)
-            backbone_module = backbone.backbone
-            out_channels = int(getattr(backbone, "out_channels", 2048))
+                try:
+                    ckpt = torch.load(det_backbone_ckpt, map_location="cpu")
+                    sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
+                    # try to load directly into resnet inside IntermediateLayerGetter
+                    backbone.body.load_state_dict(sd, strict=False)
+                    print(f"✓ Loaded semantic ResNet weights from {det_backbone_ckpt} (strict=False)")
+                except Exception as e:
+                    print(f"⚠️ Could not load semantic ResNet weights from {det_backbone_ckpt}: {e}")
+
+            backbone_module = backbone  # for freeze/unfreeze convenience
+            out_channels = int(backbone.out_channels)
+
         else:
-            # UNet backbone (content/style)
+            # fallback: UNet backbone path (your existing one)
             token_dim = int(getattr(opt, "det_token_dim", 256))
             G_det = UNetGenerator(token_dim=token_dim).to(dev)
             if det_backbone_ckpt:
                 _load_backbone_weights_from_ckpt(G_det, det_backbone_ckpt)
-            backbone = _UNetFeatBackbone(G_det, feat_source=feat_source, style_level=str(getattr(opt, "det_style_level", "s5")))
-            backbone = backbone.to(dev)
+            backbone = _UNetFeatBackbone(
+                G_det,
+                feat_source=feat_source,  # "content" or "style" etc.
+                style_level=str(getattr(opt, "det_style_level", "s5")),
+            ).to(dev)
             backbone_module = G_det
-            # infer channels dynamically
             img_h = int(getattr(opt, "det_img_h", getattr(opt, "crop_size", 256)))
             img_w = int(getattr(opt, "det_img_w", getattr(opt, "crop_size", 256)))
-            out_channels = backbone.infer_out_channels(dev, img_h=img_h, img_w=img_w)
+            out_channels = int(backbone.infer_out_channels(dev, img_h=img_h, img_w=img_w))
 
+        # ✅ IMPORTANT: match FastRNNDetector signature EXACTLY
         det_model = FastRNNDetector(
             backbone=backbone,
-            backbone_out_channels=int(out_channels),
+            out_channels=int(out_channels),
             num_classes=int(num_classes),
-            hidden_dim=int(getattr(opt, "fastrnn_hidden", 256)),
-            bidirectional=bool(getattr(opt, "fastrnn_bidir", True)),
-            dropout=float(getattr(opt, "fastrnn_dropout", 0.0)),
+            head_hidden=int(getattr(opt, "fastrnn_hidden", 256)),
+            head_bidir=bool(getattr(opt, "fastrnn_bidir", True)),
+            head_dropout=float(getattr(opt, "fastrnn_dropout", 0.0)),
+            size_divisible=int(getattr(opt, "fastrnn_size_divisible", 32)),
             focal_alpha=float(getattr(opt, "fastrnn_focal_alpha", 0.25)),
             focal_gamma=float(getattr(opt, "fastrnn_focal_gamma", 2.0)),
             score_thresh=float(getattr(opt, "fastrnn_score_thresh", 0.05)),
             nms_thresh=float(getattr(opt, "fastrnn_nms_thresh", 0.5)),
-            detections_per_img=int(getattr(opt, "fastrnn_topk", 1000)),
+            topk=int(getattr(opt, "fastrnn_topk", 1000)),
         ).to(dev)
 
         # Freeze/unfreeze backbone module
+        freeze_backbone = bool(getattr(opt, "det_freeze_backbone", False))
         if freeze_backbone:
-            if backbone_module is not None:
-                freeze(backbone_module)
+            freeze(backbone_module)
             print(f"🧊 FastRNN backbone frozen (feat_source={feat_source}, C={out_channels})")
         else:
-            if backbone_module is not None:
-                unfreeze(backbone_module)
+            unfreeze(backbone_module)
             print(f"🔥 FastRNN backbone trainable (feat_source={feat_source}, C={out_channels})")
 
         return det_model, backbone_module, None
@@ -889,15 +985,20 @@ def train_detection_transformer(opt, dev: torch.device):
 
             optimizer.zero_grad(set_to_none=True)
 
-            if head_type in ("fasterrcnn", "fastrnn"):
+            if head_type == "fasterrcnn":
                 imgs_list = [im for im in imgs]
                 loss_dict = det_model(imgs_list, targets_list)
                 loss = sum(loss_dict.values())
-            else:  # detr
-                pred_logits, pred_boxes = det_model(imgs)
-                outputs = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
-                loss_dict = criterion(outputs, targets_list)
-                loss = sum(loss_dict[k] * criterion.weight_dict.get(k, 1.0) for k in loss_dict.keys())
+
+            elif head_type == "fastrnn":
+                debug_det = bool(getattr(opt, "debug_detection", False))
+                valid_imgs, valid_tgts, st = _filter_empty_targets(imgs, targets_list, dev=dev, debug=debug_det)
+                if st["used"] == 0:
+                    if debug_det:
+                        print("[DEBUG DET] batch skipped (0 valid images)")
+                    continue
+                loss_dict = det_model(valid_imgs, valid_tgts)
+                loss = sum(loss_dict.values())
 
             loss.backward()
             optimizer.step()
