@@ -5,13 +5,17 @@ def get_opts():
     """
     Hyper-paramètres pour le schéma Double-GAN (G_A, D_A, G_B, D_B)
     + phase C supervisée (SupHeads intégrées au UNet)
-    + modes classification (cls_tokens) et détection (DETR-like).
+    + modes classification (cls_tokens) et détection (fasterrcnn/detr/vitdet/fastrnn).
 
     Cette version intègre le nécessaire pour l'affichage:
       - terminal: --print_freq, --postfix_keys
       - TensorBoard: --tb, --tb_freq, --tb_freq_C, --tb_flush
       - checkpoints: --save_freq (string), --epoch_ckpt_interval (compat)
       - robustesse: --print_trace_on_error
+
+    Ajout: options complètes et cohérentes pour la détection FastRNN
+    entraînée sur les features de la branche sémantique ResNet50 (--sem_content),
+    avec gel total/partiel et LR séparés backbone/head.
     """
     import argparse
 
@@ -77,7 +81,7 @@ def get_opts():
             "  - hybrid : A+B puis C supervisé (SupHeads)\n"
             "  - sup_freeze : supervision seule, G/D gelés\n"
             "  - cls_tokens : classification à partir de tokens multi-échelles\n"
-            "  - detect_transformer : tête DETR-like pour détection"
+            "  - detect_transformer : entraînement détection (fasterrcnn/detr/vitdet/fastrnn)"
         ),
     )
     p.add_argument("--sup_from", choices=["GA", "GB"], default="GB",
@@ -127,7 +131,6 @@ def get_opts():
     # =========================================================================
     # 5) Pertes de base (NCE / L1 / style / supervision)
     # =========================================================================
-    # Phases A-adv / A-mix / B
     p.add_argument("--lambda_nce_a_adv", type=float, default=1.0,
                    help="Poids PatchNCE en phase A-adv.")
     p.add_argument("--lambda_reg_a_adv", type=float, default=1.0,
@@ -171,8 +174,8 @@ def get_opts():
     p.add_argument("--nce_layer_weights", type=str, default=None,
                    help="Poids relatifs par couche NCE (ex: '2,1,1').")
 
-    # NOTE: action="store_true" + default=True n'est pas idéal (flag impossible à désactiver).
-    # On fournit une option explicite pour désactiver si besoin.
+    # NOTE: store_true + default=True => impossible à désactiver proprement
+    # On conserve ton comportement mais on post-process via --no_nce_intra/inter.
     p.add_argument("--nce_intra", action="store_true", default=True,
                    help="Utiliser des négatifs intra-image (par défaut ON).")
     p.add_argument("--no_nce_intra", action="store_true",
@@ -235,13 +238,11 @@ def get_opts():
     p.add_argument("--style_balance_alpha", type=float, default=0.10,
                    help="Agressivité du contrôleur multiplicatif pour λ_style_B_dyn.")
 
-    # Régularisation SPADE / gating
     p.add_argument("--lambda_spade_gate", type=float, default=0.05,
                    help="Poids de la régularisation des portes SPADE (évite ws ≫ wg).")
     p.add_argument("--spade_gate_margin", type=float, default=0.75,
                    help="Marge de la régul SPADE: pénalise ReLU(margin*ws - wg).")
 
-    # Évaluations d'ablation de tokens
     p.add_argument("--token_ablate_eval_every", type=int, default=400,
                    help="Steps entre deux évaluations par ablation (gain=0).")
 
@@ -261,25 +262,21 @@ def get_opts():
     p.add_argument("--jepa_scale_weights", type=str, default="2,2,1.5,1,0.75,0.5",
                    help="Poids par échelle JEPA (tokG,t5,t4,t3,t2,t1).")
 
-    # Style vs contenu
     p.add_argument("--jepa_on_style", action="store_true", help="JEPA sur tokens de style.")
     p.add_argument("--jepa_on_content", action="store_true", help="JEPA sur features de contenu multi-échelles.")
     p.add_argument("--lambda_jepa_style", type=float, default=0.15, help="Poids JEPA sur style.")
     p.add_argument("--lambda_jepa_content", type=float, default=0.15, help="Poids JEPA sur contenu.")
 
-    # Architecture JEPA
     p.add_argument("--jepa_hidden_mult", type=int, default=2, help="Multiplicateur de largeur du MLP JEPA.")
     p.add_argument("--jepa_heads", type=int, default=4, help="Nombre de têtes d'attention JEPA.")
     p.add_argument("--jepa_norm", type=int, default=1, help="1: normalisation interne JEPA, 0: pas de norm.")
 
-    # Anti-collapse / distillation
     p.add_argument("--lambda_jepa_var", type=float, default=0.05, help="Poids variance (anti-collapse).")
     p.add_argument("--lambda_jepa_cov", type=float, default=0.05, help="Poids covariance (anti-redondance).")
     p.add_argument("--lambda_jepa_kd", type=float, default=0.05, help="Poids distillation depuis SupHeads.")
     p.add_argument("--jepa_use_teacher", type=int, default=1,
                    help="1: utiliser teachers EMA comme cibles, 0: student lui-même.")
 
-    # EMA teachers pour JEPA
     p.add_argument("--ema_update_every", type=int, default=1,
                    help="Fréquence (en itérations) d'update de T_A/T_B.")
     p.add_argument("--nce_m", type=float, default=0.999,
@@ -324,7 +321,6 @@ def get_opts():
             "  - cont_tok*: tokens de contenu via encode_content(x)\n"
         ),
     )
-
     p.add_argument("--delta_weights", type=str, default="1,1,1,1,1",
                    help="Poids par échelle pour 'tok+delta' (Δ[s5],Δ[s4],Δ[s3],Δ[s2],Δ[s1]).")
     p.add_argument("--sup_tasks_json", type=str, default=None,
@@ -337,38 +333,153 @@ def get_opts():
                    help="Gèle backbone pour cls_tokens/detect_transformer (peut être overridé).")
     p.add_argument("--cls_freeze_backbone", type=int, default=None,
                    help="Override freeze pour classification (None => global).")
-    p.add_argument("--det_freeze_backbone", type=int, default=None,
-                   help="Override freeze pour détection (None => global).")
+    # NB: det_freeze_backbone (override) est défini dans le bloc Détection ci-dessous.
 
     # =========================================================================
-    # 14) Détection transformer (DETR-like)
+    # 14) Détection (dataset COCO-like + choix head + FastRNN + freeze sémantique)
     # =========================================================================
+    # Dataset/IO
     p.add_argument("--det_train_img_root", type=str, default=None,
                    help="Dossier images train pour détection (COCO-like).")
     p.add_argument("--det_train_ann", type=str, default=None,
-                   help="Annotations train COCO-like (JSON).")
+                   help="Annotations train au format COCO (JSON).")
     p.add_argument("--det_val_img_root", type=str, default=None,
                    help="Dossier images val pour détection.")
     p.add_argument("--det_val_ann", type=str, default=None,
-                   help="Annotations val COCO-like (JSON).")
-    p.add_argument("--det_img_h", type=int, default=256, help="Hauteur images d'entrée détection.")
-    p.add_argument("--det_img_w", type=int, default=256, help="Largeur images d'entrée détection.")
+                   help="Annotations val au format COCO (JSON).")
+    p.add_argument("--det_img_h", type=int, default=256,
+                   help="Hauteur images d'entrée détection (resize).")
+    p.add_argument("--det_img_w", type=int, default=256,
+                   help="Largeur images d'entrée détection (resize).")
 
-    p.add_argument("--det_feat_branch", type=str, default="content",
-                   choices=["content", "style", "concat"], help="Features utilisés pour détection.")
-    p.add_argument("--det_backbone_ckpt", type=str, default=None,
-                   help="Checkpoint pour initialiser le backbone (auto-supervisé, etc.).")
+    # Classes / mapping
+    p.add_argument("--det_num_classes", type=int, default=91,
+                   help=("Nombre total de classes détection INCLUANT background "
+                         "(torchvision style)."))
+    p.add_argument("--det_classes_file", type=str, default="",
+                   help=("JSON listant classes autorisées (ids ou noms). "
+                         "Si fourni: mapping old_id->new_id (1..K) ; bg=0."))
+    p.add_argument("--det_debug_merge", action="store_true",
+                   help="Debug filtrage/merge des annotations détection.")
 
-    p.add_argument("--det_lr", type=float, default=1e-4, help="LR tête de détection.")
-    p.add_argument("--det_weight_decay", type=float, default=1e-4, help="Weight decay tête de détection.")
-    p.add_argument("--det_num_classes", type=int, default=91, help="Nb classes COCO-like.")
+    # Head choisi
+    p.add_argument("--det_head", type=str,
+                   choices=["fasterrcnn", "detr", "vitdet", "fastrnn"],
+                   default="fasterrcnn",
+                   help="Type de tête de détection: fasterrcnn/detr/vitdet/fastrnn.")
+
+    # Action de détection (appelée via --mode detect_transformer)
+    p.add_argument("--det_run", type=str, default="train",
+                   choices=["train", "eval", "camera"],
+                   help=("Action en mode détection :\n"
+                         "  - train  : entraîne le détecteur\n"
+                         "  - eval   : évalue un checkpoint sur COCO (mAP)\n"
+                         "  - camera : démo caméra (webcam/RTSP via OpenCV)"))
+
+    # Checkpoints détection
+    p.add_argument("--det_ckpt", type=str, default="",
+                   help=("Checkpoint détecteur (.pth) à charger pour eval/camera, "
+                         "ou pour fine-tuning. Si vide: tente detector_best.pth puis detector_last.pth dans --save_dir."))
+    p.add_argument("--det_resume", type=str, default="",
+                   help=("Checkpoint détecteur (.pth) à reprendre pour continuer l'entraînement "
+                         "(reprend epoch/optimizer)."))
+
+    # Source de features
+    p.add_argument("--det_feat_source", type=str, default="sem_resnet50",
+                   choices=["unet_content", "unet_style", "unet_concat", "sem_resnet50"],
+                   help=("Source de features pour détection.\n"
+                         "  - sem_resnet50 : utilise la branche --sem_content (ResNet50)\n"
+                         "  - unet_* : utilise les features internes UNet/ST-STORM"))
+
+    # Si det_feat_source=sem_resnet50, on choisit la couche exportée
+    p.add_argument("--det_sem_return_layer", type=str, default="layer4",
+                   choices=["layer2", "layer3", "layer4"],
+                   help=("Couche ResNet sémantique fournie au head.\n"
+                         "layer2(stride~8), layer3(~16), layer4(~32)"))
+
+    # Gel backbone pour détection (override du global)
+    p.add_argument("--det_freeze_backbone", type=int, default=None,
+                   help=("Override gel backbone en détection: "
+                         "None=>--freeze_backbone ; 1=>gel ; 0=>trainable."))
+
+    # Gel fin du ResNet sémantique (si utilisé en détection)
+    p.add_argument("--det_sem_freeze_at", type=int, default=-1,
+                   choices=[-1, 0, 1, 2, 3, 4],
+                   help=("Gel progressif du ResNet sémantique (si det_feat_source=sem_resnet50):\n"
+                         " -1: rien gelé\n"
+                         "  0: conv1+bn1\n"
+                         "  1: +layer1\n"
+                         "  2: +layer2\n"
+                         "  3: +layer3\n"
+                         "  4: +layer4 (tout)"))
+
+    # Option: pendant les epochs détection, couper les pertes sem (MoCo/JEPA-content)
+    p.add_argument("--det_disable_sem_losses", action="store_true",
+                   help="En mode détection: ne calcule pas les losses sem (MoCo/JEPA-content).")
+
+    # Optim détection
+    p.add_argument("--det_epochs", type=int, default=20, help="Nb epochs détection.")
+    p.add_argument("--det_lr_head", type=float, default=1e-4, help="LR tête de détection.")
+    p.add_argument("--det_lr_backbone", type=float, default=1e-5,
+                   help="LR backbone en détection (si non gelé).")
+    p.add_argument("--det_weight_decay", type=float, default=1e-4, help="Weight decay détection.")
+    p.add_argument("--det_grad_clip", type=float, default=0.0, help="Grad clip norm (0=off).")
+
+    # DETR-like (si det_head='detr')
     p.add_argument("--det_num_queries", type=int, default=300, help="Nb queries DETR.")
     p.add_argument("--det_nheads", type=int, default=8, help="Nb têtes attention décodeur.")
     p.add_argument("--det_dec_layers", type=int, default=6, help="Nb couches décodeur DETR.")
     p.add_argument("--det_eos_coef", type=float, default=0.1, help="Poids 'no object' DETR.")
-    p.add_argument("--det_epochs", type=int, default=20, help="Nb epochs détection.")
-    p.add_argument("--det_head_type", type=str, default="simple_unet",
-                   help="Tête: 'simple_unet' (UNet+SimpleDETRHead) ou 'detr_resnet50'")
+
+    # FasterRCNN (si det_head='fasterrcnn') - anchors
+    p.add_argument("--fasterrcnn_anchor_sizes", type=str, default="32,64,128,256,512",
+                   help="Anchor sizes (comma-separated).")
+    p.add_argument("--fasterrcnn_aspect_ratios", type=str, default="0.5,1.0,2.0",
+                   help="Anchor aspect ratios (comma-separated).")
+
+    # FastRNN (si det_head='fastrnn')
+    p.add_argument("--fastrnn_hidden", type=int, default=256, help="Dim interne FastRNN head.")
+    p.add_argument("--fastrnn_dropout", type=float, default=0.0, help="Dropout FastRNN head.")
+
+    # Bool propre: bidir par défaut ON, désactivable avec --fastrnn_no_bidir
+    p.add_argument("--fastrnn_bidir", action="store_true",
+                   help="Active FastRNN bidirectionnel.")
+    p.add_argument("--fastrnn_no_bidir", action="store_true",
+                   help="Force FastRNN unidirectionnel.")
+
+    # Loss anchor-free (focal + reg + centerness)
+    p.add_argument("--fastrnn_focal_alpha", type=float, default=0.25)
+    p.add_argument("--fastrnn_focal_gamma", type=float, default=2.0)
+    p.add_argument("--fastrnn_lambda_reg", type=float, default=1.0)
+    p.add_argument("--fastrnn_lambda_ctr", type=float, default=1.0)
+    p.add_argument("--fastrnn_lambda_cls", type=float, default=1.0)
+
+    # Inference / post-process
+    p.add_argument("--fastrnn_score_thresh", type=float, default=0.05)
+    p.add_argument("--fastrnn_nms_thresh", type=float, default=0.5)
+    p.add_argument("--fastrnn_topk", type=int, default=1000)
+    p.add_argument("--fastrnn_size_divisible", type=int, default=32,
+                   help="Padding images pour batch (multiple de).")
+    p.add_argument("--fastrnn_force_stride", type=int, default=0,
+                   help="0=auto, sinon impose un stride constant (ex 32).")
+
+    # Évaluation COCO
+    p.add_argument("--det_eval_iou_types", type=str, default="bbox",
+                   help="Types IoU COCOeval (ex: 'bbox' ou 'bbox,segm').")
+    p.add_argument("--det_eval_max_dets", type=int, default=100,
+                   help="COCOeval maxDets (par image).")
+    p.add_argument("--det_eval_limit", type=int, default=0,
+                   help="Limite nb d'images en évaluation (0=val complet).")
+
+    # Caméra (OpenCV)
+    p.add_argument("--det_cam_id", type=int, default=0,
+                   help="ID caméra OpenCV (0,1,...) ou index si webcam.")
+    p.add_argument("--det_cam_url", type=str, default="",
+                   help="URL caméra (RTSP/HTTP). Si défini, prioritaire sur --det_cam_id.")
+    p.add_argument("--det_cam_threshold", type=float, default=0.35,
+                   help="Seuil score pour afficher les boxes à la caméra.")
+    p.add_argument("--det_cam_save", type=str, default="",
+                   help="Chemin de sortie vidéo (.mp4) pour enregistrer la démo caméra (optionnel).")
 
     # =========================================================================
     # 15) Classification via tokens (cls_tokens)
@@ -392,7 +503,6 @@ def get_opts():
     # =========================================================================
     # 16) Logs & checkpoints
     # =========================================================================
-    # TensorBoard
     p.add_argument("--tb", action="store_true", help="Active TensorBoard.")
     p.add_argument("--tb_freq", type=int, default=100,
                    help="Itérations entre deux logs TensorBoard (A/B).")
@@ -401,14 +511,13 @@ def get_opts():
     p.add_argument("--tb_flush", type=int, default=100,
                    help="Flush TB tous les N steps (0 => jamais).")
 
-    # Checkpoints
-    # IMPORTANT: train_style_disentangle.py utilise _parse_save_freq qui accepte string (epoch:5, step:1000, none)
     p.add_argument("--save_freq", type=str, default="epoch",
                    help="Fréquence ckpt: 'epoch', 'epoch:N', 'step', 'step:N', 'none' ou 'N' (step:N).")
     p.add_argument("--epoch_ckpt_interval", type=int, default=None,
                    help="Compat: intervalle en epochs si tu veux forcer un N (override save_freq epoch).")
 
-    p.add_argument("--resume_dir", type=str, default=None, help="Répertoire de reprise (checkpoint précédent).")
+    p.add_argument("--resume_dir", type=str, default=None,
+                   help="Répertoire de reprise (checkpoint précédent).")
     p.add_argument("--print_trace_on_error", action="store_true",
                    help="Affiche le traceback complet en cas d'exception.")
 
@@ -444,7 +553,6 @@ def get_opts():
     p.add_argument("--sem_m", type=float, default=0.999, help="Momentum EMA encodeur MoCo.")
     p.add_argument("--sem_t", type=float, default=0.2, help="Température MoCo (InfoNCE).")
 
-    # --- Pretrained path (chargement externe MoCo v3 etc.)
     p.add_argument("--sem_pretrained_path", type=str, default=None,
                    help="Chemin vers un checkpoint externe pour initialiser le backbone sémantique.")
     p.add_argument("--sem_pretrained_strict", type=int, default=0,
@@ -452,7 +560,6 @@ def get_opts():
     p.add_argument("--sem_pretrained_verbose", type=int, default=1,
                    help="1: logs chargement checkpoint ; 0: silencieux.")
 
-    # --- Augmentations pour branche sémantique
     p.add_argument("--sem_use_aug", action="store_true",
                    help="Augmentations SimCLR-like pour le contraste (en plus de la vue far).")
     p.add_argument("--sem_crop", type=int, default=224, help="Taille crop branche sémantique.")
@@ -469,6 +576,9 @@ def get_opts():
     p.add_argument("--debug", action="store_true",
                    help="Mode debug: peut réduire nbatchs ailleurs si tu l'implémentes.")
 
+    # =========================================================================
+    # Parse
+    # =========================================================================
     args = p.parse_args()
 
     # --- Post-process flags incohérents (nce_intra/inter)
@@ -476,5 +586,24 @@ def get_opts():
         args.nce_intra = False
     if getattr(args, "no_nce_inter", False):
         args.nce_inter = False
+
+    # --- FastRNN bidir : défaut ON, désactivable
+    if getattr(args, "fastrnn_no_bidir", False):
+        args.fastrnn_bidir = False
+    else:
+        # défaut = True (si tu ne passes aucun flag)
+        args.fastrnn_bidir = True
+
+    # --- Override freeze backbone détection : fallback sur freeze_backbone global
+    if args.det_freeze_backbone is None:
+        args.det_freeze_backbone = 1 if getattr(args, "freeze_backbone", False) else 0
+    else:
+        args.det_freeze_backbone = int(args.det_freeze_backbone)
+
+    # --- Override freeze backbone classification : fallback sur freeze_backbone global
+    if args.cls_freeze_backbone is None:
+        args.cls_freeze_backbone = 1 if getattr(args, "freeze_backbone", False) else 0
+    else:
+        args.cls_freeze_backbone = int(args.cls_freeze_backbone)
 
     return args

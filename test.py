@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader, Subset
 
 
 
-from training.functionsTest import (
+from tests.functions_for_test import (
     compute_style_embeddings,
     load_models,
     compute_metrics,

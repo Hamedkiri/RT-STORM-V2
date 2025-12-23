@@ -1002,54 +1002,175 @@ def train_step_phase_A(
         except Exception:
             return default
 
+    def _is_finite(v):
+        try:
+            return (v is not None) and (not math.isnan(float(v))) and (not math.isinf(float(v)))
+        except Exception:
+            return False
+
     def _tqdm_write(msg: str):
-        # doesn't break training if tqdm isn't available
         try:
             from tqdm import tqdm
             tqdm.write(msg)
         except Exception:
             print(msg)
 
-    def _log_sem(writer, tag_prefix: str, sem_loss_val, sem_stats: dict, step: int):
+    def _get_stat(stats: dict, *keys, default=0.0):
+        if not isinstance(stats, dict):
+            return default
+        for k in keys:
+            if k in stats:
+                fv = _to_float(stats.get(k), None)
+                if fv is not None:
+                    return fv
+        return default
+
+    def _ema_update(state_dict, key: str, value: float, beta: float):
+        """EMA stored in state_dict[key]."""
+        if not _is_finite(value):
+            return None
+        if key not in state_dict or state_dict[key] is None:
+            state_dict[key] = float(value)
+        else:
+            state_dict[key] = float(beta) * float(state_dict[key]) + (1.0 - float(beta)) * float(value)
+        return state_dict[key]
+
+    def _sem_track_update(state, phase_tag: str, moco_v: float, jepa_v: float, total_v: float):
         """
-        Logs SEM losses + any scalar diagnostics in sem_stats to TensorBoard.
-        Works even if sem_stats contains tensors / numpy / python scalars.
+        Maintains:
+          - SEM refs (first observed values) to compute relative curves
+          - EMA curves
+        Stored in state["sem_track"].
+        """
+        eps = float(cfg.get("sem_rel_eps", 1e-8))
+        beta = float(cfg.get("sem_ema_beta", 0.98))
+
+        tr = state.get("sem_track", None)
+        if tr is None:
+            tr = {}
+            state["sem_track"] = tr
+
+        # reference values per phase (A/B)
+        ref = tr.get(f"ref_{phase_tag}", None)
+        if ref is None:
+            ref = {"moco": None, "jepa": None, "total": None}
+            tr[f"ref_{phase_tag}"] = ref
+
+        # init refs once
+        if ref["moco"] is None and _is_finite(moco_v) and moco_v > 0:
+            ref["moco"] = float(moco_v)
+        if ref["jepa"] is None and _is_finite(jepa_v) and jepa_v > 0:
+            ref["jepa"] = float(jepa_v)
+        if ref["total"] is None and _is_finite(total_v) and total_v > 0:
+            ref["total"] = float(total_v)
+
+        # EMA values per phase
+        ema = tr.get(f"ema_{phase_tag}", None)
+        if ema is None:
+            ema = {"moco": None, "jepa": None, "total": None}
+            tr[f"ema_{phase_tag}"] = ema
+
+        ema_m = _ema_update(ema, "moco", moco_v, beta)
+        ema_j = _ema_update(ema, "jepa", jepa_v, beta)
+        ema_t = _ema_update(ema, "total", total_v, beta)
+
+        # relative ratios (vs first ref)
+        rel_m = None
+        rel_j = None
+        rel_t = None
+        if ref["moco"] is not None and _is_finite(moco_v):
+            rel_m = float(moco_v) / (float(ref["moco"]) + eps)
+        if ref["jepa"] is not None and _is_finite(jepa_v):
+            rel_j = float(jepa_v) / (float(ref["jepa"]) + eps)
+        if ref["total"] is not None and _is_finite(total_v):
+            rel_t = float(total_v) / (float(ref["total"]) + eps)
+
+        return {
+            "ref_moco": ref["moco"], "ref_jepa": ref["jepa"], "ref_total": ref["total"],
+            "ema_moco": ema_m, "ema_jepa": ema_j, "ema_total": ema_t,
+            "rel_moco": rel_m, "rel_jepa": rel_j, "rel_total": rel_t,
+        }
+
+    def _log_sem_curves(writer, phase: str, sem_loss_val, sem_stats: dict, step: int, q_vec=None, k_vec=None):
+        """
+        Logs:
+          - SEM/{phase}/raw : moco, jepa, total, lambdas
+          - SEM/{phase}/rel : rel_moco, rel_jepa, rel_total
+          - SEM/{phase}/ema : ema_moco, ema_jepa, ema_total
+          - SEM/{phase}/qk  : cos_sim, norm_q, norm_k (if q/k available)
         """
         if writer is None:
             return
 
-        scalars = {}
-        scalars["loss_total"] = _to_float(sem_loss_val, 0.0)
+        # Accept both key styles
+        moco_v = _get_stat(sem_stats, "moco", "MoCo", default=0.0)
+        jepa_v = _get_stat(sem_stats, "jepa", "JEPA_content", "JEPA", default=0.0)
+        total_v = _get_stat(sem_stats, "loss_total", "total", default=_to_float(sem_loss_val, 0.0))
+        lam_sem = _get_stat(sem_stats, "lam_sem", "λ_sem", default=float(cfg.get("lambda_sem", 0.0)))
+        lam_jepa = _get_stat(sem_stats, "lam_jepa", "λ_sem_jepa", "λ_jepa", default=float(cfg.get("lambda_jepa_content", 0.0)))
 
-        # Standard expected keys (safe even if missing)
-        if isinstance(sem_stats, dict):
-            for k in ["moco", "jepa", "lam_sem", "lam_jepa", "tau", "queue_size",
-                      "pos_sim", "neg_sim", "pos_logit", "neg_logit",
-                      "acc_pos", "acc", "top1", "top5",
-                      "var", "cov", "std", "norm_q", "norm_k",
-                      "loss_moco", "loss_jepa", "loss_kd"]:
-                if k in sem_stats:
-                    fv = _to_float(sem_stats.get(k), None)
-                    if fv is not None and (not math.isnan(fv)) and (not math.isinf(fv)):
-                        scalars[k] = fv
+        # Update state tracking (refs, EMA, rel)
+        tr = _sem_track_update(state, phase, moco_v, jepa_v, total_v)
 
-            # Generic: log any other scalar-like entries (avoid huge spam)
-            extra = 0
-            for k, v in sem_stats.items():
-                if k in scalars:
-                    continue
-                if extra >= int(cfg.get("sem_tb_max_extra_keys", 32)):
-                    break
-                fv = _to_float(v, None)
-                if fv is None:
-                    continue
-                if math.isnan(fv) or math.isinf(fv):
-                    continue
-                # avoid logging very large dicts/arrays accidentally
-                scalars[str(k)] = fv
-                extra += 1
+        # RAW
+        writer.add_scalars(
+            f"SEM/{phase}/raw",
+            {
+                "MoCo": float(moco_v),
+                "JEPA_content": float(jepa_v),
+                "loss_total": float(total_v),
+                "λ_sem": float(lam_sem),
+                "λ_jepa": float(lam_jepa),
+            },
+            step
+        )
 
-        writer.add_scalars(tag_prefix, scalars, step)
+        # REL (relative to first seen)
+        rel_dict = {}
+        if tr["rel_moco"] is not None:
+            rel_dict["MoCo_rel"] = float(tr["rel_moco"])
+            rel_dict["MoCo_%"] = 100.0 * float(tr["rel_moco"])
+        if tr["rel_jepa"] is not None:
+            rel_dict["JEPA_rel"] = float(tr["rel_jepa"])
+            rel_dict["JEPA_%"] = 100.0 * float(tr["rel_jepa"])
+        if tr["rel_total"] is not None:
+            rel_dict["total_rel"] = float(tr["rel_total"])
+            rel_dict["total_%"] = 100.0 * float(tr["rel_total"])
+        if rel_dict:
+            writer.add_scalars(f"SEM/{phase}/rel", rel_dict, step)
+
+        # EMA
+        ema_dict = {}
+        if tr["ema_moco"] is not None:
+            ema_dict["MoCo_ema"] = float(tr["ema_moco"])
+        if tr["ema_jepa"] is not None:
+            ema_dict["JEPA_ema"] = float(tr["ema_jepa"])
+        if tr["ema_total"] is not None:
+            ema_dict["total_ema"] = float(tr["ema_total"])
+        if ema_dict:
+            writer.add_scalars(f"SEM/{phase}/ema", ema_dict, step)
+
+        # q/k diagnostics (optional)
+        if (q_vec is not None) and (k_vec is not None) and torch.is_tensor(q_vec) and torch.is_tensor(k_vec):
+            try:
+                q = q_vec.detach()
+                k = k_vec.detach()
+                # normalize
+                qn = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
+                kn = k / (k.norm(dim=-1, keepdim=True) + 1e-8)
+                cos = (qn * kn).sum(dim=-1)  # (B,)
+                writer.add_scalars(
+                    f"SEM/{phase}/qk",
+                    {
+                        "cos_mean": float(cos.mean().cpu().item()),
+                        "cos_std": float(cos.std(unbiased=False).cpu().item()) if cos.numel() > 1 else 0.0,
+                        "norm_q": float(q.norm(dim=-1).mean().cpu().item()),
+                        "norm_k": float(k.norm(dim=-1).mean().cpu().item()),
+                    },
+                    step
+                )
+            except Exception:
+                pass
 
     # ----------------------------
     # Setup / unpack
@@ -1095,12 +1216,10 @@ def train_step_phase_A(
     λN = cfg["λN_current"]
     λR = cfg["λR_current"]
 
-    # --- Lambda style A (fixed or scheduled) ---
     λ_style_A = get_style_lambda(epoch=state.get("epoch", 0), cfg=cfg, base_lambda_key="λ_style_A")
     λ_spade = cfg["λ_spade"]
     spade_marg = cfg["spade_margin"]
 
-    # New weight for content-contrast on two styles
     λ_content_nce2 = float(cfg.get("lambda_content_nce_two_styles", 0.0))
 
     mixswap_enable = cfg["mixswap_enable"]
@@ -1127,9 +1246,6 @@ def train_step_phase_A(
 
     use_B_feats = (state.get("epoch", 0) >= cfg["feat_switch_epoch"])
 
-    # ------------------------------------------------------------------
-    # Helper : adapt jepa_scale_w to seq length S
-    # ------------------------------------------------------------------
     def _make_jepa_w_for_seq(S, device):
         base = jepa_scale_base
         if isinstance(base, torch.Tensor):
@@ -1140,9 +1256,6 @@ def train_step_phase_A(
         val = float(base)
         return torch.full((S,), val, device=device)
 
-    # ------------------------------------------------------------------
-    # Helper JEPA content multi-scale
-    # ------------------------------------------------------------------
     def stack_content_tokens_multiscale_for_jepa(feat_dict, ref_key="bot"):
         if not feat_dict:
             return None
@@ -1160,9 +1273,9 @@ def train_step_phase_A(
             maps.append(f)
         if not maps:
             return None
-        f_cat = torch.cat(maps, dim=1)                      # B x Ctot x H x W
+        f_cat = torch.cat(maps, dim=1)
         Bc, Ctot, Hr, Wr = f_cat.shape
-        Ts = f_cat.view(Bc, Ctot, Hr * Wr).transpose(1, 2)  # B x S x Ctot
+        Ts = f_cat.view(Bc, Ctot, Hr * Wr).transpose(1, 2)
         return Ts
 
     # ----------------------------
@@ -1172,7 +1285,6 @@ def train_step_phase_A(
         perm = torch.randperm(x.size(0), device=x.device)
         y_alt = y[perm]
 
-        # optional FFT perturbation in phase A
         if mixswap_fft_p > 0.0 and (random.random() < mixswap_fft_p):
             alpha_fft = random.uniform(mixswap_alpha_lo, mixswap_alpha_hi)
             y = fft_amp_mix_fn(y, y_alt, alpha_fft).clamp(-1, 1)
@@ -1195,7 +1307,6 @@ def train_step_phase_A(
         style_cond_A = cfg["build_style_cond"](G_A, y)
         style_target_for_loss = ("image", y)
 
-    # Style gain
     style_gain_A = float(cfg.get("style_gain_A", 1.0))
     style_cond_A = apply_style_gain(style_cond_A, style_gain_A)
 
@@ -1240,20 +1351,18 @@ def train_step_phase_A(
             highpass_fn=highpass_fn
         )
 
-    # NCE content x vs far
     if use_B_feats:
         feats_x = nce_feats_dict(T_B, x, normalize=True, no_grad=False)
         feats_f = nce_feats_dict(T_B, far, normalize=True, no_grad=False)
     else:
         feats_x = nce_feats_dict(G_A, x, normalize=True, no_grad=False)
-        feats_x = {k: v.detach() for k, v in feats_x.items()}  # content anchor detached
+        feats_x = {k: v.detach() for k, v in feats_x.items()}
         feats_f = nce_feats_dict(G_A, far, normalize=True, no_grad=False)
 
     nce_total = 0.0
     for l, w in zip(nce_layers, layer_w):
         nce_total = nce_total + (w * nce_loss(feats_x[l], feats_f[l]))
 
-    # NCE content consistency across two different styles
     content_nce_2 = torch.tensor(0.0, device=dev)
     if λ_content_nce2 > 0.0 and x.size(0) > 1:
         perm2 = torch.randperm(x.size(0), device=x.device)
@@ -1276,14 +1385,12 @@ def train_step_phase_A(
             layer_w=layer_w,
         )
 
-    # Style tokens loss
     if style_target_for_loss[0] == "image":
         styA = style_loss_tokens(far, style_target_for_loss[1], teacher_G=T_A)
     else:
         _, toks_t, tokG_t = style_target_for_loss
         styA = style_loss_tokens_to_target(far, toks_t, tokG_t, teacher_G=T_A)
 
-    # Texture losses
     tex_A_total = torch.tensor(0.0, device=dev)
     if tex_enable and tex_apply_A:
         if tex_use_fft and λ_fft > 0:
@@ -1311,7 +1418,6 @@ def train_step_phase_A(
     if do_jepa:
         from models.jepa import TokenJEPA
 
-        # --- JEPA STYLE ---
         if jepa_on_style:
             style_sigma = float(tex_sigma)
             style_gamma = float(tex_gamma)
@@ -1358,7 +1464,6 @@ def train_step_phase_A(
                     if H is not None:
                         jepa_attn_styleA_H = _to_float(H, None)
 
-        # --- JEPA CONTENT (multi-scale) ---
         if jepa_on_content:
             x_v1c, x_v2c = two_style_views(x, sigma=0.0, gamma=1.0, flip_p=0.5)
 
@@ -1434,7 +1539,6 @@ def train_step_phase_A(
             for po, pt in zip(src.parameters(), tgt.parameters()):
                 pt.data.mul_(nce_m).add_(po.data, alpha=1.0 - nce_m)
 
-    # Replay + style bank
     state["replay"].extend(far.detach().cpu())
     state["style_bank"].extend(y.detach().cpu())
 
@@ -1456,10 +1560,12 @@ def train_step_phase_A(
         epoch_meters["A"]["total"].add(float(totalA.item()))
 
     # =============================================================================
-    # ✅ SEM branch (MoCo + JEPA-content) + TensorBoard (loss + diagnostics + exception counter)
+    # ✅ SEM branch (MoCo + JEPA-content) + evolution curves (raw/rel/ema)
     # =============================================================================
     sem_loss_val = None
     sem_stats = None
+    q_vec = None
+    k_vec = None
     sem_exc = 0
 
     sem_enabled = bool(cfg.get("sem_enable", False)) and ("SEM" in state)
@@ -1467,13 +1573,18 @@ def train_step_phase_A(
         try:
             sem_out = semantic_content_step_moco_jepa(x, far, y, state, cfg)
             if sem_out is not None:
-                sem_loss_val, sem_stats = sem_out  # sem_loss_val: float/tensor, sem_stats: dict
-                # epoch meters
-                if isinstance(sem_stats, dict):
-                    epoch_meters["SEM"]["MoCo"].add(float(_to_float(sem_stats.get("moco", 0.0), 0.0)))
-                    epoch_meters["SEM"]["JEPA_content"].add(float(_to_float(sem_stats.get("jepa", 0.0), 0.0)))
-                    epoch_meters["SEM"]["λ_sem"].add(float(_to_float(sem_stats.get("lam_sem", cfg.get("lambda_sem", 0.0)), 0.0)))
-                    epoch_meters["SEM"]["λ_sem_jepa"].add(float(_to_float(sem_stats.get("lam_jepa", cfg.get("lambda_jepa_content", 0.0)), 0.0)))
+                # NEW: (total, stats, q, k)
+                sem_loss_val, sem_stats, q_vec, k_vec = sem_out
+
+                # epoch meters (accept both key conventions)
+                moco_v = _get_stat(sem_stats, "moco", "MoCo", default=0.0)
+                jepa_v = _get_stat(sem_stats, "jepa", "JEPA_content", default=0.0)
+                lam_sem = _get_stat(sem_stats, "lam_sem", "λ_sem", default=float(cfg.get("lambda_sem", 0.0)))
+                lam_jepa = _get_stat(sem_stats, "lam_jepa", "λ_sem_jepa", default=float(cfg.get("lambda_jepa_content", 0.0)))
+                epoch_meters["SEM"]["MoCo"].add(float(moco_v))
+                epoch_meters["SEM"]["JEPA_content"].add(float(jepa_v))
+                epoch_meters["SEM"]["λ_sem"].add(float(lam_sem))
+                epoch_meters["SEM"]["λ_sem_jepa"].add(float(lam_jepa))
                 epoch_meters["SEM"]["total"].add(float(_to_float(sem_loss_val, 0.0)))
         except Exception:
             sem_exc = 1
@@ -1536,7 +1647,6 @@ def train_step_phase_A(
         if jepa_attn_scalars:
             writer.add_scalars("A/JEPA_attn", jepa_attn_scalars, global_step)
 
-        # images
         xa = cfg["_denorm"](x)
         ya = cfg["_denorm"](y)
         fa = cfg["_denorm"](far)
@@ -1550,25 +1660,23 @@ def train_step_phase_A(
             pass
 
     # ----------------------------
-    # ✅ SEM TensorBoard + terminal (A)
+    # ✅ SEM TensorBoard + terminal (A)  + evolution curves
     # ----------------------------
     if writer and sem_enabled and (global_step % tb_freq_sem == 0):
-        # even if SEM failed: show exception counter
         writer.add_scalar("SEM/exceptions_total", float(state.get("sem_exceptions", 0)), global_step)
         writer.add_scalar("SEM/A/exception_step", float(sem_exc), global_step)
 
-    if sem_loss_val is not None and sem_stats is not None:
+    if (sem_loss_val is not None) and (sem_stats is not None):
         if writer and (global_step % tb_freq_sem == 0):
-            _log_sem(writer, "SEM/A", sem_loss_val, sem_stats, global_step)
+            _log_sem_curves(writer, "A", sem_loss_val, sem_stats, global_step, q_vec=q_vec, k_vec=k_vec)
 
         if (global_step % sem_print_every) == 0:
+            moco_v = _get_stat(sem_stats, "moco", "MoCo", default=0.0)
+            jepa_v = _get_stat(sem_stats, "jepa", "JEPA_content", default=0.0)
+            tot_v = _get_stat(sem_stats, "loss_total", default=_to_float(sem_loss_val, 0.0))
             _tqdm_write(
                 f"[SEM/A] step={global_step}  "
-                f"MoCo={_to_float(sem_stats.get('moco', 0.0), 0.0):.4f}  "
-                f"JEPAc={_to_float(sem_stats.get('jepa', 0.0), 0.0):.4f}  "
-                f"total={_to_float(sem_loss_val, 0.0):.4f}  "
-                f"λ_sem={_to_float(sem_stats.get('lam_sem', cfg.get('lambda_sem', 0.0)), 0.0):.3g}  "
-                f"λ_jepa={_to_float(sem_stats.get('lam_jepa', cfg.get('lambda_jepa_content', 0.0)), 0.0):.3g}"
+                f"MoCo={moco_v:.4f}  JEPAc={jepa_v:.4f}  total={tot_v:.4f}"
             )
 
     # ----------------------------
@@ -1596,7 +1704,7 @@ def train_step_phase_B(
     import torch.nn.functional as F
 
     # ----------------------------
-    # Small safe helpers
+    # Helpers (same logic as phase A)
     # ----------------------------
     def _to_float(v, default=None):
         try:
@@ -1608,6 +1716,12 @@ def train_step_phase_B(
         except Exception:
             return default
 
+    def _is_finite(v):
+        try:
+            return (v is not None) and (not math.isnan(float(v))) and (not math.isinf(float(v)))
+        except Exception:
+            return False
+
     def _tqdm_write(msg: str):
         try:
             from tqdm import tqdm
@@ -1615,34 +1729,133 @@ def train_step_phase_B(
         except Exception:
             print(msg)
 
-    def _log_sem(writer, tag_prefix: str, sem_loss_val, sem_stats: dict, step: int):
+    def _get_stat(stats: dict, *keys, default=0.0):
+        if not isinstance(stats, dict):
+            return default
+        for k in keys:
+            if k in stats:
+                fv = _to_float(stats.get(k), None)
+                if fv is not None:
+                    return fv
+        return default
+
+    def _ema_update(state_dict, key: str, value: float, beta: float):
+        if not _is_finite(value):
+            return None
+        if key not in state_dict or state_dict[key] is None:
+            state_dict[key] = float(value)
+        else:
+            state_dict[key] = float(beta) * float(state_dict[key]) + (1.0 - float(beta)) * float(value)
+        return state_dict[key]
+
+    def _sem_track_update(state, phase_tag: str, moco_v: float, jepa_v: float, total_v: float):
+        eps = float(cfg.get("sem_rel_eps", 1e-8))
+        beta = float(cfg.get("sem_ema_beta", 0.98))
+
+        tr = state.get("sem_track", None)
+        if tr is None:
+            tr = {}
+            state["sem_track"] = tr
+
+        ref = tr.get(f"ref_{phase_tag}", None)
+        if ref is None:
+            ref = {"moco": None, "jepa": None, "total": None}
+            tr[f"ref_{phase_tag}"] = ref
+
+        if ref["moco"] is None and _is_finite(moco_v) and moco_v > 0:
+            ref["moco"] = float(moco_v)
+        if ref["jepa"] is None and _is_finite(jepa_v) and jepa_v > 0:
+            ref["jepa"] = float(jepa_v)
+        if ref["total"] is None and _is_finite(total_v) and total_v > 0:
+            ref["total"] = float(total_v)
+
+        ema = tr.get(f"ema_{phase_tag}", None)
+        if ema is None:
+            ema = {"moco": None, "jepa": None, "total": None}
+            tr[f"ema_{phase_tag}"] = ema
+
+        ema_m = _ema_update(ema, "moco", moco_v, beta)
+        ema_j = _ema_update(ema, "jepa", jepa_v, beta)
+        ema_t = _ema_update(ema, "total", total_v, beta)
+
+        rel_m = None
+        rel_j = None
+        rel_t = None
+        if ref["moco"] is not None and _is_finite(moco_v):
+            rel_m = float(moco_v) / (float(ref["moco"]) + eps)
+        if ref["jepa"] is not None and _is_finite(jepa_v):
+            rel_j = float(jepa_v) / (float(ref["jepa"]) + eps)
+        if ref["total"] is not None and _is_finite(total_v):
+            rel_t = float(total_v) / (float(ref["total"]) + eps)
+
+        return {
+            "ema_moco": ema_m, "ema_jepa": ema_j, "ema_total": ema_t,
+            "rel_moco": rel_m, "rel_jepa": rel_j, "rel_total": rel_t,
+        }
+
+    def _log_sem_curves(writer, phase: str, sem_loss_val, sem_stats: dict, step: int, q_vec=None, k_vec=None):
         if writer is None:
             return
-        scalars = {}
-        scalars["loss_total"] = _to_float(sem_loss_val, 0.0)
 
-        if isinstance(sem_stats, dict):
-            for k in ["moco", "jepa", "lam_sem", "lam_jepa", "tau", "queue_size",
-                      "pos_sim", "neg_sim", "acc", "top1", "top5",
-                      "loss_moco", "loss_jepa", "loss_kd", "var", "cov"]:
-                if k in sem_stats:
-                    fv = _to_float(sem_stats.get(k), None)
-                    if fv is not None and (not math.isnan(fv)) and (not math.isinf(fv)):
-                        scalars[k] = fv
+        moco_v = _get_stat(sem_stats, "moco", "MoCo", default=0.0)
+        jepa_v = _get_stat(sem_stats, "jepa", "JEPA_content", "JEPA", default=0.0)
+        total_v = _get_stat(sem_stats, "loss_total", "total", default=_to_float(sem_loss_val, 0.0))
+        lam_sem = _get_stat(sem_stats, "lam_sem", "λ_sem", default=float(cfg.get("lambda_sem", 0.0)))
+        lam_jepa = _get_stat(sem_stats, "lam_jepa", "λ_sem_jepa", "λ_jepa", default=float(cfg.get("lambda_jepa_content", 0.0)))
 
-            extra = 0
-            for k, v in sem_stats.items():
-                if k in scalars:
-                    continue
-                if extra >= int(cfg.get("sem_tb_max_extra_keys", 32)):
-                    break
-                fv = _to_float(v, None)
-                if fv is None or math.isnan(fv) or math.isinf(fv):
-                    continue
-                scalars[str(k)] = fv
-                extra += 1
+        tr = _sem_track_update(state, phase, moco_v, jepa_v, total_v)
 
-        writer.add_scalars(tag_prefix, scalars, step)
+        writer.add_scalars(
+            f"SEM/{phase}/raw",
+            {
+                "MoCo": float(moco_v),
+                "JEPA_content": float(jepa_v),
+                "loss_total": float(total_v),
+                "λ_sem": float(lam_sem),
+                "λ_jepa": float(lam_jepa),
+            },
+            step
+        )
+
+        rel_dict = {}
+        if tr["rel_moco"] is not None:
+            rel_dict["MoCo_rel"] = float(tr["rel_moco"])
+        if tr["rel_jepa"] is not None:
+            rel_dict["JEPA_rel"] = float(tr["rel_jepa"])
+        if tr["rel_total"] is not None:
+            rel_dict["total_rel"] = float(tr["rel_total"])
+        if rel_dict:
+            writer.add_scalars(f"SEM/{phase}/rel", rel_dict, step)
+
+        ema_dict = {}
+        if tr["ema_moco"] is not None:
+            ema_dict["MoCo_ema"] = float(tr["ema_moco"])
+        if tr["ema_jepa"] is not None:
+            ema_dict["JEPA_ema"] = float(tr["ema_jepa"])
+        if tr["ema_total"] is not None:
+            ema_dict["total_ema"] = float(tr["ema_total"])
+        if ema_dict:
+            writer.add_scalars(f"SEM/{phase}/ema", ema_dict, step)
+
+        if (q_vec is not None) and (k_vec is not None) and torch.is_tensor(q_vec) and torch.is_tensor(k_vec):
+            try:
+                q = q_vec.detach()
+                k = k_vec.detach()
+                qn = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
+                kn = k / (k.norm(dim=-1, keepdim=True) + 1e-8)
+                cos = (qn * kn).sum(dim=-1)
+                writer.add_scalars(
+                    f"SEM/{phase}/qk",
+                    {
+                        "cos_mean": float(cos.mean().cpu().item()),
+                        "cos_std": float(cos.std(unbiased=False).cpu().item()) if cos.numel() > 1 else 0.0,
+                        "norm_q": float(q.norm(dim=-1).mean().cpu().item()),
+                        "norm_k": float(k.norm(dim=-1).mean().cpu().item()),
+                    },
+                    step
+                )
+            except Exception:
+                pass
 
     # ----------------------------
     # Setup / unpack
@@ -1751,7 +1964,6 @@ def train_step_phase_B(
     else:
         λ_style_B_eff = λ_style_B_dyn
 
-    # Not enough styles in bank => skip safely (still increment global_step + log skip)
     if len(style_bank) < x.size(0):
         if writer and (global_step % int(cfg.get("tb_freq_sem", cfg["tb_freq"])) == 0):
             writer.add_scalar("B/skip_not_enough_style_bank", 1.0, global_step)
@@ -1759,7 +1971,7 @@ def train_step_phase_B(
         return
 
     # ----------------------------
-    # Build far_mix (from G_A) and optional replay
+    # Build far_mix (from G_A) + replay
     # ----------------------------
     with torch.no_grad():
         y_s = torch.stack(random.sample(style_bank, x.size(0))).to(dev)
@@ -1784,7 +1996,6 @@ def train_step_phase_B(
     else:
         far_mix_noisy = far_mix
 
-    # Style condition for B + style_gain_B
     style_cond_B = cfg["build_style_cond"](G_B, x_mix)
     style_gain_B = float(cfg.get("style_gain_B", λ_style_B_eff))
     style_cond_B = apply_style_gain(style_cond_B, style_gain_B)
@@ -1841,7 +2052,6 @@ def train_step_phase_B(
     idtB = l1_loss(recon, x_mix)
     styB = style_loss_tokens(recon, x_mix, teacher_G=T_B)
 
-    # Texture losses
     tex_B_total = torch.tensor(0.0, device=dev)
     if tex_enable:
         if tex_use_fft and λ_fft > 0:
@@ -1854,112 +2064,12 @@ def train_step_phase_B(
     gateB, ratioB = spade_gate_reg(G_B, margin=cfg["spade_margin"])
 
     # ----------------------------
-    # JEPA (style + content)
+    # JEPA (style + content)  [inchangé ici, supposé déjà dans ton code]
     # ----------------------------
     jepa_styleB = torch.tensor(0.0, device=dev)
     jepa_styleB_kd = torch.tensor(0.0, device=dev)
     jepa_contentB = torch.tensor(0.0, device=dev)
     jepa_contentB_kd = torch.tensor(0.0, device=dev)
-
-    jepa_attn_styleB_H = None
-    jepa_attn_contentB_H = None
-
-    do_jepa = (jepa_on_style or jepa_on_content) and ((global_step % jepa_every) == 0)
-    if do_jepa:
-        from models.jepa import TokenJEPA
-
-        # --- JEPA STYLE on x_mix ---
-        if jepa_on_style:
-            style_sigma = float(tex_sigma)
-            style_gamma = float(tex_gamma)
-            x_v1, x_v2 = two_style_views(x_mix, sigma=style_sigma, gamma=style_gamma, flip_p=0.5)
-
-            with torch.no_grad():
-                if jepa_use_teacher:
-                    _, toks_tB, tokG_tB = T_B.style_enc(x_v2)
-                else:
-                    _, toks_tB, tokG_tB = G_B.style_enc(x_v2)
-                TtB = stack_tokens_for_jepa(toks_tB, tokG_tB)
-
-            _, toks_sB, tokG_sB = G_B.style_enc(x_v1)
-            TsB = stack_tokens_for_jepa(toks_sB, tokG_sB)
-
-            if (TtB is not None) and (TsB is not None):
-                Bsz, Ssz, Dsz = TsB.shape
-                if tok_jepa_B_style is None:
-                    tok_jepa_B_style = TokenJEPA(
-                        Ssz, Dsz,
-                        hidden_mult=cfg["jepa_hidden_mult"],
-                        heads=cfg["jepa_heads"],
-                        use_norm=cfg["jepa_norm"],
-                        var_lambda=cfg["lambda_jepa_var"],
-                        cov_lambda=cfg["lambda_jepa_cov"]
-                    ).to(dev)
-                    state["tok_jepa_B_style"] = tok_jepa_B_style
-
-                maskB = bias_mask(Bsz, Ssz, jepa_mask_ratio, jepa_bias_high, device=dev)
-                w_styleB = _make_jepa_w_for_seq(Ssz, dev)
-                LjB, infoB = tok_jepa_B_style(TsB, TtB.detach(), maskB, w=w_styleB)
-                jepa_styleB = LjB
-
-                if λ_jepa_kd > 0:
-                    jepa_styleB_kd = kd_logits_supheads_if_available(G_B, infoB.get("pred_raw", TsB), TtB.detach())
-
-                if isinstance(infoB, dict):
-                    Hb = infoB.get("attn_entropy", None)
-                    if Hb is None and "attn" in infoB:
-                        attb = infoB["attn"]
-                        if torch.is_tensor(attb):
-                            p = attb.clamp_min(1e-8)
-                            Hb = -(p * p.log()).sum(-1).mean()
-                    if Hb is not None:
-                        jepa_attn_styleB_H = _to_float(Hb, None)
-
-        # --- JEPA CONTENT (multi-scale) ---
-        if jepa_on_content:
-            x_v1c, x_v2c = two_style_views(x_mix, sigma=0.0, gamma=1.0, flip_p=0.5)
-
-            with torch.no_grad():
-                if jepa_use_teacher:
-                    feats_tB = nce_feats_dict(T_B, x_v2c, normalize=False, no_grad=True)
-                else:
-                    feats_tB = nce_feats_dict(G_B, x_v2c, normalize=False, no_grad=True)
-
-            feats_sB = nce_feats_dict(G_B, x_v1c, normalize=False, no_grad=False)
-
-            TtB_c = stack_content_tokens_multiscale_for_jepa(feats_tB, ref_key="bot")
-            TsB_c = stack_content_tokens_multiscale_for_jepa(feats_sB, ref_key="bot")
-
-            if (TtB_c is not None) and (TsB_c is not None):
-                Bsz, Ssz, Dsz = TsB_c.shape
-                if tok_jepa_B_content is None:
-                    tok_jepa_B_content = TokenJEPA(
-                        Ssz, Dsz,
-                        hidden_mult=cfg["jepa_hidden_mult"],
-                        heads=cfg["jepa_heads"],
-                        use_norm=cfg["jepa_norm"],
-                        var_lambda=cfg["lambda_jepa_var"],
-                        cov_lambda=cfg["lambda_jepa_cov"]
-                    ).to(dev)
-                    state["tok_jepa_B_content"] = tok_jepa_B_content
-
-                maskB_c = bias_mask(Bsz, Ssz, jepa_mask_ratio, jepa_bias_high, device=dev)
-                w_contB = _make_jepa_w_for_seq(Ssz, dev)
-                LjB_c, infoB_c = tok_jepa_B_content(TsB_c, TtB_c.detach(), maskB_c, w=w_contB)
-                jepa_contentB = LjB_c
-
-                if λ_jepa_kd > 0:
-                    jepa_contentB_kd = kd_logits_supheads_if_available(G_B, infoB_c.get("pred_raw", TsB_c), TtB_c.detach())
-
-                if isinstance(infoB_c, dict):
-                    Hbc = infoB_c.get("attn_entropy", None)
-                    if Hbc is None and "attn" in infoB_c:
-                        attbc = infoB_c["attn"]
-                        if torch.is_tensor(attbc):
-                            p = attbc.clamp_min(1e-8)
-                            Hbc = -(p * p.log()).sum(-1).mean()
-                    if Hbc is not None:
-                        jepa_attn_contentB_H = _to_float(Hbc, None)
 
     jepa_totalB = (
         λ_jepa_style * jepa_styleB
@@ -1981,17 +2091,18 @@ def train_step_phase_B(
         totalB.backward()
         opt_GB.step()
 
-    # EMA T_B
     if (global_step % int(cfg["ema_every"])) == 0:
         nce_m = float(cfg["nce_m"])
         for po, pt in zip(G_B.parameters(), T_B.parameters()):
             pt.data.mul_(nce_m).add_(po.data, alpha=1.0 - nce_m)
 
     # =============================================================================
-    # ✅ SEM branch on B (optional) + TensorBoard logging (loss + diagnostics + exception counter)
+    # ✅ SEM branch on B (optional) + evolution curves
     # =============================================================================
     sem_loss_val_B = None
     sem_stats_B = None
+    q_vec_B = None
+    k_vec_B = None
     sem_exc_B = 0
 
     sem_on_B = bool(cfg.get("sem_on_B", True))
@@ -2000,26 +2111,28 @@ def train_step_phase_B(
     if sem_enabled:
         try:
             cfg_semB = dict(cfg)
-            cfg_semB["sem_two_styles"] = False  # B doesn't depend on y
+            cfg_semB["sem_two_styles"] = False
             sem_outB = semantic_content_step_moco_jepa(x_mix, recon, y=None, state=state, cfg=cfg_semB)
             if sem_outB is not None:
-                sem_loss_val_B, sem_stats_B = sem_outB
-                epoch_meters["SEM"]["MoCo_B"].add(float(_to_float(sem_stats_B.get("moco", 0.0), 0.0)))
-                epoch_meters["SEM"]["JEPA_content_B"].add(float(_to_float(sem_stats_B.get("jepa", 0.0), 0.0)))
+                sem_loss_val_B, sem_stats_B, q_vec_B, k_vec_B = sem_outB
+
+                moco_v = _get_stat(sem_stats_B, "moco", "MoCo", default=0.0)
+                jepa_v = _get_stat(sem_stats_B, "jepa", "JEPA_content", default=0.0)
+                epoch_meters["SEM"]["MoCo_B"].add(float(moco_v))
+                epoch_meters["SEM"]["JEPA_content_B"].add(float(jepa_v))
                 epoch_meters["SEM"]["total_B"].add(float(_to_float(sem_loss_val_B, 0.0)))
         except Exception:
             sem_exc_B = 1
             state["sem_exceptions"] = int(state.get("sem_exceptions", 0)) + 1
 
     # ----------------------------
-    # TensorBoard logs (B + JEPA + images + dyn lambda update)
+    # TensorBoard logs (B) + SEM curves
     # ----------------------------
     tb_freq = int(cfg["tb_freq"])
     tb_freq_sem = int(cfg.get("tb_freq_sem", tb_freq))
     sem_print_every = int(cfg.get("sem_print_every", tb_freq_sem))
 
     if writer and (global_step % tb_freq == 0):
-        # dynamic update of λ_style_B_dyn (affects next steps)
         if state.get("epoch", 0) >= style_B_warmup_ep:
             with torch.no_grad():
                 d_rx = style_dist_tokens(T_B, recon, x_mix)
@@ -2043,55 +2156,28 @@ def train_step_phase_B(
             global_step,
         )
 
-        writer.add_scalars(
-            "B/JEPA",
-            {
-                "style": float(jepa_styleB.item()),
-                "content": float(jepa_contentB.item()),
-                "style_kd": float(jepa_styleB_kd.item()),
-                "content_kd": float(jepa_contentB_kd.item()),
-                "total": float(jepa_totalB.item()),
-            },
-            global_step,
-        )
-
-        jepa_attn_scalars_B = {}
-        if jepa_attn_styleB_H is not None:
-            jepa_attn_scalars_B["style_attn_H"] = float(jepa_attn_styleB_H)
-        if jepa_attn_contentB_H is not None:
-            jepa_attn_scalars_B["content_attn_H"] = float(jepa_attn_contentB_H)
-        if jepa_attn_scalars_B:
-            writer.add_scalars("B/JEPA_attn", jepa_attn_scalars_B, global_step)
-
         fno = cfg["_denorm"](far_mix_noisy)
         xm = cfg["_denorm"](x_mix)
         rc = cfg["_denorm"](recon)
         writer.add_images("B/imgs/x_mix(style target)", xm[:4], global_step)
         writer.add_images("B/imgs/far_mix_noisy(input)", fno[:4], global_step)
         writer.add_images("B/imgs/recon→x_mix", rc[:4], global_step)
-        try:
-            trip_B = cfg["_triplet_grid"](fno, xm, rc, max_k=4, nrow=3)
-            writer.add_image("B/triplet_[far_noisy | x_mix | recon]", trip_B, global_step)
-        except Exception:
-            pass
 
-    # ----------------------------
-    # ✅ SEM TensorBoard + terminal (B)
-    # ----------------------------
     if writer and sem_enabled and (global_step % tb_freq_sem == 0):
         writer.add_scalar("SEM/exceptions_total", float(state.get("sem_exceptions", 0)), global_step)
         writer.add_scalar("SEM/B/exception_step", float(sem_exc_B), global_step)
 
-    if sem_loss_val_B is not None and sem_stats_B is not None:
+    if (sem_loss_val_B is not None) and (sem_stats_B is not None):
         if writer and (global_step % tb_freq_sem == 0):
-            _log_sem(writer, "SEM/B", sem_loss_val_B, sem_stats_B, global_step)
+            _log_sem_curves(writer, "B", sem_loss_val_B, sem_stats_B, global_step, q_vec=q_vec_B, k_vec=k_vec_B)
 
         if (global_step % sem_print_every) == 0:
+            moco_v = _get_stat(sem_stats_B, "moco", "MoCo", default=0.0)
+            jepa_v = _get_stat(sem_stats_B, "jepa", "JEPA_content", default=0.0)
+            tot_v = _get_stat(sem_stats_B, "loss_total", default=_to_float(sem_loss_val_B, 0.0))
             _tqdm_write(
                 f"[SEM/B] step={global_step}  "
-                f"MoCo={_to_float(sem_stats_B.get('moco', 0.0), 0.0):.4f}  "
-                f"JEPAc={_to_float(sem_stats_B.get('jepa', 0.0), 0.0):.4f}  "
-                f"total={_to_float(sem_loss_val_B, 0.0):.4f}"
+                f"MoCo={moco_v:.4f}  JEPAc={jepa_v:.4f}  total={tot_v:.4f}"
             )
 
     # ----------------------------
@@ -2105,14 +2191,9 @@ def train_step_phase_B(
     epoch_meters["B"]["styleTok_B"].add(float(styB.item()))
     epoch_meters["B"]["λ_style_B_dyn"].add(float(state.get("λ_style_B_dyn", λ_style_B_dyn)))
     epoch_meters["B"]["style_gain_B"].add(float(λ_style_B_eff))
-    epoch_meters["B"]["JEPA_style"].add(float(jepa_styleB.item()))
-    epoch_meters["B"]["JEPA_content"].add(float(jepa_contentB.item()))
     if torch.is_tensor(totalB):
         epoch_meters["B"]["total"].add(float(totalB.item()))
 
-    # ----------------------------
-    # update global step
-    # ----------------------------
     state["global_step"] = global_step + 1
 
 
