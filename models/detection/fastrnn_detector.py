@@ -204,6 +204,82 @@ class FastRNNDetector(nn.Module):
         Hf, Wf = feat_hw
         return float(H) / float(Hf)
 
+    @staticmethod
+    def _sanitize_target_boxes_labels(
+        t: Dict[str, torch.Tensor],
+        device: torch.device,
+        *,
+        strict: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Normalise les targets pour éviter les cas courants qui cassent l'indexation:
+          - boxes sous forme (4,) -> reshape en (1,4)
+          - boxes vides -> (0,4)
+          - labels scalaire -> (1,)
+          - labels multi-dim -> flatten
+        Attend des boxes au format xyxy.
+        """
+        if "boxes" not in t or "labels" not in t:
+            if strict:
+                raise KeyError(f"[FastRNNDetector] target must contain 'boxes' and 'labels'. Got keys={list(t.keys())}")
+            # fallback: empty
+            empty_boxes = torch.zeros((0, 4), device=device, dtype=torch.float32)
+            empty_labels = torch.zeros((0,), device=device, dtype=torch.long)
+            return empty_boxes, empty_labels
+
+        gt_boxes = t["boxes"]
+        gt_labels = t["labels"]
+
+        # tensors / device
+        if not torch.is_tensor(gt_boxes):
+            gt_boxes = torch.as_tensor(gt_boxes, device=device)
+        else:
+            gt_boxes = gt_boxes.to(device)
+
+        if not torch.is_tensor(gt_labels):
+            gt_labels = torch.as_tensor(gt_labels, device=device)
+        else:
+            gt_labels = gt_labels.to(device)
+
+        # empty
+        if gt_boxes.numel() == 0:
+            gt_boxes = gt_boxes.reshape(0, 4).to(dtype=torch.float32)
+            gt_labels = gt_labels.reshape(0).to(dtype=torch.long)
+            return gt_boxes, gt_labels
+
+        # single box (4,) -> (1,4)
+        if gt_boxes.dim() == 1 and gt_boxes.numel() == 4:
+            gt_boxes = gt_boxes.view(1, 4)
+
+        # enforce 2D (M,4)
+        if gt_boxes.dim() != 2 or gt_boxes.shape[-1] != 4:
+            msg = f"[FastRNNDetector] Bad gt_boxes shape: {tuple(gt_boxes.shape)} (expected (M,4))."
+            if strict:
+                raise ValueError(msg)
+            # best-effort fallback
+            gt_boxes = gt_boxes.reshape(-1, 4)
+
+        # labels shape to (M,)
+        if gt_labels.dim() == 0:
+            gt_labels = gt_labels.view(1)
+        elif gt_labels.dim() > 1:
+            gt_labels = gt_labels.view(-1)
+
+        # dtypes
+        gt_boxes = gt_boxes.to(dtype=torch.float32)
+        gt_labels = gt_labels.to(dtype=torch.long)
+
+        # length consistency
+        if gt_boxes.shape[0] != gt_labels.shape[0]:
+            msg = f"[FastRNNDetector] Mismatch boxes/labels: boxes={tuple(gt_boxes.shape)}, labels={tuple(gt_labels.shape)}"
+            if strict:
+                raise ValueError(msg)
+            m = min(gt_boxes.shape[0], gt_labels.shape[0])
+            gt_boxes = gt_boxes[:m]
+            gt_labels = gt_labels[:m]
+
+        return gt_boxes, gt_labels
+
     def forward(self, images: List[torch.Tensor], targets: Optional[List[Dict[str, torch.Tensor]]] = None):
         assert isinstance(images, (list, tuple)), "images doit être une liste de tensors (C,H,W)."
 
@@ -234,8 +310,9 @@ class FastRNNDetector(nn.Module):
             stride = self._infer_stride((img_h, img_w), (Hf, Wf))
 
             t = targets[i]
-            gt_boxes = t["boxes"].to(device)
-            gt_labels = t["labels"].to(device)
+
+            # --- SANITIZE to avoid (4,) boxes etc. ---
+            gt_boxes, gt_labels = self._sanitize_target_boxes_labels(t, device, strict=True)
 
             # clamp boxes within image
             gt_boxes = gt_boxes.clone()
@@ -263,7 +340,9 @@ class FastRNNDetector(nn.Module):
             ctr_t_flat = ctr_t.view(-1)
             ctr_pred = ctr_flat[i]
             if pos_idx.numel() > 0:
-                loss_ctr = F.binary_cross_entropy_with_logits(ctr_pred[pos_idx], ctr_t_flat[pos_idx], reduction="mean")
+                loss_ctr = F.binary_cross_entropy_with_logits(
+                    ctr_pred[pos_idx], ctr_t_flat[pos_idx], reduction="mean"
+                )
             else:
                 loss_ctr = torch.tensor(0.0, device=device)
 
@@ -317,9 +396,11 @@ class FastRNNDetector(nn.Module):
             top_idx = top_idx[keep]
 
             if top_scores.numel() == 0:
-                results.append({"boxes": torch.zeros((0, 4), device=device),
-                                "labels": torch.zeros((0,), device=device, dtype=torch.long),
-                                "scores": torch.zeros((0,), device=device)})
+                results.append({
+                    "boxes": torch.zeros((0, 4), device=device),
+                    "labels": torch.zeros((0,), device=device, dtype=torch.long),
+                    "scores": torch.zeros((0,), device=device),
+                })
                 continue
 
             # decode indices
