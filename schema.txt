@@ -15,3 +15,565 @@ style_project/
 │   ├── texture_fft_swd.py            # fft_texture_loss, swd_loss_images, spectral_noise, etc.
 │   └── adv_utils.py                  # fonctions D/G adversarial + highpass
 ├── helpers.py
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# file: config.py
+# -*- coding: utf-8 -*-
+
+def get_opts():
+    """
+    Hyper-paramètres pour :
+      - Double-GAN (G_A, D_A, G_B, D_B) + phases A/B + option C supervisée (SupHeads)
+      - modes : auto / hybrid / sup_freeze
+      - classification tokens : cls_tokens
+      - détection : detect_transformer (fasterrcnn/detr/vitdet/fastrnn)
+
+    Cette version est cohérente et complète pour la détection + tests:
+      - chargement ckpt + hyperparams JSON (pour tester facilement)
+      - action det_run: train/eval/camera
+      - seuils de score distincts: det_score_thresh (DETR/VitDet), fastrnn_* (FastRNN), det_cam_threshold (camera)
+      - freeze global + overrides par mode
+      - LR séparés backbone/head en détection
+    """
+    import argparse
+
+    p = argparse.ArgumentParser("Style Perturb-Reconstr Training")
+
+    # =========================================================================
+    # 0) Général / runtime / affichage
+    # =========================================================================
+    p.add_argument("--seed", type=int, default=42, help="Graine RNG.")
+    p.add_argument("--device", type=str, default=None, help="Force device: 'cuda', 'cpu' (sinon auto).")
+    p.add_argument("--num_workers", type=int, default=4, help="Dataloader workers (si supporté).")
+    p.add_argument("--pin_memory", action="store_true", help="Active pin_memory pour DataLoader (si supporté).")
+
+    # Terminal logging
+    p.add_argument("--print_freq", type=int, default=50, help="Fréquence (steps) d'affichage terminal.")
+    p.add_argument(
+        "--postfix_keys",
+        type=str,
+        default="loss_G,loss_D,loss_nce,loss_jepa,loss_idt,loss_reg",
+        help="Clés (séparées par ',') affichées dans le postfix tqdm.",
+    )
+
+    # Robustesse
+    p.add_argument("--print_trace_on_error", action="store_true", help="Traceback complet en cas d'exception.")
+    p.add_argument("--debug", action="store_true", help="Mode debug (si implémenté).")
+
+    # =========================================================================
+    # 1) Données, IO & run
+    # =========================================================================
+    p.add_argument("--data", type=str, default=None, help="Dossier images (ImageFolder) pour auto/hybrid/cls_tokens.")
+    p.add_argument("--data_json", type=str, default=None, help="Liste d'images au format JSON (optionnel).")
+    p.add_argument("--classes_json", type=str, default=None, help="JSON décrivant les classes (optionnel).")
+    p.add_argument("--search_folder", type=str, default=None, help="Racine où chercher les images (si data_json).")
+    p.add_argument("--find_images_by_sub_folder", type=str, default=None, help="Racine des sous-dossiers d'images.")
+
+    p.add_argument("--save_dir", type=str, required=True, help="Répertoire où sauvegarder checkpoints + logs.")
+    p.add_argument("--resume_dir", type=str, default=None, help="Répertoire de reprise (checkpoint précédent).")
+
+    p.add_argument("--batch_size", type=int, default=8, help="Taille de batch globale.")
+    p.add_argument("--k_folds", type=int, default=2, help="Nombre de folds pour alternance A/B (>=2).")
+    p.add_argument("--epochs", type=int, default=25, help="Nb époques (auto/hybrid/sup_freeze/cls_tokens).")
+    p.add_argument("--crop_size", type=int, default=256, help="Taille d'entrée (si utilisée dans transforms).")
+
+    # =========================================================================
+    # 2) Mode d'entraînement
+    # =========================================================================
+    p.add_argument(
+        "--mode",
+        type=str,
+        default="auto",
+        choices=["auto", "hybrid", "sup_freeze", "cls_tokens", "detect_transformer"],
+        help=(
+            "Mode d'entraînement :\n"
+            "  - auto : A+B (self-supervised style + JEPA)\n"
+            "  - hybrid : A+B puis C supervisé (SupHeads)\n"
+            "  - sup_freeze : supervision seule, G/D gelés\n"
+            "  - cls_tokens : classification à partir de tokens multi-échelles\n"
+            "  - detect_transformer : entraînement/test détection"
+        ),
+    )
+    p.add_argument("--sup_from", choices=["GA", "GB"], default="GB", help="Quel générateur fournit les features à C.")
+    p.add_argument("--warmup_epochs", type=int, default=0, help="Nb époques avant d'activer C (hybrid).")
+    p.add_argument("--sup_ratio", type=float, default=0.25, help="Ratio d'itérations réservées à C en mode hybrid.")
+
+    # =========================================================================
+    # 3) Optimisation (G/D)
+    # =========================================================================
+    p.add_argument("--lr", type=float, default=2e-4, help="LR base pour G_A/G_B.")
+    p.add_argument("--adv_lrD_mult", type=float, default=0.5, help="TTUR: lr_D = lr * adv_lrD_mult.")
+    p.add_argument("--ema_tau", type=float, default=0.005, help="EMA sur D_B ← D_A (0=off).")
+
+    p.add_argument("--replay_size", type=int, default=50, help="Taille du replay buffer (x,y).")
+    p.add_argument("--replay_ratio", type=float, default=0.3, help="Proportion de samples depuis replay buffer.")
+
+    # =========================================================================
+    # 4) Scheduling des phases A / mix / B
+    # =========================================================================
+    p.add_argument("--adv_only_epochs", type=int, default=2, help="Nb époques phase A-adv.")
+    p.add_argument("--adv_mix_epochs", type=int, default=0, help="Nb époques phase A-mix.")
+    p.add_argument("--recon_epochs", type=int, default=2, help="Nb époques phase B (reconstruction).")
+
+    p.add_argument("--adv_boost", type=int, default=0, help="Allonge phases A par cycle.")
+    p.add_argument("--b_boost", type=int, default=0, help="Allonge phase B par cycle.")
+    p.add_argument("--skip_amix", action="store_true", help="Saute la phase A-mix.")
+    p.add_argument("--feat_switch_epoch", type=int, default=50, help="Époque switch backbone T_B pour NCE(A).")
+    p.add_argument("--fold_epochs", type=int, default=4, help="Nb époques par fold avant switch A/B.")
+
+    # =========================================================================
+    # 5) Pertes de base
+    # =========================================================================
+    p.add_argument("--lambda_nce_a_adv", type=float, default=1.0, help="Poids PatchNCE en phase A-adv.")
+    p.add_argument("--lambda_reg_a_adv", type=float, default=1.0, help="Poids L1/régularisation en phase A-adv.")
+
+    p.add_argument("--lambda_nce_a_mix", type=float, default=1.0, help="Poids PatchNCE en phase A-mix.")
+    p.add_argument("--lambda_reg_a_mix", type=float, default=0.5, help="Poids L1/régularisation en phase A-mix.")
+    p.add_argument("--amix_ramp", action="store_true", help="Rampe linéaire des λ en phase A-mix.")
+
+    p.add_argument("--lambda_nce_b", type=float, default=1.0, help="Poids PatchNCE en phase B.")
+    p.add_argument("--lambda_idt_b", type=float, default=1.0, help="Poids identité (x->x) en phase B.")
+    p.add_argument("--lambda_reg_b", type=float, default=10.0, help="Poids L1 global (fallback) en phase B.")
+
+    # Style lambda scheduler
+    p.add_argument("--style_lambda", type=float, default=10.0, help="Valeur cible max de λ_style.")
+    p.add_argument("--style_lambda_min", type=float, default=0.0, help="Valeur de départ λ_style.")
+    p.add_argument(
+        "--style_lambda_sched",
+        type=str,
+        default="none",
+        choices=["none", "linear", "cosine", "exp", "piecewise"],
+        help="Planning de λ_style.",
+    )
+    p.add_argument("--style_lambda_warmup", type=int, default=20, help="Warmup epochs pour λ_style.")
+
+    p.add_argument("--lambda_sup", type=float, default=1.0, help="Poids perte supervisée (phase C).")
+
+    # =========================================================================
+    # 6) PatchNCE
+    # =========================================================================
+    p.add_argument("--nce_t", type=float, default=0.07, help="Température PatchNCE.")
+    p.add_argument("--nce_layers", type=str, default="bot,skip64,skip32", help="Couches NCE (csv).")
+    p.add_argument("--nce_layer_weights", type=str, default=None, help="Poids par couche NCE (csv).")
+
+    # (ON par défaut) -> désactivable par flags
+    p.add_argument("--nce_intra", action="store_true", default=True, help="Négatifs intra-image (défaut ON).")
+    p.add_argument("--no_nce_intra", action="store_true", help="Désactive nce_intra.")
+    p.add_argument("--nce_inter", action="store_true", default=True, help="Négatifs inter-image (défaut ON).")
+    p.add_argument("--no_nce_inter", action="store_true", help="Désactive nce_inter.")
+
+    p.add_argument("--nce_max_patches", type=int, default=None, help="Max patches NCE par image (None=tous).")
+    p.add_argument("--nce_gate", type=float, default=2000.0, help="Seuil NCE pour activer A-mix (0=toujours).")
+
+    # =========================================================================
+    # 7) Texture (FFT / SWD)
+    # =========================================================================
+    p.add_argument("--tex_enable", action="store_true", help="Active le bloc texture (FFT/SWD).")
+    p.add_argument("--tex_apply_A", action="store_true", help="Applique texture aussi en phase A.")
+
+    p.add_argument("--tex_sigma", type=float, default=2.0, help="Intensité bruit spectral injecté (B).")
+    p.add_argument("--tex_gamma", type=float, default=1.0, help="Exposant pondération freq (≈1/f^gamma).")
+
+    p.add_argument("--tex_use_fft", action="store_true", help="Active la loss FFT.")
+    p.add_argument("--tex_use_swd", action="store_true", help="Active la SWD multi-échelles.")
+
+    p.add_argument("--lambda_fft", type=float, default=0.1, help="Poids FFT.")
+    p.add_argument("--lambda_swd", type=float, default=0.05, help="Poids SWD.")
+    p.add_argument("--swd_levels", type=str, default="64", help="Niveaux SWD (ex '64,32,16' ou '3').")
+    p.add_argument("--swd_patch", type=int, default=64, help="Taille patch SWD.")
+    p.add_argument("--swd_proj", type=int, default=128, help="Nb projections SWD.")
+    p.add_argument("--swd_max_patches", type=int, default=64, help="Max patches SWD par image/niveau.")
+
+    # =========================================================================
+    # 8) Style tokens A / B
+    # =========================================================================
+    p.add_argument("--style_gain_A", type=float, default=10.0, help="Gain tokens style en phase A.")
+    p.add_argument("--style_gain_B", type=float, default=1.5, help="Gain tokens style dans G_B (phase B).")
+
+    p.add_argument("--lambda_style_b", type=float, default=0.005, help="Poids initial cohérence style en B.")
+    p.add_argument("--lambda_style_b_min", type=float, default=0.0001, help="Plancher λ_style_B_dyn.")
+    p.add_argument("--lambda_style_b_max", type=float, default=2.0, help="Plafond λ_style_B_dyn.")
+    p.add_argument("--style_b_warmup_epochs", type=int, default=1, help="Warmup avant style loss en B.")
+    p.add_argument("--style_balance_target", type=float, default=0.06, help="Cible distance style recon ↔ x_mix.")
+    p.add_argument("--style_balance_alpha", type=float, default=0.10, help="Agressivité contrôleur λ_style_B_dyn.")
+
+    p.add_argument("--lambda_spade_gate", type=float, default=0.05, help="Régul portes SPADE.")
+    p.add_argument("--spade_gate_margin", type=float, default=0.75, help="Marge régul SPADE.")
+
+    p.add_argument("--token_ablate_eval_every", type=int, default=400, help="Steps entre évaluations ablation.")
+
+    # =========================================================================
+    # 9) JEPA
+    # =========================================================================
+    p.add_argument("--jepa_tokens", action="store_true", help="Active la perte JEPA sur tokens (auto).")
+    p.add_argument("--lambda_jepa", type=float, default=0.15, help="Poids global JEPA (si non séparé).")
+    p.add_argument("--jepa_every", type=int, default=2, help="Calcule JEPA toutes les N itérations.")
+    p.add_argument("--jepa_mask_ratio", type=float, default=0.60, help="Ratio positions masquées JEPA.")
+    p.add_argument("--jepa_mask_bias_high", type=float, default=2.0, help="Biais masque vers échelles hautes.")
+    p.add_argument("--jepa_scale_weights", type=str, default="2,2,1.5,1,0.75,0.5", help="Poids par échelle JEPA.")
+
+    p.add_argument("--jepa_on_style", action="store_true", help="JEPA sur tokens de style.")
+    p.add_argument("--jepa_on_content", action="store_true", help="JEPA sur features de contenu.")
+    p.add_argument("--lambda_jepa_style", type=float, default=0.15, help="Poids JEPA style.")
+    p.add_argument("--lambda_jepa_content", type=float, default=0.15, help="Poids JEPA contenu.")
+
+    p.add_argument("--jepa_hidden_mult", type=int, default=2, help="Multiplicateur largeur MLP JEPA.")
+    p.add_argument("--jepa_heads", type=int, default=4, help="Nb têtes attention JEPA.")
+    p.add_argument("--jepa_norm", type=int, default=1, help="1: norm interne JEPA, 0: pas de norm.")
+
+    p.add_argument("--lambda_jepa_var", type=float, default=0.05, help="Poids variance (anti-collapse).")
+    p.add_argument("--lambda_jepa_cov", type=float, default=0.05, help="Poids covariance (anti-redondance).")
+    p.add_argument("--lambda_jepa_kd", type=float, default=0.05, help="Poids distillation depuis SupHeads.")
+    p.add_argument("--jepa_use_teacher", type=int, default=1, help="1: teacher EMA comme cible.")
+
+    p.add_argument("--ema_update_every", type=int, default=1, help="Fréquence update T_A/T_B (itérations).")
+    p.add_argument("--nce_m", type=float, default=0.999, help="Momentum EMA T_A/T_B (NCE/JEPA).")
+
+    # =========================================================================
+    # 10) Mix-Swap
+    # =========================================================================
+    p.add_argument("--mixswap_enable", action="store_true", help="Active Mix-Swap.")
+    p.add_argument("--mixswap_alpha", type=str, default="0.3,0.7", help="Intervalle mix tokens (lo,hi).")
+    p.add_argument("--mixswap_token_p", type=float, default=1.0, help="Proba mix tokens par batch.")
+    p.add_argument("--mixswap_fft_p", type=float, default=0.0, help="Proba mix FFT amplitude sur y.")
+
+    # =========================================================================
+    # 11) Adversarial GAN
+    # =========================================================================
+    p.add_argument("--adv_enable_A", action="store_true", help="Loss adversariale en phase A.")
+    p.add_argument("--adv_enable_B", action="store_true", help="Loss adversariale en phase B.")
+    p.add_argument("--adv_type", type=str, default="lsgan", choices=["hinge", "lsgan"], help="Type loss adv.")
+    p.add_argument("--adv_r1_gamma", type=float, default=10.0, help="Poids pénalité R1 (0=off).")
+    p.add_argument("--adv_r1_every", type=int, default=16, help="Appliquer R1 toutes les N itérations.")
+    p.add_argument("--adv_highpass", action="store_true", help="Focaliser D sur les hautes fréquences.")
+
+    # =========================================================================
+    # 12) Supervision multi-tâches (SupHeads)
+    # =========================================================================
+    p.add_argument(
+        "--sup_feat_type",
+        choices=[
+            "tokG", "tok6", "tok6_mean", "tok6_w",
+            "cont_tok", "cont_tok_vit",
+            "style_tok", "bot", "bot+tok", "tok+delta", "mgap", "mgap+tok",
+        ],
+        default="tok6",
+        help="Type de features vers SupHeads.",
+    )
+    p.add_argument("--delta_weights", type=str, default="1,1,1,1,1", help="Poids échelles pour 'tok+delta'.")
+    p.add_argument("--sup_tasks_json", type=str, default=None, help="JSON tâches: {task: n_classes ou [names]}")
+
+    # =========================================================================
+    # 13) Backbone : freeze global + overrides
+    # =========================================================================
+    p.add_argument("--freeze_backbone", action="store_true", help="Freeze global (cls_tokens/detect).")
+    p.add_argument("--cls_freeze_backbone", type=int, default=None, help="Override freeze cls_tokens (None=>global).")
+    # det_freeze_backbone défini en bloc détection
+
+    # =========================================================================
+    # 14) Détection (COCO-like + heads + FastRNN)
+    # =========================================================================
+    # Dataset/IO
+    p.add_argument("--det_train_img_root", type=str, default=None, help="Dossier images train (COCO-like).")
+    p.add_argument("--det_train_ann", type=str, default=None, help="Annotations train COCO (JSON).")
+    p.add_argument("--det_val_img_root", type=str, default=None, help="Dossier images val (COCO-like).")
+    p.add_argument("--det_val_ann", type=str, default=None, help="Annotations val COCO (JSON).")
+    p.add_argument("--det_img_h", type=int, default=256, help="Hauteur input détection (resize).")
+    p.add_argument("--det_img_w", type=int, default=256, help="Largeur input détection (resize).")
+
+    # Classes / mapping
+    p.add_argument(
+        "--det_num_classes",
+        type=int,
+        default=91,
+        help="Nb total classes détection (torchvision style, bg=0).",
+    )
+    p.add_argument("--det_classes_file", type=str, default="", help="JSON classes autorisées (ids/noms).")
+    p.add_argument("--det_debug_merge", action="store_true", help="Debug filtrage/merge annotations.")
+
+    # Head
+    p.add_argument(
+        "--det_head",
+        type=str,
+        choices=["fasterrcnn", "detr", "vitdet", "fastrnn"],
+        default="fasterrcnn",
+        help="Tête: fasterrcnn/detr/vitdet/fastrnn.",
+    )
+
+    # Action en mode detect_transformer
+    p.add_argument(
+        "--det_run",
+        type=str,
+        default="train",
+        choices=["train", "eval", "camera"],
+        help="Action détection : train / eval / camera",
+    )
+
+    # Checkpoints (poids)
+    p.add_argument(
+        "--det_ckpt",
+        type=str,
+        default="",
+        help="Checkpoint détecteur (.pth) à charger (eval/camera/fine-tune).",
+    )
+    p.add_argument(
+        "--det_resume",
+        type=str,
+        default="",
+        help="Checkpoint pour reprendre training détecteur (inclut optim/epoch).",
+    )
+
+    # >>> AJOUT IMPORTANT POUR LES TESTS FACILES <<<
+    # Hyperparams sauvegardés (JSON) pour reconstruire exactement l'architecture
+    p.add_argument(
+        "--det_hparams_json",
+        type=str,
+        default="",
+        help=(
+            "Chemin vers hyperparameters.json (ou hparams.json) sauvegardé avec le détecteur. "
+            "Utilisé en eval/camera pour reconstruire l'architecture (detr/fastrnn/...). "
+            "Si vide, le loader tente de trouver automatiquement un hyperparameters.json dans le dossier du ckpt."
+        ),
+    )
+    p.add_argument(
+        "--det_auto_hparams_json",
+        action="store_true",
+        help="Si activé (recommandé), tente de trouver automatiquement hyperparameters.json près du ckpt.",
+    )
+    p.add_argument(
+        "--det_prefer_json_over_ckpt",
+        action="store_true",
+        help="Si JSON + ckpt ont des hparams, le JSON écrase le ckpt.",
+    )
+    p.add_argument(
+        "--det_strict_load",
+        type=int,
+        default=1,
+        help="strict load_state_dict pour le détecteur (1 oui / 0 permissif).",
+    )
+
+    # Source de features
+    p.add_argument(
+        "--det_feat_source",
+        type=str,
+        default="sem_resnet50",
+        choices=["unet_content", "unet_style", "unet_concat", "sem_resnet50"],
+        help="Source features détection.",
+    )
+    p.add_argument(
+        "--det_sem_return_layer",
+        type=str,
+        default="layer4",
+        choices=["layer2", "layer3", "layer4"],
+        help="Couche ResNet sémantique fournie au head (si sem_resnet50).",
+    )
+
+    # Freeze
+    p.add_argument(
+        "--det_freeze_backbone",
+        type=int,
+        default=None,
+        help="Override freeze détection: None=>freeze_backbone global ; 1 gel ; 0 trainable.",
+    )
+    p.add_argument(
+        "--det_sem_freeze_at",
+        type=int,
+        default=-1,
+        choices=[-1, 0, 1, 2, 3, 4],
+        help="Gel progressif ResNet sémantique (si sem_resnet50).",
+    )
+    p.add_argument("--det_disable_sem_losses", action="store_true", help="En mode détection, coupe losses sem.")
+
+    # Optim détection
+    p.add_argument("--det_epochs", type=int, default=20, help="Nb epochs détection.")
+    p.add_argument("--det_lr_head", type=float, default=1e-4, help="LR tête détection.")
+    p.add_argument("--det_lr_backbone", type=float, default=1e-5, help="LR backbone détection (si non gelé).")
+    p.add_argument("--det_weight_decay", type=float, default=1e-4, help="Weight decay détection.")
+    p.add_argument("--det_grad_clip", type=float, default=0.0, help="Grad clip norm (0=off).")
+
+    # DETR/VitDet-like
+    p.add_argument("--det_num_queries", type=int, default=300, help="Nb queries DETR.")
+    p.add_argument("--det_nheads", type=int, default=8, help="Nb têtes attention décodeur.")
+    p.add_argument("--det_dec_layers", type=int, default=6, help="Nb couches décodeur DETR.")
+    p.add_argument("--det_d_model", type=int, default=256, help="Dim modèle DETR.")
+    p.add_argument("--det_token_dim", type=int, default=256, help="Dim token/proj pour DETR/VitDet.")
+    p.add_argument("--det_eos_coef", type=float, default=0.1, help="Poids 'no object' DETR.")
+    p.add_argument("--det_score_thresh", type=float, default=0.5, help="Seuil score (DETR/VitDet) en eval/camera.")
+
+    # FasterRCNN anchors
+    p.add_argument("--fasterrcnn_anchor_sizes", type=str, default="32,64,128,256,512", help="Anchor sizes csv.")
+    p.add_argument("--fasterrcnn_aspect_ratios", type=str, default="0.5,1.0,2.0", help="Aspect ratios csv.")
+
+    # FastRNN head
+    p.add_argument("--fastrnn_hidden", type=int, default=256, help="Dim interne FastRNN.")
+    p.add_argument("--fastrnn_dropout", type=float, default=0.0, help="Dropout FastRNN.")
+
+    # Bool propre: ON par défaut, désactivable
+    p.add_argument("--fastrnn_bidir", action="store_true", help="Active FastRNN bidirectionnel.")
+    p.add_argument("--fastrnn_no_bidir", action="store_true", help="Force FastRNN unidirectionnel.")
+
+    # Pertes FastRNN
+    p.add_argument("--fastrnn_focal_alpha", type=float, default=0.25)
+    p.add_argument("--fastrnn_focal_gamma", type=float, default=2.0)
+    p.add_argument("--fastrnn_lambda_reg", type=float, default=1.0)
+    p.add_argument("--fastrnn_lambda_ctr", type=float, default=1.0)
+    p.add_argument("--fastrnn_lambda_cls", type=float, default=1.0)
+
+    # Post-process FastRNN
+    p.add_argument("--fastrnn_score_thresh", type=float, default=0.05)
+    p.add_argument("--fastrnn_nms_thresh", type=float, default=0.5)
+    p.add_argument("--fastrnn_topk", type=int, default=1000)
+    p.add_argument("--fastrnn_size_divisible", type=int, default=32, help="Padding multiple de.")
+    p.add_argument("--fastrnn_force_stride", type=int, default=0, help="0=auto, sinon impose stride (ex 32).")
+
+    # Eval COCO
+    p.add_argument("--det_eval_iou_types", type=str, default="bbox", help="IoU types COCOeval (bbox,segm).")
+    p.add_argument("--det_eval_max_dets", type=int, default=100, help="COCOeval maxDets.")
+    p.add_argument("--det_eval_limit", type=int, default=0, help="Limite nb images eval (0=full).")
+
+    # Caméra (OpenCV)
+    p.add_argument("--det_cam_id", type=int, default=0, help="ID caméra OpenCV (webcam).")
+    p.add_argument("--det_cam_url", type=str, default="", help="URL RTSP/HTTP (prioritaire sur cam_id).")
+    p.add_argument("--det_cam_threshold", type=float, default=0.35, help="Seuil affichage boxes caméra.")
+    p.add_argument("--det_cam_save", type=str, default="", help="Chemin sortie vidéo .mp4 (optionnel).")
+
+    # =========================================================================
+    # 15) Classification tokens (cls_tokens)
+    # =========================================================================
+    p.add_argument("--cls_num_classes", type=int, default=10, help="Fallback nb classes.")
+    p.add_argument("--cls_d_model", type=int, default=256, help="Dim tokens tête cls.")
+    p.add_argument("--cls_nhead", type=int, default=4, help="Nb têtes Transformer cls.")
+    p.add_argument("--cls_layers", type=int, default=2, help="Nb couches Transformer cls.")
+    p.add_argument("--cls_dim_ff", type=int, default=1024, help="Dim feedforward cls.")
+    p.add_argument("--cls_dropout", type=float, default=0.1, help="Dropout cls.")
+
+    p.add_argument("--cls_lr_backbone", type=float, default=1e-4, help="LR backbone cls_tokens (si non gelé).")
+    p.add_argument("--cls_lr_head", type=float, default=1e-3, help="LR token_encoder + tête cls.")
+    p.add_argument("--cls_epochs", type=int, default=50, help="Nb epochs cls.")
+    p.add_argument("--cls_save_freq", type=int, default=10, help="Save freq cls (epochs).")
+
+    # =========================================================================
+    # 16) Logs & checkpoints
+    # =========================================================================
+    p.add_argument("--tb", action="store_true", help="Active TensorBoard.")
+    p.add_argument("--tb_freq", type=int, default=100, help="Itérations entre logs TB (A/B).")
+    p.add_argument("--tb_freq_C", type=int, default=50, help="Itérations entre logs TB pour C.")
+    p.add_argument("--tb_flush", type=int, default=100, help="Flush TB tous les N steps (0=jamais).")
+
+    p.add_argument(
+        "--save_freq",
+        type=str,
+        default="epoch",
+        help="Ckpt: 'epoch', 'epoch:N', 'step', 'step:N', 'none' ou 'N'(=step:N).",
+    )
+    p.add_argument(
+        "--epoch_ckpt_interval",
+        type=int,
+        default=None,
+        help="Compat: intervalle epochs si tu veux forcer un N (override save_freq epoch).",
+    )
+
+    # =========================================================================
+    # 17) PatchNCE contenu (optionnel)
+    # =========================================================================
+    p.add_argument("--content_nce_enable", action="store_true", help="PatchNCE supplémentaire sur contenu.")
+    p.add_argument("--lambda_content_nce", type=float, default=0.0, help="Poids NCE contenu.")
+
+    # =========================================================================
+    # 18) Contenu sémantique (ResNet50 + MoCo + JEPA-content)
+    # =========================================================================
+    p.add_argument("--sem_content", action="store_true", help="Active branche contenu sémantique (ResNet50+MoCo).")
+    p.add_argument("--lambda_sem", type=float, default=0.5, help="Poids MoCo (contenu sémantique).")
+    p.add_argument("--sem_every", type=int, default=1, help="Optimise la branche sem toutes les N itérations.")
+    p.add_argument("--sem_sym", action="store_true", help="Loss symétrique.")
+    p.add_argument("--sem_two_styles", action="store_true", help="Deux styles comme positifs supplémentaires.")
+    p.add_argument("--sem_detach_far", type=int, default=1, help="1: contraste ne rétro-propage pas vers G_A.")
+    p.add_argument("--lr_sem", type=float, default=None, help="LR branche sem (None=>--lr).")
+
+    p.add_argument("--sem_pretrained", type=int, default=1, help="1: ResNet50 ImageNet pré-entraîné.")
+    p.add_argument("--sem_dim", type=int, default=256, help="Dim embedding global MoCo.")
+    p.add_argument("--sem_tok_dim", type=int, default=256, help="Dim tokens sémantiques (JEPA-content).")
+    p.add_argument("--sem_queue", type=int, default=65536, help="Taille queue MoCo.")
+    p.add_argument("--sem_m", type=float, default=0.999, help="Momentum EMA encodeur MoCo.")
+    p.add_argument("--sem_t", type=float, default=0.2, help="Température MoCo (InfoNCE).")
+
+    p.add_argument("--sem_pretrained_path", type=str, default=None, help="Ckpt externe pour init backbone sem.")
+    p.add_argument("--sem_pretrained_strict", type=int, default=0, help="1: strict load_state_dict.")
+    p.add_argument("--sem_pretrained_verbose", type=int, default=1, help="Logs chargement checkpoint.")
+
+    p.add_argument("--sem_use_aug", action="store_true", help="Augmentations SimCLR-like pour contraste.")
+    p.add_argument("--sem_crop", type=int, default=224, help="Taille crop branche sem.")
+    p.add_argument("--sem_min_scale", type=float, default=0.5, help="Scale min RandomResizedCrop.")
+    p.add_argument("--sem_color_jitter", type=float, default=0.4, help="Amplitude ColorJitter.")
+    p.add_argument("--sem_gray", type=float, default=0.2, help="Probabilité RandomGrayscale.")
+    p.add_argument("--sem_blur", type=float, default=0.1, help="Probabilité GaussianBlur.")
+
+    # =========================================================================
+    # 19) Compat / sécurité
+    # =========================================================================
+    p.add_argument("--strict_load", type=int, default=0, help="Option générique strict=True dans certains loaders.")
+
+    # =========================================================================
+    # Parse
+    # =========================================================================
+    args = p.parse_args()
+
+    # ---- Post-process NCE intra/inter
+    if getattr(args, "no_nce_intra", False):
+        args.nce_intra = False
+    if getattr(args, "no_nce_inter", False):
+        args.nce_inter = False
+
+    # ---- FastRNN bidir: ON par défaut, OFF si --fastrnn_no_bidir
+    if getattr(args, "fastrnn_no_bidir", False):
+        args.fastrnn_bidir = False
+    else:
+        args.fastrnn_bidir = True
+
+    # ---- Override freeze backbone détection: fallback global freeze_backbone
+    if args.det_freeze_backbone is None:
+        args.det_freeze_backbone = 1 if getattr(args, "freeze_backbone", False) else 0
+    else:
+        args.det_freeze_backbone = int(args.det_freeze_backbone)
+
+    # ---- Override freeze backbone classification
+    if args.cls_freeze_backbone is None:
+        args.cls_freeze_backbone = 1 if getattr(args, "freeze_backbone", False) else 0
+    else:
+        args.cls_freeze_backbone = int(args.cls_freeze_backbone)
+
+    # ---- Petites sécurités sur det_* hparams-json flags
+    if not getattr(args, "det_auto_hparams_json", False):
+        # Si l'utilisateur n'a pas activé l'auto, on ne tente rien automatiquement
+        pass
+    if isinstance(args.det_hparams_json, str) and args.det_hparams_json.strip() == "":
+        args.det_hparams_json = ""
+    if isinstance(args.det_ckpt, str) and args.det_ckpt.strip() == "":
+        args.det_ckpt = ""
+    if isinstance(args.det_resume, str) and args.det_resume.strip() == "":
+        args.det_resume = ""
+
+    return args
+

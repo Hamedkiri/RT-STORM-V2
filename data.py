@@ -14,6 +14,7 @@ from PIL import Image
 # -----------------------------
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
+
 def is_image_path(p: Path) -> bool:
     return p.suffix.lower() in IMG_EXTS
 
@@ -95,7 +96,7 @@ class MultiTaskDataset(torch.utils.data.Dataset):
 
         # Construire la liste des échantillons
         for folder, images in self.data.items():
-            for img_name, img_info in images.items():
+            for _img_name, img_info in images.items():
                 orig_path = img_info['image_path']
                 if self.search_folder:
                     image_identifier = os.path.join(self.search_folder, os.path.basename(orig_path))
@@ -151,7 +152,7 @@ class UnsupervisedJsonDataset(Dataset):
         self.find_images_by_sub_folder = find_images_by_sub_folder
 
         for folder, images in data.items():
-            for img_name, img_info in images.items():
+            for _img_name, img_info in images.items():
                 orig_path = img_info["image_path"]
                 if self.search_folder:
                     path = os.path.join(self.search_folder, os.path.basename(orig_path))
@@ -335,7 +336,7 @@ def infer_tasks_from_dataset(loader, opt):
 
 
 # ---------------------------------------------------------------------------------------
-# (Le reste : CocoStyleDetectionDataset + build_detection_dataloader inchangé)
+# Detection: CocoStyleDetectionDataset + build_detection_dataloader (avec filtrage amont)
 # ---------------------------------------------------------------------------------------
 
 class CocoStyleDetectionDataset(Dataset):
@@ -344,12 +345,17 @@ class CocoStyleDetectionDataset(Dataset):
       - ann_file : JSON avec "images", "annotations", "categories"
       - img_root : dossier contenant les images
     Chaque item retourne : image_tensor, target_dict
+
+    ✅ drop_empty=True :
+      - retire en amont les images sans bbox valides
+      - stocke removed_empty / original_len
     """
-    def __init__(self, img_root, ann_file, transforms=None, class_ids=None):
+    def __init__(self, img_root, ann_file, transforms=None, class_ids=None, drop_empty: bool = True):
         super().__init__()
         self.img_root = img_root
         self.ann_file = ann_file
         self.transforms = transforms
+        self.drop_empty = bool(drop_empty)
 
         with open(ann_file, "r") as f:
             coco = json.load(f)
@@ -360,18 +366,47 @@ class CocoStyleDetectionDataset(Dataset):
         if class_ids is None:
             self.cat2label = {c["id"]: i + 1 for i, c in enumerate(cats)}
         else:
+            # restreint aux classes du train (ordre stable)
             self.cat2label = {cid: i + 1 for i, cid in enumerate(class_ids)}
 
+        # regrouper annotations par image + filtrer celles invalides
         self.ann_by_img = {img_id: [] for img_id in self.images.keys()}
-        for ann in coco["annotations"]:
-            img_id = ann["image_id"]
+        for ann in coco.get("annotations", []):
+            img_id = ann.get("image_id")
             if img_id not in self.ann_by_img:
                 continue
             if ann.get("iscrowd", 0) == 1:
                 continue
+
+            cat_id = ann.get("category_id", None)
+            if cat_id not in self.cat2label:
+                continue
+
+            bbox = ann.get("bbox", None)
+            if bbox is None or len(bbox) != 4:
+                continue
+            x, y, w, h = bbox
+            if w is None or h is None or w <= 0 or h <= 0:
+                continue
+
             self.ann_by_img[img_id].append(ann)
 
-        self.ids = sorted(self.images.keys())
+        all_ids = sorted(self.images.keys())
+        self.original_len = len(all_ids)
+
+        if self.drop_empty:
+            kept = []
+            removed = 0
+            for img_id in all_ids:
+                if len(self.ann_by_img.get(img_id, [])) > 0:
+                    kept.append(img_id)
+                else:
+                    removed += 1
+            self.ids = kept
+            self.removed_empty = int(removed)
+        else:
+            self.ids = all_ids
+            self.removed_empty = 0
 
     def __len__(self):
         return len(self.ids)
@@ -382,24 +417,36 @@ class CocoStyleDetectionDataset(Dataset):
         file_name = info["file_name"]
         path = os.path.join(self.img_root, file_name)
 
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"[CocoStyleDetectionDataset] Image not found: {path}")
+
         img = Image.open(path).convert("RGB")
 
         anns = self.ann_by_img.get(img_id, [])
-        boxes, labels, area, iscrowd = [], [], [], []
+        boxes_list, labels_list, area_list, iscrowd_list = [], [], [], []
 
         for ann in anns:
             x, y, w, h = ann["bbox"]
-            x1, y1, x2, y2 = x, y, x + w, y + h
-            boxes.append([x1, y1, x2, y2])
-            cat_id = ann["category_id"]
-            labels.append(self.cat2label.get(cat_id, 0))
-            area.append(ann.get("area", w * h))
-            iscrowd.append(ann.get("iscrowd", 0))
+            x1, y1, x2, y2 = float(x), float(y), float(x + w), float(y + h)
+            boxes_list.append([x1, y1, x2, y2])
 
-        boxes = torch.tensor(boxes, dtype=torch.float32)
-        labels = torch.tensor(labels, dtype=torch.int64)
-        area = torch.tensor(area, dtype=torch.float32)
-        iscrowd = torch.tensor(iscrowd, dtype=torch.int64)
+            cat_id = ann["category_id"]
+            labels_list.append(int(self.cat2label.get(cat_id, 0)))
+
+            area_list.append(float(ann.get("area", w * h)))
+            iscrowd_list.append(int(ann.get("iscrowd", 0)))
+
+        # ✅ sécurité shape: (0,4) au lieu de torch.Size([0])
+        if len(boxes_list) == 0:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+            area = torch.zeros((0,), dtype=torch.float32)
+            iscrowd = torch.zeros((0,), dtype=torch.int64)
+        else:
+            boxes = torch.tensor(boxes_list, dtype=torch.float32).reshape(-1, 4)
+            labels = torch.tensor(labels_list, dtype=torch.int64)
+            area = torch.tensor(area_list, dtype=torch.float32)
+            iscrowd = torch.tensor(iscrowd_list, dtype=torch.int64)
 
         target = {
             "boxes": boxes,
@@ -436,16 +483,21 @@ def build_detection_dataloader(opt):
         T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
+    # 1 par défaut (retire les images sans bbox)
+    drop_empty = bool(int(getattr(opt, "det_drop_empty", 1)))
+
     train_ds = CocoStyleDetectionDataset(
         img_root=opt.det_train_img_root,
         ann_file=opt.det_train_ann,
         transforms=train_tf,
+        drop_empty=drop_empty,
     )
     val_ds = CocoStyleDetectionDataset(
         img_root=opt.det_val_img_root,
         ann_file=opt.det_val_ann,
         transforms=val_tf,
         class_ids=list(train_ds.cat2label.keys()),
+        drop_empty=drop_empty,
     )
 
     train_loader = DataLoader(
@@ -463,6 +515,21 @@ def build_detection_dataloader(opt):
         num_workers=getattr(opt, "num_workers", 4),
         pin_memory=True,
         collate_fn=det_collate_fn,
+    )
+
+    removed_train = int(getattr(train_ds, "removed_empty", 0))
+    removed_val = int(getattr(val_ds, "removed_empty", 0))
+    total_removed = removed_train + removed_val
+
+    print(
+        "[DET][DATA] drop_empty={} | "
+        "train: {} -> {} (removed={}) | "
+        "val: {} -> {} (removed={}) | TOTAL_REMOVED={}".format(
+            drop_empty,
+            train_ds.original_len, len(train_ds), removed_train,
+            val_ds.original_len, len(val_ds), removed_val,
+            total_removed,
+        )
     )
 
     return train_loader, val_loader, len(train_ds.cat2label) + 1  # +1 pour classe fond

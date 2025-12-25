@@ -1,8 +1,8 @@
-# tests/detection_utils.py
+#!/usr/bin/env python3
+# testsFile/detectionUtils.py
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -37,43 +37,173 @@ def _to_device_images(
     images: Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, ...]],
     dev: torch.device,
 ) -> List[torch.Tensor]:
-    """
-    Normalise en list[Tensor(C,H,W)] sur device.
-    """
+    """Normalise en list[Tensor(C,H,W)] sur device."""
     if torch.is_tensor(images):
-        # images: (B,C,H,W) -> list
         return [img.to(dev) for img in images]
     return [img.to(dev) for img in list(images)]
 
 
 def _ensure_chw_float01(img: torch.Tensor) -> torch.Tensor:
-    """
-    Best-effort: assure float32, [0,1], CHW.
-    """
+    """Best-effort: assure float32, [0,1], CHW."""
     if img.dtype != torch.float32:
         img = img.float()
-    # si vraisemblablement en 0..255
-    if img.max().item() > 1.5:
+    if img.numel() > 0 and img.max().item() > 1.5:
         img = img / 255.0
     return img
 
 
 # ---------------------------------------------------------------------
+# Checkpoint key helpers
+# ---------------------------------------------------------------------
+def _strip_module_prefix_if_needed(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Supprime un éventuel préfixe 'module.' (DDP/DataParallel)."""
+    if not isinstance(state, dict):
+        return state
+    if not any(k.startswith("module.") for k in state.keys()):
+        return state
+    return {k[len("module.") :]: v for k, v in state.items()}
+
+
+def _guess_head_type_from_state(state: Dict[str, Any]) -> Optional[str]:
+    """
+    Heuristique: détecte si c'est un FasterRCNN ou un FastRNN checkpoint.
+    """
+    if not isinstance(state, dict) or not state:
+        return None
+
+    keys = list(state.keys())
+
+    # typique torchvision FasterRCNN
+    if any(k.startswith("rpn.") for k in keys) or any(k.startswith("roi_heads.") for k in keys):
+        return "fasterrcnn"
+
+    # ton detector custom
+    if any(k.startswith("head.") for k in keys):
+        return "fastrnn"
+
+    return None
+
+
+def _infer_num_classes_from_state(state: Dict[str, Any], head_type: str) -> Optional[int]:
+    """
+    Infère num_classes depuis le checkpoint (utile pour éviter les size-mismatch).
+    - FasterRCNN: roi_heads.box_predictor.cls_score.weight -> [num_classes, in_features]
+    - FastRNN: tente quelques clés probables (fallback).
+    """
+    head_type = str(head_type).lower().strip()
+
+    if head_type == "fasterrcnn":
+        w = state.get("roi_heads.box_predictor.cls_score.weight", None)
+        if torch.is_tensor(w) and w.ndim == 2:
+            return int(w.shape[0])
+        b = state.get("roi_heads.box_predictor.cls_score.bias", None)
+        if torch.is_tensor(b) and b.ndim == 1:
+            return int(b.shape[0])
+        return None
+
+    if head_type == "fastrnn":
+        # clés typiques possibles (à adapter si ton head a un naming différent)
+        candidates = [
+            "head.cls.weight",
+            "head.classifier.weight",
+            "head.fc_cls.weight",
+            "head.cls_score.weight",
+        ]
+        for k in candidates:
+            w = state.get(k, None)
+            if torch.is_tensor(w) and w.ndim == 2:
+                return int(w.shape[0])
+        candidates_b = [
+            "head.cls.bias",
+            "head.classifier.bias",
+            "head.fc_cls.bias",
+            "head.cls_score.bias",
+        ]
+        for k in candidates_b:
+            b = state.get(k, None)
+            if torch.is_tensor(b) and b.ndim == 1:
+                return int(b.shape[0])
+        return None
+
+    return None
+
+
+def _remap_backbone_keys_to_match_model(
+    state: Dict[str, Any],
+    model_state_keys: List[str],
+) -> Dict[str, Any]:
+    """
+    Gère le cas backbone.body.* <-> backbone.*
+    selon ce que le modèle ATTEND réellement.
+
+    - Si le checkpoint a backbone.body.* mais le modèle attend backbone.* -> on enlève ".body"
+    - Si le checkpoint a backbone.* mais le modèle attend backbone.body.* -> on ajoute ".body"
+    """
+    if not isinstance(state, dict) or not state:
+        return state
+
+    has_ckpt_body = any(k.startswith("backbone.body.") for k in state.keys())
+    has_ckpt_plain = any(k.startswith("backbone.") for k in state.keys()) and not has_ckpt_body
+
+    model_has_body = any(k.startswith("backbone.body.") for k in model_state_keys)
+    model_has_plain = any(k.startswith("backbone.") for k in model_state_keys) and not model_has_body
+
+    # ckpt: backbone.body.*, model: backbone.*
+    if has_ckpt_body and model_has_plain:
+        new_state: Dict[str, Any] = {}
+        for k, v in state.items():
+            if k.startswith("backbone.body."):
+                new_state[k.replace("backbone.body.", "backbone.", 1)] = v
+            else:
+                new_state[k] = v
+        return new_state
+
+    # ckpt: backbone.*, model: backbone.body.*
+    if has_ckpt_plain and model_has_body:
+        new_state: Dict[str, Any] = {}
+        for k, v in state.items():
+            if k.startswith("backbone.") and not k.startswith("backbone.body."):
+                new_state[k.replace("backbone.", "backbone.body.", 1)] = v
+            else:
+                new_state[k] = v
+        return new_state
+
+    return state
+
+
+def _drop_fasterrcnn_predictor_keys(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    En cas de mismatch voulu (changement de nb de classes), on peut ignorer la tête :
+    - roi_heads.box_predictor.*
+    """
+    if not isinstance(state, dict) or not state:
+        return state
+    bad_prefix = "roi_heads.box_predictor."
+    return {k: v for k, v in state.items() if not k.startswith(bad_prefix)}
+
+
+# ---------------------------------------------------------------------
 # Checkpoint + hyperparams loading
 # ---------------------------------------------------------------------
-def _load_detector_ckpt(ckpt_path: Union[str, Path], map_location: str = "cpu") -> Dict[str, Any]:
+def _load_detector_ckpt(
+    ckpt_path: Union[str, Path],
+    map_location: str = "cpu",
+) -> Dict[str, Any]:
     ckpt_path = str(ckpt_path)
     ckpt = torch.load(ckpt_path, map_location=map_location)
+
     if not isinstance(ckpt, dict):
         raise RuntimeError(f"Invalid detector checkpoint (not a dict): {ckpt_path}")
 
     # accept legacy key
     if "model" not in ckpt and "state_dict" in ckpt:
         ckpt["model"] = ckpt["state_dict"]
-    if "model" not in ckpt:
-        raise RuntimeError(f"Invalid detector checkpoint (missing 'model'/'state_dict'): {ckpt_path}")
 
-    # hparams optional
+    if "model" not in ckpt:
+        raise RuntimeError(
+            f"Invalid detector checkpoint (missing 'model'/'state_dict'): {ckpt_path}"
+        )
+
     if "hparams" in ckpt and ckpt["hparams"] is not None and not isinstance(ckpt["hparams"], dict):
         raise RuntimeError("ckpt['hparams'] must be a dict when present")
 
@@ -110,23 +240,22 @@ def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, An
 
 
 # ---------------------------------------------------------------------
-# HParams dataclass (centrée sur FastRNN pour l'instant)
+# HParams dataclass
 # ---------------------------------------------------------------------
 @dataclass
 class DetectorHParams:
     # Core
-    head_type: str = "fastrnn"        # <-- pour l'instant on supporte seulement fastrnn
-    num_classes: int = 81             # inclut background = 0
-    feat_source: str = "sem_resnet50" # sem_resnet50 (backbone torchvision) ou autre plus tard
+    head_type: str = "fastrnn"         # "fastrnn" | "fasterrcnn"
+    num_classes: int = 81              # inclut background = 0
+    feat_source: str = "sem_resnet50"
     freeze_backbone: bool = True
     img_h: int = 256
     img_w: int = 256
-    sem_pretrained: bool = True       # backbone torchvision pretrained
+    sem_pretrained: bool = True
 
-    # (optionnel) layer à retourner si tu passes par IntermediateLayerGetter
     det_sem_return_layer: str = "layer4"
 
-    # FastRNN detector params
+    # FastRNN params
     fastrnn_hidden: int = 256
     fastrnn_bidir: bool = True
     fastrnn_dropout: float = 0.0
@@ -137,6 +266,21 @@ class DetectorHParams:
     fastrnn_topk: int = 1000
     fastrnn_size_divisible: int = 32
 
+    # FasterRCNN params
+    frcnn_rpn_pre_nms_top_n_train: int = 2000
+    frcnn_rpn_pre_nms_top_n_test: int = 1000
+    frcnn_rpn_post_nms_top_n_train: int = 2000
+    frcnn_rpn_post_nms_top_n_test: int = 1000
+    frcnn_rpn_nms_thresh: float = 0.7
+    frcnn_rpn_fg_iou_thresh: float = 0.7
+    frcnn_rpn_bg_iou_thresh: float = 0.3
+    frcnn_rpn_batch_size_per_image: int = 256
+    frcnn_rpn_positive_fraction: float = 0.5
+
+    frcnn_box_score_thresh: float = 0.05
+    frcnn_box_nms_thresh: float = 0.5
+    frcnn_box_detections_per_img: int = 100
+
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "DetectorHParams":
         allowed = {f.name for f in fields(DetectorHParams)}
@@ -145,7 +289,7 @@ class DetectorHParams:
 
 
 # ---------------------------------------------------------------------
-# Backbone builders (cohérent + minimal)
+# Backbone builders
 # ---------------------------------------------------------------------
 def _build_sem_resnet50_backbone(
     *,
@@ -153,17 +297,12 @@ def _build_sem_resnet50_backbone(
     return_layer: str = "layer4",
 ) -> Tuple[torch.nn.Module, int]:
     """
-    Backbone torchvision ResNet50 qui renvoie un dict {"0": feat}.
-    out_channels dépend du layer:
-      - layer4 -> 2048
-      - layer3 -> 1024
-      - layer2 -> 512
-      - layer1 -> 256
+    Backbone torchvision ResNet50 -> IntermediateLayerGetter -> {"0": feat}
+    Keys du state_dict: backbone.body.* (compatible torchvision detection).
     """
     import torchvision
     from torchvision.models._utils import IntermediateLayerGetter
 
-    # weights API change selon torchvision; on fait best-effort
     weights = None
     if pretrained:
         try:
@@ -173,19 +312,60 @@ def _build_sem_resnet50_backbone(
 
     m = torchvision.models.resnet50(weights=weights)
 
-    # channels per layer
     layer_to_c = {"layer1": 256, "layer2": 512, "layer3": 1024, "layer4": 2048}
     if return_layer not in layer_to_c:
         raise ValueError(f"return_layer must be one of {list(layer_to_c.keys())}, got {return_layer}")
 
     out_channels = layer_to_c[return_layer]
-
     backbone = IntermediateLayerGetter(m, return_layers={return_layer: "0"})
-    return backbone, out_channels
+    setattr(backbone, "out_channels", int(out_channels))
+    return backbone, int(out_channels)
 
 
 # ---------------------------------------------------------------------
-# Build detector from checkpoint (+ hparams JSON)
+# FasterRCNN builder
+# ---------------------------------------------------------------------
+def _build_fasterrcnn_detector(
+    backbone: torch.nn.Module,
+    num_classes: int,
+    hp: DetectorHParams,
+) -> torch.nn.Module:
+    """
+    FasterRCNN torchvision. Compatible avec le checkpoint FasterRCNN
+    (rpn.*, roi_heads.* etc.).
+    """
+    from torchvision.models.detection import FasterRCNN
+    from torchvision.models.detection.rpn import AnchorGenerator
+
+    anchor_generator = AnchorGenerator(
+        sizes=((32, 64, 128, 256, 512),),      # 1 feature map -> tuple len 1
+        aspect_ratios=((0.5, 1.0, 2.0),),
+    )
+
+    model = FasterRCNN(
+        backbone=backbone,
+        num_classes=int(num_classes),
+        rpn_anchor_generator=anchor_generator,
+
+        rpn_pre_nms_top_n_train=int(hp.frcnn_rpn_pre_nms_top_n_train),
+        rpn_pre_nms_top_n_test=int(hp.frcnn_rpn_pre_nms_top_n_test),
+        rpn_post_nms_top_n_train=int(hp.frcnn_rpn_post_nms_top_n_train),
+        rpn_post_nms_top_n_test=int(hp.frcnn_rpn_post_nms_top_n_test),
+        rpn_nms_thresh=float(hp.frcnn_rpn_nms_thresh),
+        rpn_fg_iou_thresh=float(hp.frcnn_rpn_fg_iou_thresh),
+        rpn_bg_iou_thresh=float(hp.frcnn_rpn_bg_iou_thresh),
+        rpn_batch_size_per_image=int(hp.frcnn_rpn_batch_size_per_image),
+        rpn_positive_fraction=float(hp.frcnn_rpn_positive_fraction),
+
+        box_score_thresh=float(hp.frcnn_box_score_thresh),
+        box_nms_thresh=float(hp.frcnn_box_nms_thresh),
+        box_detections_per_img=int(hp.frcnn_box_detections_per_img),
+    )
+    return model
+
+
+# ---------------------------------------------------------------------
+# Build detector from checkpoint
 # ---------------------------------------------------------------------
 def build_detector_from_checkpoint(
     ckpt_path: Union[str, Path],
@@ -194,22 +374,27 @@ def build_detector_from_checkpoint(
     hparams_json: Optional[Union[str, Path]] = None,
     auto_hparams_json: bool = True,
     prefer_json_over_ckpt: bool = True,
-    strict: bool = True,
+    strict: bool = False,   # IMPORTANT: par défaut False (diagnostic)
+    auto_fix_num_classes: bool = True,
+    drop_predictor_if_mismatch: bool = False,
 ) -> Tuple[torch.nn.Module, DetectorHParams]:
     """
-    Un seul point d'entrée pour reconstruire le détecteur en test.
+    Reconstruit le détecteur du test.
 
-    Résolution des hparams :
-      - hparams_json fourni -> utilisé
-      - sinon auto_hparams_json -> cherche hyperparameters.json à côté du ckpt
-      - sinon ckpt["hparams"] si dispo
-      - sinon defaults dataclass
-
-    Support actuel: head_type == "fastrnn" uniquement.
+    FIX PRINCIPAL:
+      - auto-détection du head_type à partir des clés du state_dict du ckpt.
+        (ex: rpn./roi_heads. => FasterRCNN)
+      - remap backbone.body <-> backbone si nécessaire.
+      - auto-fix num_classes depuis le checkpoint (évite les size mismatch),
+        et option pour ignorer la tête si mismatch volontaire.
     """
-    from models.detection.fastrnn_detector import FastRNNDetector
-
     ckpt = _load_detector_ckpt(ckpt_path, map_location=str(dev))
+
+    state = ckpt["model"]
+    if not isinstance(state, dict):
+        raise RuntimeError("[detection_utils] ckpt['model'] must be a state_dict dict.")
+    state = _strip_module_prefix_if_needed(state)
+
     ckpt_hp = ckpt.get("hparams") or {}
     if not isinstance(ckpt_hp, dict):
         raise RuntimeError("ckpt['hparams'] must be a dict when present")
@@ -224,7 +409,6 @@ def build_detector_from_checkpoint(
         if inferred_json_path is not None:
             json_hp = _load_hparams_json(inferred_json_path)
 
-    # merge
     if json_hp and ckpt_hp:
         merged = _merge_dicts(ckpt_hp, json_hp) if prefer_json_over_ckpt else _merge_dicts(json_hp, ckpt_hp)
     elif json_hp:
@@ -236,19 +420,36 @@ def build_detector_from_checkpoint(
 
     hp = DetectorHParams.from_dict(merged)
 
+    # ---- AUTO head_type override if mismatch with checkpoint ----
+    guessed = _guess_head_type_from_state(state)
+    if guessed is not None and str(hp.head_type).lower().strip() != guessed:
+        print(
+            f"[detection_utils] ⚠️ head_type from hparams='{hp.head_type}' "
+            f"but checkpoint looks like '{guessed}'. Overriding head_type -> '{guessed}'."
+        )
+        hp.head_type = guessed
+
+    # ---- AUTO num_classes override to match checkpoint (avoids size mismatch) ----
+    if auto_fix_num_classes:
+        inferred_nc = _infer_num_classes_from_state(state, head_type=str(hp.head_type))
+        if inferred_nc is not None and int(inferred_nc) != int(hp.num_classes):
+            msg = (
+                f"[detection_utils] ⚠️ num_classes from hparams={hp.num_classes} "
+                f"but checkpoint has {inferred_nc}."
+            )
+            if drop_predictor_if_mismatch and str(hp.head_type).lower().strip() == "fasterrcnn":
+                print(msg + " Will DROP predictor weights (roi_heads.box_predictor.*) and keep hp.num_classes.")
+            else:
+                print(msg + f" Overriding hp.num_classes -> {inferred_nc}")
+                hp.num_classes = int(inferred_nc)
+
     if inferred_json_path is not None:
         print(f"[detection_utils] auto hparams_json loaded: {inferred_json_path}")
     if hparams_json is not None:
         print(f"[detection_utils] hparams_json used: {Path(hparams_json)}")
     print(f"[detection_utils] head_type={hp.head_type}, feat_source={hp.feat_source}, num_classes={hp.num_classes}")
 
-    head = str(hp.head_type).lower().strip()
-    if head != "fastrnn":
-        raise ValueError(
-            f"[detection_utils] Only head_type='fastrnn' is supported for now, got '{hp.head_type}'."
-        )
-
-    # build backbone
+    # ---- build backbone ----
     feat_source = str(hp.feat_source).lower().strip()
     if feat_source == "sem_resnet50":
         backbone, out_ch = _build_sem_resnet50_backbone(
@@ -256,36 +457,67 @@ def build_detector_from_checkpoint(
             return_layer=str(hp.det_sem_return_layer),
         )
     else:
-        raise ValueError(
-            f"[detection_utils] Unsupported feat_source='{hp.feat_source}' for now. "
-            f"Supported: ['sem_resnet50']"
-        )
+        raise ValueError(f"[detection_utils] Unsupported feat_source='{hp.feat_source}' (only sem_resnet50).")
 
-    # freeze backbone
     if hp.freeze_backbone:
         for p in backbone.parameters():
             p.requires_grad = False
 
-    model = FastRNNDetector(
-        backbone=backbone,
-        out_channels=int(out_ch),
-        num_classes=int(hp.num_classes),
-        head_hidden=int(hp.fastrnn_hidden),
-        head_bidir=bool(hp.fastrnn_bidir),
-        head_dropout=float(hp.fastrnn_dropout),
-        size_divisible=int(hp.fastrnn_size_divisible),
-        focal_alpha=float(hp.fastrnn_focal_alpha),
-        focal_gamma=float(hp.fastrnn_focal_gamma),
-        score_thresh=float(hp.fastrnn_score_thresh),
-        nms_thresh=float(hp.fastrnn_nms_thresh),
-        topk=int(hp.fastrnn_topk),
-    ).to(dev)
+    head = str(hp.head_type).lower().strip()
 
-    # load weights
-    state = ckpt["model"]
-    if not isinstance(state, dict):
-        raise RuntimeError("[detection_utils] ckpt['model'] must be a state_dict dict.")
-    model.load_state_dict(state, strict=bool(strict))
+    if head == "fastrnn":
+        from models.detection.fastrnn_detector import FastRNNDetector
+
+        model = FastRNNDetector(
+            backbone=backbone,
+            out_channels=int(out_ch),
+            num_classes=int(hp.num_classes),
+            head_hidden=int(hp.fastrnn_hidden),
+            head_bidir=bool(hp.fastrnn_bidir),
+            head_dropout=float(hp.fastrnn_dropout),
+            size_divisible=int(hp.fastrnn_size_divisible),
+            focal_alpha=float(hp.fastrnn_focal_alpha),
+            focal_gamma=float(hp.fastrnn_focal_gamma),
+            score_thresh=float(hp.fastrnn_score_thresh),
+            nms_thresh=float(hp.fastrnn_nms_thresh),
+            topk=int(hp.fastrnn_topk),
+        ).to(dev)
+
+    elif head == "fasterrcnn":
+        model = _build_fasterrcnn_detector(
+            backbone=backbone,
+            num_classes=int(hp.num_classes),
+            hp=hp,
+        ).to(dev)
+
+        # Si on a gardé hp.num_classes différent du ckpt (cas drop_predictor_if_mismatch),
+        # on retire les poids de la tête du state pour éviter les size-mismatch.
+        if auto_fix_num_classes and drop_predictor_if_mismatch:
+            inferred_nc = _infer_num_classes_from_state(state, head_type="fasterrcnn")
+            if inferred_nc is not None and int(inferred_nc) != int(hp.num_classes):
+                state = _drop_fasterrcnn_predictor_keys(state)
+
+    else:
+        raise ValueError(f"[detection_utils] Unsupported head_type='{hp.head_type}'.")
+
+    # ---- remap backbone keys to match model expected keys ----
+    model_keys = list(model.state_dict().keys())
+    state = _remap_backbone_keys_to_match_model(state, model_keys)
+
+    # ---- load ----
+    # NOTE: strict=False n'évite PAS les size mismatch. D'où l'auto-fix num_classes / drop predictor.
+    missing, unexpected = model.load_state_dict(state, strict=bool(strict))
+
+    if not strict:
+        if missing:
+            print(f"[detection_utils] missing keys: {len(missing)} (showing 20)")
+            for k in missing[:20]:
+                print("  -", k)
+        if unexpected:
+            print(f"[detection_utils] unexpected keys: {len(unexpected)} (showing 20)")
+            for k in unexpected[:20]:
+                print("  -", k)
+
     model.eval()
     return model, hp
 
@@ -302,21 +534,13 @@ def infer_batch(
     score_thresh: Optional[float] = None,
     max_dets: Optional[int] = None,
 ) -> List[Dict[str, torch.Tensor]]:
-    """
-    API UNIQUE de sortie:
-      returns list[{"boxes","scores","labels"}] sur CPU.
-
-    Pour FastRNNDetector:
-      - le filtrage score_thresh est déjà dans le modèle (self.score_thresh),
-        mais on permet un override optionnel ici.
-    """
     imgs = _to_device_images(images, dev)
     imgs = [_ensure_chw_float01(x) for x in imgs]
 
-    outs = model(imgs)  # attendu: list[dict]
+    outs = model(imgs)  # torchvision style list[dict]
     if not isinstance(outs, (list, tuple)) or (len(outs) > 0 and not isinstance(outs[0], dict)):
         raise RuntimeError(
-            "[infer_batch] Expected torchvision-style outputs: list[dict(boxes, labels, scores)]. "
+            "[infer_batch] Expected list[dict(boxes, labels, scores)]. "
             f"Got type={type(outs)}."
         )
 
@@ -326,23 +550,20 @@ def infer_batch(
         scores = o.get("scores", torch.empty((0,), device=dev)).detach()
         labels = o.get("labels", torch.empty((0,), device=dev, dtype=torch.long)).detach()
 
-        # optional override filter
         if score_thresh is not None and scores.numel() > 0:
             keep = scores >= float(score_thresh)
             boxes = boxes[keep]
             scores = scores[keep]
             labels = labels[keep]
 
-        # optional top-k
         if max_dets is not None and scores.numel() > int(max_dets):
             idx = torch.argsort(scores, descending=True)[: int(max_dets)]
             boxes = boxes[idx]
             scores = scores[idx]
             labels = labels[idx]
 
-        out_cpu.append(
-            {"boxes": boxes.cpu(), "scores": scores.cpu(), "labels": labels.cpu()}
-        )
+        out_cpu.append({"boxes": boxes.cpu(), "scores": scores.cpu(), "labels": labels.cpu()})
+
     return out_cpu
 
 
@@ -363,10 +584,6 @@ def evaluate_coco_map(
     score_thresh: float = 0.05,
     max_images: Optional[int] = None,
 ) -> Dict[str, float]:
-    """
-    Suppose un dataset CocoDetection-like (data_loader.dataset.coco exist)
-    et targets contenant image_id (dict avec "image_id").
-    """
     if not _try_import_pycocotools():
         raise ImportError("pycocotools required for COCOeval")
 
@@ -387,10 +604,8 @@ def evaluate_coco_map(
 
         for out, tgt in zip(outputs, targets):
             if not (isinstance(tgt, dict) and "image_id" in tgt):
-                raise RuntimeError(
-                    "Target does not contain 'image_id'. "
-                    "Ensure your dataset/collate returns a dict with image_id per image."
-                )
+                raise RuntimeError("Target must contain 'image_id'.")
+
             v = tgt["image_id"]
             img_id = int(v.item() if torch.is_tensor(v) else v)
 
@@ -416,10 +631,7 @@ def evaluate_coco_map(
             break
 
     if not results:
-        return {
-            "AP": 0.0, "AP50": 0.0, "AP75": 0.0, "APs": 0.0, "APm": 0.0, "APl": 0.0,
-            "AR1": 0.0, "AR10": 0.0, "AR100": 0.0,
-        }
+        return {k: 0.0 for k in ["AP","AP50","AP75","APs","APm","APl","AR1","AR10","AR100"]}
 
     coco_dt = coco_gt.loadRes(results)
     coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
@@ -442,7 +654,7 @@ def evaluate_coco_map(
 
 
 # ---------------------------------------------------------------------
-# Camera demo (unique)
+# Camera demo (optional)
 # ---------------------------------------------------------------------
 @torch.no_grad()
 def run_camera_demo(
@@ -476,7 +688,7 @@ def run_camera_demo(
             h, w = resize_hw
             rgb = cv2.resize(rgb, (int(w), int(h)))
 
-        img = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0  # CHW float01
+        img = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
 
         out = infer_batch(
             model,

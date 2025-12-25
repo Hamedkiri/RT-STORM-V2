@@ -9,7 +9,7 @@ def get_opts():
       - classification tokens : cls_tokens
       - détection : detect_transformer (fasterrcnn/detr/vitdet/fastrnn)
 
-    Cette version est cohérente et complète pour la détection + tests:
+    Cette version est cohérente et complète pour la détection + testsFile:
       - chargement ckpt + hyperparams JSON (pour tester facilement)
       - action det_run: train/eval/camera
       - seuils de score distincts: det_score_thresh (DETR/VitDet), fastrnn_* (FastRNN), det_cam_threshold (camera)
@@ -261,6 +261,7 @@ def get_opts():
     p.add_argument("--det_val_ann", type=str, default=None, help="Annotations val COCO (JSON).")
     p.add_argument("--det_img_h", type=int, default=256, help="Hauteur input détection (resize).")
     p.add_argument("--det_img_w", type=int, default=256, help="Largeur input détection (resize).")
+    p.add_argument("--det_drop_empty", type=int, default=1, help="1: retire images sans bbox (train/val).")
 
     # Classes / mapping
     p.add_argument(
@@ -276,9 +277,9 @@ def get_opts():
     p.add_argument(
         "--det_head",
         type=str,
-        choices=["fasterrcnn", "detr", "vitdet", "fastrnn"],
+        choices=["fasterrcnn", "fastrnn"],
         default="fasterrcnn",
-        help="Tête: fasterrcnn/detr/vitdet/fastrnn.",
+        help="Tête détection: fasterrcnn (torchvision) ou fastrnn (custom).",
     )
 
     # Action en mode detect_transformer
@@ -488,6 +489,9 @@ def get_opts():
     p.add_argument("--sem_color_jitter", type=float, default=0.4, help="Amplitude ColorJitter.")
     p.add_argument("--sem_gray", type=float, default=0.2, help="Probabilité RandomGrayscale.")
     p.add_argument("--sem_blur", type=float, default=0.1, help="Probabilité GaussianBlur.")
+    # Dans le bloc 14) Détection
+
+
 
     # =========================================================================
     # 19) Compat / sécurité
