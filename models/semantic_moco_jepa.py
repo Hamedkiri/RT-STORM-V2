@@ -1,7 +1,11 @@
 # file: models/semantic_moco_jepa.py
 """
 Semantic content branch (ResNet50 + MoCo + optional JEPA-content).
-... (docstring inchangé)
+Version robuste:
+- Augmentations batch
+- Chargement backbone pré-entraîné externe (multi-formats, prefixes)
+- MoCo queue
+- ✅ JEPA-content DYNAMIQUE: (re)build TokenJEPA si S change (ex: sem_crop != img_size)
 """
 from __future__ import annotations
 
@@ -69,7 +73,10 @@ class _BatchAugmenter(nn.Module):
             transforms.RandomHorizontalFlip(),
             transforms.RandomApply([cj], p=0.8),
             transforms.RandomGrayscale(p=cfg.gray_p),
-            transforms.RandomApply([transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=cfg.blur_p),
+            transforms.RandomApply(
+                [transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))],
+                p=cfg.blur_p
+            ),
         ])
 
     def forward(self, x01: torch.Tensor) -> torch.Tensor:
@@ -95,7 +102,6 @@ def _unwrap_checkpoint(ckpt: Any) -> Dict[str, torch.Tensor]:
             v = ckpt.get(key, None)
             if isinstance(v, dict) and len(v) > 0 and any(isinstance(t, torch.Tensor) for t in v.values()):
                 return v
-        # else: maybe it's already a state_dict
         if any(isinstance(t, torch.Tensor) for t in ckpt.values()):
             return ckpt
     raise ValueError("[SEM] checkpoint format not recognized (no state_dict tensors found).")
@@ -111,7 +117,6 @@ def _strip_prefixes(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         "model.",
         "net.",
         "state_dict.",
-        # common in MoCo/SSL repos
         "encoder_q.",
         "encoder_k.",
         "base_encoder.",
@@ -140,9 +145,7 @@ def _select_encoder_subdict(sd: Dict[str, torch.Tensor], prefer_q: bool = True) 
     Some checkpoints include both encoder_q and encoder_k.
     If after stripping prefixes we still have keys starting with 'encoder_q.' etc,
     this helper can select the right subset.
-    In our pipeline we generally load one encoder and copy to the other.
     """
-    # if keys still contain encoder_q/encoder_k (because checkpoint used nested dicts)
     has_q = any(k.startswith("encoder_q.") for k in sd.keys())
     has_k = any(k.startswith("encoder_k.") for k in sd.keys())
     if has_q or has_k:
@@ -161,15 +164,11 @@ def _remap_resnet_keys_to_wrapper(sd: Dict[str, torch.Tensor]) -> Dict[str, torc
     Remap torchvision resnet50 keys -> our ResNet50Backbone wrapper keys:
       conv1.* -> stem.0.*
       bn1.*   -> stem.1.*
-      layer1.* -> layer1.*
-      layer2.* -> layer2.*
-      layer3.* -> layer3.*
-      layer4.* -> layer4.*
-    Drop fc.* and other non-trunk keys.
+      layer1..layer4 stay identical
+    Drop fc.* and any non-trunk params.
     """
     out = {}
     for k, v in sd.items():
-        # drop classifier head
         if k.startswith("fc."):
             continue
 
@@ -178,8 +177,6 @@ def _remap_resnet_keys_to_wrapper(sd: Dict[str, torch.Tensor]) -> Dict[str, torc
             kk = "stem.0." + kk[len("conv1."):]
         elif kk.startswith("bn1."):
             kk = "stem.1." + kk[len("bn1."):]
-        # layer1..layer4 stay identical
-        # anything else (e.g. 'relu', 'maxpool') has no params; ignore safely
         if kk.startswith(("stem.0.", "stem.1.", "layer1.", "layer2.", "layer3.", "layer4.")):
             out[kk] = v
     return out
@@ -236,6 +233,7 @@ class MLP(nn.Module):
 class SemanticMoCoJEPA(nn.Module):
     """
     Query encoder is trained with gradients; key encoder is EMA-updated.
+    ✅ JEPA-content: (re)built dynamically to match current token shape (B,S,D).
     """
     def __init__(
         self,
@@ -248,7 +246,7 @@ class SemanticMoCoJEPA(nn.Module):
         pretrained: bool = True,
         aug_cfg: Optional[SemAugConfig] = None,
         img_size: int = 256,
-        # NEW: external pretrained weights
+        # external pretrained weights
         pretrained_path: Optional[str] = None,
         pretrained_strict: bool = False,
         pretrained_verbose: bool = True,
@@ -270,8 +268,6 @@ class SemanticMoCoJEPA(nn.Module):
         self.augmenter = _BatchAugmenter(aug_cfg or SemAugConfig(use_aug=False))
 
         # Encoders
-        # If pretrained_path is provided, we typically DON'T want torchvision ImageNet init again,
-        # but we keep the option. User can set pretrained=0 in CLI.
         self.backbone_q = ResNet50Backbone(pretrained=pretrained)
         self.backbone_k = ResNet50Backbone(pretrained=pretrained)
 
@@ -285,35 +281,35 @@ class SemanticMoCoJEPA(nn.Module):
         # Init key = query
         self._copy_q_to_k()
 
-        # Optionally load external pretrained weights INTO backbone_q then copy to k
+        # Optionally load external pretrained weights into backbone_q then copy to k
         if pretrained_path is not None and str(pretrained_path).strip() != "":
             self.load_pretrained_backbone(
                 pretrained_path,
                 strict=bool(pretrained_strict),
                 verbose=bool(pretrained_verbose),
             )
-            # after loading backbone_q, keep k aligned
             self._copy_q_to_k()
 
         # MoCo queue (K, dim)
         self.register_buffer("queue", F.normalize(torch.randn(self.K, self.dim), dim=1))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
-        # Optional JEPA
+        # JEPA dynamic config
         self.jepa_use = bool(jepa_use)
-        self.jepa = None
+        self._jepa_cfg = dict(
+            hidden_mult=int(jepa_hidden_mult),
+            heads=int(jepa_heads),
+            use_norm=bool(jepa_norm),
+            var_lambda=float(jepa_var),
+            cov_lambda=float(jepa_cov),
+        )
+        self.jepa: Optional[TokenJEPA] = None
+
+        # (optionnel) init JEPA avec img_size supposé -> mais on REBUILD si mismatch
         if self.jepa_use:
             hs = max(1, int(img_size) // 32)
-            S = 1 + hs * hs
-            self.jepa = TokenJEPA(
-                S=S,
-                D=self.tok_dim,
-                hidden_mult=int(jepa_hidden_mult),
-                heads=int(jepa_heads),
-                use_norm=bool(jepa_norm),
-                var_lambda=float(jepa_var),
-                cov_lambda=float(jepa_cov),
-            )
+            S0 = 1 + hs * hs
+            self.jepa = TokenJEPA(S=S0, D=self.tok_dim, **self._jepa_cfg)
 
         # Freeze key params (EMA updated)
         for p in self.backbone_k.parameters():
@@ -327,10 +323,9 @@ class SemanticMoCoJEPA(nn.Module):
 
     def load_pretrained_backbone(self, path: str, *, strict: bool = False, verbose: bool = True):
         """
-        Loads external pretrained weights into backbone_q only (then caller may copy to k).
-
-        Supports many checkpoint formats and key prefixes (module., encoder_q., base_encoder., etc.).
-        Also remaps torchvision resnet keys (conv1/bn1) -> our wrapper keys (stem.0/stem.1).
+        Loads external pretrained weights into backbone_q only (then caller copies to k).
+        Supports many checkpoint formats and key prefixes.
+        Remaps torchvision resnet keys (conv1/bn1) -> our wrapper keys (stem.0/stem.1).
         """
         if verbose:
             print(f"[SEM] Loading pretrained backbone from: {path}")
@@ -405,6 +400,14 @@ class SemanticMoCoJEPA(nn.Module):
         tokG = t.mean(dim=(2, 3), keepdim=False).unsqueeze(1)  # (B,1,D)
         return torch.cat([tokG, spatial], dim=1)  # (B,1+Hs*Ws,D)
 
+    # ✅ JEPA dynamic builder
+    def _ensure_jepa(self, S: int, D: int, device: torch.device, dtype: torch.dtype):
+        if not self.jepa_use:
+            return
+        if self.jepa is None or getattr(self.jepa, "S", None) != int(S) or getattr(self.jepa, "D", None) != int(D):
+            # (re)build
+            self.jepa = TokenJEPA(S=int(S), D=int(D), **self._jepa_cfg).to(device=device, dtype=dtype)
+
     def encode_q(self, x_m11: torch.Tensor, *, apply_aug: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self._prep(x_m11, apply_aug=apply_aug)
         fmap = self.backbone_q(x)
@@ -429,35 +432,57 @@ class SemanticMoCoJEPA(nn.Module):
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         return logits, labels
 
-    def loss_moco(self, im_q: torch.Tensor, im_k: torch.Tensor, *, apply_aug: bool = True) -> Tuple[torch.Tensor, Dict]:
+    def loss_moco(
+        self,
+        im_q: torch.Tensor,
+        im_k: torch.Tensor,
+        *,
+        apply_aug: bool = True,
+        return_keys: bool = True,
+    ) -> Tuple[torch.Tensor, Dict, Optional[torch.Tensor]]:
+        """
+        Retourne (loss, stats, k_vec) si return_keys=True.
+        ⚠️ On NE fait PAS enqueue ici (pour éviter les erreurs inplace avant backward).
+        L'enqueue doit être fait après backward/step dans la boucle appelante.
+        """
         q, _ = self.encode_q(im_q, apply_aug=apply_aug)
         with torch.no_grad():
             k, _ = self.encode_k(im_k, apply_aug=apply_aug)
+
         logits, labels = self.moco_logits(q, k)
         loss = F.cross_entropy(logits, labels)
-        with torch.no_grad():
-            self._dequeue_and_enqueue(k)
+
         stats = {
             "loss": float(loss.item()),
             "logits_pos": float(logits[:, 0].mean().item()),
             "logits_neg": float(logits[:, 1:].mean().item()),
         }
-        return loss, stats
+        k_out = k.detach() if return_keys else None
+        return loss, stats, k_out
 
-    def loss_jepa(self,
-                  im_student: torch.Tensor,
-                  im_teacher: torch.Tensor,
-                  mask_ratio: float = 0.6,
-                  *,
-                  apply_aug: bool = True) -> Tuple[torch.Tensor, Dict]:
-        if not self.jepa_use or self.jepa is None:
+    def loss_jepa(
+        self,
+        im_student: torch.Tensor,
+        im_teacher: torch.Tensor,
+        mask_ratio: float = 0.6,
+        *,
+        apply_aug: bool = True
+    ) -> Tuple[torch.Tensor, Dict]:
+        if not self.jepa_use:
             z = im_student.new_tensor(0.0)
             return z, {"loss": 0.0}
+
         _, Ts = self.encode_q(im_student, apply_aug=apply_aug)
         with torch.no_grad():
             _, Tt = self.encode_k(im_teacher, apply_aug=apply_aug)
+
+        # ✅ ensure correct TokenJEPA shape (S,D)
         B, S, D = Ts.shape
+        self._ensure_jepa(S=S, D=D, device=Ts.device, dtype=Ts.dtype)
+
+        assert self.jepa is not None  # for type checkers
+
         mask = (torch.rand(B, S, device=Ts.device) < float(mask_ratio))
-        mask[:, 0] = False
+        mask[:, 0] = False  # keep global token unmasked
         loss, info = self.jepa(Ts, Tt, mask, w=None)
         return loss, info

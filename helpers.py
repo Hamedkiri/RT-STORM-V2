@@ -2356,12 +2356,12 @@ def log_sem_tensorboard(
                     pass
 
 
+import traceback
+import torch
+import traceback
+import torch
+
 def semantic_content_step_moco_jepa(x, far, y, state, cfg):
-    """
-    Retourne maintenant :
-      (total_loss_float, stats_dict, q_tensor_or_None, k_tensor_or_None)
-    au lieu de (total_loss_float, stats_dict)
-    """
     dev = cfg["device"]
     sem_every = int(cfg.get("sem_every", 1))
     lam_sem = float(cfg.get("lambda_sem", 0.0))
@@ -2380,10 +2380,13 @@ def semantic_content_step_moco_jepa(x, far, y, state, cfg):
     sem_two_styles = bool(cfg.get("sem_two_styles", False))
     sem_detach_far = bool(int(cfg.get("sem_detach_far", 1)) != 0)
 
+    # writer + step
+    writer = state.get("writer", None) or cfg.get("writer", None)
+    step = int(state.get("global_step", -1))
+
     x_in = x.to(dev, non_blocking=True)
     far_in = (far.detach() if sem_detach_far else far).to(dev, non_blocking=True)
 
-    # far2 optionnel
     far2_in = None
     if sem_two_styles and (y is not None):
         try:
@@ -2394,68 +2397,118 @@ def semantic_content_step_moco_jepa(x, far, y, state, cfg):
         except Exception:
             far2_in = None
 
-    opt_sem.zero_grad(set_to_none=True)
-
-    # ---------------- MoCo ----------------
-    loss_moco_1, st1 = sem.loss_moco(x_in, far_in, apply_aug=sem_use_aug)
-    loss_moco = loss_moco_1
-    moco_val = float(st1.get("loss", loss_moco_1.item()))
-
-    if far2_in is not None:
-        loss_moco_2, st2 = sem.loss_moco(x_in, far2_in, apply_aug=sem_use_aug)
-        loss_moco = 0.5 * (loss_moco + loss_moco_2)
-        moco_val = float(0.5 * (moco_val + float(st2.get("loss", loss_moco_2.item()))))
-
-    if sem_sym:
-        loss_sym, st_sym = sem.loss_moco(far_in, x_in, apply_aug=sem_use_aug)
-        loss_moco = 0.5 * (loss_moco + loss_sym)
-        moco_val = float(0.5 * (moco_val + float(st_sym.get("loss", loss_sym.item()))))
-
-    # ---------------- JEPA semantic (optionnel) ----------------
-    jepa_on = bool(cfg.get("sem_jepa_on", False))
-    jepa_every = int(cfg.get("jepa_every", 2))
-    jepa_mask_ratio = float(cfg.get("jepa_mask_ratio", 0.6))
-    loss_jepa = x_in.new_tensor(0.0)
-    jepa_val = 0.0
-    if jepa_on and getattr(sem, "jepa_use", False) and (state["global_step"] % max(1, jepa_every) == 0):
-        loss_jepa, info = sem.loss_jepa(x_in, far_in, mask_ratio=jepa_mask_ratio, apply_aug=sem_use_aug)
-        try:
-            jepa_val = float(info.get("loss_total", info.get("loss", loss_jepa.item())))
-        except Exception:
-            jepa_val = float(loss_jepa.item())
-
-    lam_jepa = float(cfg.get("lambda_jepa_content", 0.0)) if jepa_on else 0.0
-
-    total = lam_sem * loss_moco + lam_jepa * loss_jepa
-    total.backward()
-    opt_sem.step()
-
-    # EMA key encoder
-    with torch.no_grad():
-        sem.momentum_update()
-
-    # ---------------- Diagnostics : récupérer q/k si possible ----------------
-    q_vec, k_vec = None, None
     try:
-        # Option 1 : sem expose encode_q / encode_k
-        if hasattr(sem, "encode_q") and hasattr(sem, "encode_k"):
-            q_vec = sem.encode_q(x_in, apply_aug=False)  # (B,D)
-            k_vec = sem.encode_k(far_in, apply_aug=False)  # (B,D)
-        # Option 2 : sem.loss_moco retourne déjà des embeddings
-        elif isinstance(st1, dict) and ("q" in st1) and ("k" in st1):
-            q_vec, k_vec = st1["q"], st1["k"]
-    except Exception:
-        q_vec, k_vec = None, None
+        opt_sem.zero_grad(set_to_none=True)
 
-    total_val = float(total.item())
-    stats = {
-        "MoCo": float(moco_val),
-        "JEPA_content": float(jepa_val) if jepa_on else 0.0,
-        "loss_total": float(total_val),
-        "λ_sem": float(lam_sem),
-        "λ_sem_jepa": float(lam_jepa),
-    }
-    return total_val, stats, q_vec, k_vec
+        # ---------------- MoCo ----------------
+        keys_to_enqueue = []
+
+        out = sem.loss_moco(x_in, far_in, apply_aug=sem_use_aug)
+
+        st1 = {}
+        if isinstance(out, (tuple, list)) and len(out) == 3:
+            loss_moco_1, st1, k1 = out
+            if k1 is not None:
+                keys_to_enqueue.append(k1)
+        else:
+            loss_moco_1, st1 = out
+            k1 = None
+
+        loss_moco = loss_moco_1
+        moco_val = float(st1.get("loss", loss_moco_1.item())) if isinstance(st1, dict) else float(loss_moco_1.item())
+
+        # collect logits stats if any
+        logits_pos = float(st1.get("logits_pos", 0.0)) if isinstance(st1, dict) else 0.0
+        logits_neg = float(st1.get("logits_neg", 0.0)) if isinstance(st1, dict) else 0.0
+
+        if far2_in is not None:
+            out = sem.loss_moco(x_in, far2_in, apply_aug=sem_use_aug)
+            st2 = {}
+            if isinstance(out, (tuple, list)) and len(out) == 3:
+                loss_moco_2, st2, k2 = out
+                if k2 is not None:
+                    keys_to_enqueue.append(k2)
+            else:
+                loss_moco_2, st2 = out
+
+            loss_moco = 0.5 * (loss_moco + loss_moco_2)
+            v2 = float(st2.get("loss", loss_moco_2.item())) if isinstance(st2, dict) else float(loss_moco_2.item())
+            moco_val = 0.5 * (moco_val + v2)
+
+        if sem_sym:
+            out = sem.loss_moco(far_in, x_in, apply_aug=sem_use_aug)
+            st_sym = {}
+            if isinstance(out, (tuple, list)) and len(out) == 3:
+                loss_sym, st_sym, ksym = out
+                if ksym is not None:
+                    keys_to_enqueue.append(ksym)
+            else:
+                loss_sym, st_sym = out
+
+            loss_moco = 0.5 * (loss_moco + loss_sym)
+            vs = float(st_sym.get("loss", loss_sym.item())) if isinstance(st_sym, dict) else float(loss_sym.item())
+            moco_val = 0.5 * (moco_val + vs)
+
+        # ---------------- JEPA semantic (optionnel) ----------------
+        jepa_on = bool(cfg.get("sem_jepa_on", False))
+        jepa_every = int(cfg.get("jepa_every", 2))
+        jepa_mask_ratio = float(cfg.get("jepa_mask_ratio", 0.6))
+        loss_jepa = x_in.new_tensor(0.0)
+        jepa_val = 0.0
+        if jepa_on and getattr(sem, "jepa_use", False) and (step % max(1, jepa_every) == 0):
+            loss_jepa, info = sem.loss_jepa(x_in, far_in, mask_ratio=jepa_mask_ratio, apply_aug=sem_use_aug)
+            try:
+                jepa_val = float(info.get("loss_total", info.get("loss", loss_jepa.item())))
+            except Exception:
+                jepa_val = float(loss_jepa.item())
+
+        lam_jepa = float(cfg.get("lambda_jepa_content", 0.0)) if jepa_on else 0.0
+
+        total = lam_sem * loss_moco + lam_jepa * loss_jepa
+
+        total.backward()
+        opt_sem.step()
+
+        # enqueue AFTER backward/step (avoid inplace versioning issues)
+        if len(keys_to_enqueue) > 0 and hasattr(sem, "_dequeue_and_enqueue"):
+            with torch.no_grad():
+                for kk in keys_to_enqueue:
+                    sem._dequeue_and_enqueue(kk)
+
+        # EMA key encoder
+        with torch.no_grad():
+            if hasattr(sem, "momentum_update"):
+                sem.momentum_update()
+
+        total_val = float(total.item())
+        stats = {
+            "MoCo": float(moco_val),
+            "JEPA_content": float(jepa_val) if jepa_on else 0.0,
+            "loss_total": float(total_val),
+            "λ_sem": float(lam_sem),
+            "λ_sem_jepa": float(lam_jepa),
+        }
+
+        # ---------------- TB writer ----------------
+        if writer is not None and step >= 0:
+            try:
+                writer.add_scalar("SEM/MoCo", stats["MoCo"], step)
+                writer.add_scalar("SEM/JEPA_content", stats["JEPA_content"], step)
+                writer.add_scalar("SEM/total", stats["loss_total"], step)
+                writer.add_scalar("SEM/lambda_sem", stats["λ_sem"], step)
+                writer.add_scalar("SEM/lambda_sem_jepa", stats["λ_sem_jepa"], step)
+                if logits_pos != 0.0 or logits_neg != 0.0:
+                    writer.add_scalar("SEM/logits_pos", logits_pos, step)
+                    writer.add_scalar("SEM/logits_neg", logits_neg, step)
+            except Exception:
+                pass
+
+        return total_val, stats, None, None
+
+    except Exception as e:
+        print(f"[SEM][ERROR] sem step failed @step={step}: {type(e).__name__}: {e}")
+        print(traceback.format_exc())
+        return None
 
 
 def d_forward_logits(D, x):
