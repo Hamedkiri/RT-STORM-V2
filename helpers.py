@@ -1560,35 +1560,48 @@ def train_step_phase_A(
         epoch_meters["A"]["total"].add(float(totalA.item()))
 
     # =============================================================================
-    # ✅ SEM branch (MoCo + JEPA-content) + evolution curves (raw/rel/ema)
+    # ✅ SEM branch (MoCo + JEPA-content) — ALWAYS LOG (even if SEM fails)
     # =============================================================================
-    sem_loss_val = None
-    sem_stats = None
+    sem_enabled = bool(cfg.get("sem_enable", False)) and ("SEM" in state)
+
+    moco_v = 0.0
+    jepa_v = 0.0
+    sem_total_v = 0.0
+    lam_sem = float(cfg.get("lambda_sem", 0.0))
+    lam_jepa = float(cfg.get("lambda_jepa_content", 0.0))
     q_vec = None
     k_vec = None
     sem_exc = 0
+    sem_stats = {"moco": 0.0, "jepa": 0.0, "loss_total": 0.0, "lam_sem": lam_sem, "lam_jepa": lam_jepa}
 
-    sem_enabled = bool(cfg.get("sem_enable", False)) and ("SEM" in state)
     if sem_enabled:
         try:
             sem_out = semantic_content_step_moco_jepa(x, far, y, state, cfg)
             if sem_out is not None:
-                # NEW: (total, stats, q, k)
-                sem_loss_val, sem_stats, q_vec, k_vec = sem_out
-
-                # epoch meters (accept both key conventions)
-                moco_v = _get_stat(sem_stats, "moco", "MoCo", default=0.0)
-                jepa_v = _get_stat(sem_stats, "jepa", "JEPA_content", default=0.0)
-                lam_sem = _get_stat(sem_stats, "lam_sem", "λ_sem", default=float(cfg.get("lambda_sem", 0.0)))
-                lam_jepa = _get_stat(sem_stats, "lam_jepa", "λ_sem_jepa", default=float(cfg.get("lambda_jepa_content", 0.0)))
-                epoch_meters["SEM"]["MoCo"].add(float(moco_v))
-                epoch_meters["SEM"]["JEPA_content"].add(float(jepa_v))
-                epoch_meters["SEM"]["λ_sem"].add(float(lam_sem))
-                epoch_meters["SEM"]["λ_sem_jepa"].add(float(lam_jepa))
-                epoch_meters["SEM"]["total"].add(float(_to_float(sem_loss_val, 0.0)))
+                sem_loss_val, sem_stats_out, q_vec, k_vec = sem_out
+                # read stats robustly
+                moco_v = _get_stat(sem_stats_out, "moco", "MoCo", default=0.0)
+                jepa_v = _get_stat(sem_stats_out, "jepa", "JEPA_content", default=0.0)
+                sem_total_v = _get_stat(sem_stats_out, "loss_total", "total", default=_to_float(sem_loss_val, 0.0))
+                lam_sem = _get_stat(sem_stats_out, "lam_sem", "λ_sem", default=lam_sem)
+                lam_jepa = _get_stat(sem_stats_out, "lam_jepa", "λ_sem_jepa", "λ_jepa", default=lam_jepa)
         except Exception:
             sem_exc = 1
             state["sem_exceptions"] = int(state.get("sem_exceptions", 0)) + 1
+
+    # epoch meters SEM (always)
+    if "SEM" in epoch_meters:
+        try:
+            epoch_meters["SEM"]["MoCo"].add(float(moco_v))
+            epoch_meters["SEM"]["JEPA_content"].add(float(jepa_v))
+            if "λ_sem" in epoch_meters["SEM"]:
+                epoch_meters["SEM"]["λ_sem"].add(float(lam_sem))
+            if "λ_sem_jepa" in epoch_meters["SEM"]:
+                epoch_meters["SEM"]["λ_sem_jepa"].add(float(lam_jepa))
+            if "total" in epoch_meters["SEM"]:
+                epoch_meters["SEM"]["total"].add(float(sem_total_v))
+        except Exception:
+            pass
 
     # ----------------------------
     # TensorBoard logs (A + JEPA + images)
@@ -1660,30 +1673,33 @@ def train_step_phase_A(
             pass
 
     # ----------------------------
-    # ✅ SEM TensorBoard + terminal (A)  + evolution curves
+    # ✅ SEM TensorBoard + terminal (A)  + evolution curves (ALWAYS)
     # ----------------------------
     if writer and sem_enabled and (global_step % tb_freq_sem == 0):
+        # raw curves always visible
+        writer.add_scalars(
+            "SEM/A/raw_direct",
+            {"MoCo": float(moco_v), "JEPA_content": float(jepa_v), "loss_total": float(sem_total_v),
+             "λ_sem": float(lam_sem), "λ_jepa": float(lam_jepa)},
+            global_step
+        )
+        # evolution curves (raw/rel/ema/qk)
+        sem_stats = {"moco": moco_v, "jepa": jepa_v, "loss_total": sem_total_v, "lam_sem": lam_sem, "lam_jepa": lam_jepa}
+        _log_sem_curves(writer, "A", sem_total_v, sem_stats, global_step, q_vec=q_vec, k_vec=k_vec)
+
         writer.add_scalar("SEM/exceptions_total", float(state.get("sem_exceptions", 0)), global_step)
         writer.add_scalar("SEM/A/exception_step", float(sem_exc), global_step)
 
-    if (sem_loss_val is not None) and (sem_stats is not None):
-        if writer and (global_step % tb_freq_sem == 0):
-            _log_sem_curves(writer, "A", sem_loss_val, sem_stats, global_step, q_vec=q_vec, k_vec=k_vec)
-
-        if (global_step % sem_print_every) == 0:
-            moco_v = _get_stat(sem_stats, "moco", "MoCo", default=0.0)
-            jepa_v = _get_stat(sem_stats, "jepa", "JEPA_content", default=0.0)
-            tot_v = _get_stat(sem_stats, "loss_total", default=_to_float(sem_loss_val, 0.0))
-            _tqdm_write(
-                f"[SEM/A] step={global_step}  "
-                f"MoCo={moco_v:.4f}  JEPAc={jepa_v:.4f}  total={tot_v:.4f}"
-            )
+    if sem_enabled and ((global_step % sem_print_every) == 0):
+        _tqdm_write(
+            f"[SEM/A] step={global_step}  "
+            f"MoCo={moco_v:.4f}  JEPAc={jepa_v:.4f}  total={sem_total_v:.4f}  exc={sem_exc}"
+        )
 
     # ----------------------------
     # update global step
     # ----------------------------
     state["global_step"] = global_step + 1
-
 
 
 # =========================================================================================
@@ -1820,10 +1836,13 @@ def train_step_phase_B(
         rel_dict = {}
         if tr["rel_moco"] is not None:
             rel_dict["MoCo_rel"] = float(tr["rel_moco"])
+            rel_dict["MoCo_%"] = 100.0 * float(tr["rel_moco"])
         if tr["rel_jepa"] is not None:
             rel_dict["JEPA_rel"] = float(tr["rel_jepa"])
+            rel_dict["JEPA_%"] = 100.0 * float(tr["rel_jepa"])
         if tr["rel_total"] is not None:
             rel_dict["total_rel"] = float(tr["rel_total"])
+            rel_dict["total_%"] = 100.0 * float(tr["rel_total"])
         if rel_dict:
             writer.add_scalars(f"SEM/{phase}/rel", rel_dict, step)
 
@@ -1911,53 +1930,6 @@ def train_step_phase_B(
     style_target = float(cfg["style_balance_target"])
     style_alpha = float(cfg["style_balance_alpha"])
 
-    # --- JEPA config ---
-    jepa_on_style = bool(cfg.get("jepa_on_style", False))
-    jepa_on_content = bool(cfg.get("jepa_on_content", False))
-    jepa_every = int(cfg["jepa_every"])
-    jepa_scale_base = cfg["jepa_scale_w"]
-    jepa_mask_ratio = float(cfg["jepa_mask_ratio"])
-    jepa_bias_high = float(cfg["jepa_bias_high"])
-    jepa_use_teacher = bool(cfg["jepa_use_teacher"])
-    λ_jepa_style = float(cfg.get("lambda_jepa_style", cfg.get("lambda_jepa", 0.0)))
-    λ_jepa_content = float(cfg.get("lambda_jepa_content", 0.0))
-    λ_jepa_kd = float(cfg.get("lambda_jepa_kd", 0.0))
-
-    tok_jepa_B_style = state.get("tok_jepa_B_style", None)
-    tok_jepa_B_content = state.get("tok_jepa_B_content", None)
-
-    def _make_jepa_w_for_seq(S, device):
-        base = jepa_scale_base
-        if isinstance(base, torch.Tensor):
-            w_vec = base.to(device).flatten()
-            if w_vec.numel() == S:
-                return w_vec
-            return w_vec.mean().repeat(S)
-        val = float(base)
-        return torch.full((S,), val, device=device)
-
-    def stack_content_tokens_multiscale_for_jepa(feat_dict, ref_key="bot"):
-        if not feat_dict:
-            return None
-        if ref_key in feat_dict:
-            ref = feat_dict[ref_key]
-        else:
-            ref = max(feat_dict.values(), key=lambda t: t.shape[2] * t.shape[3])
-        _, _, H_ref, W_ref = ref.shape
-        maps = []
-        for _, f in feat_dict.items():
-            if not (torch.is_tensor(f) and f.dim() == 4):
-                continue
-            if (f.shape[2] != H_ref) or (f.shape[3] != W_ref):
-                f = F.interpolate(f, size=(H_ref, W_ref), mode="bilinear", align_corners=False)
-            maps.append(f)
-        if not maps:
-            return None
-        f_cat = torch.cat(maps, dim=1)
-        Bc, Ctot, Hr, Wr = f_cat.shape
-        Ts = f_cat.view(Bc, Ctot, Hr * Wr).transpose(1, 2)
-        return Ts
-
     # effective style weight for B (warmup + dyn)
     if state.get("epoch", 0) < style_B_warmup_ep:
         λ_style_B_eff = 0.0
@@ -2015,7 +1987,7 @@ def train_step_phase_B(
         loss_DB, dstatsB = d_loss_and_stats(
             D_B, x_mix, recon_det,
             use_hinge=use_hinge,
-            r1_gamma=adv_r1_gamma,
+            r1_gamma=cfg["adv_r1_gamma"],
             do_r1=do_r1,
             adv_highpass=adv_highpass,
             highpass_fn=highpass_fn
@@ -2054,28 +2026,14 @@ def train_step_phase_B(
 
     tex_B_total = torch.tensor(0.0, device=dev)
     if tex_enable:
-        if tex_use_fft and λ_fft > 0:
+        if cfg["tex_use_fft"] and λ_fft > 0:
             tex_B_total = tex_B_total + (λ_fft * fft_texture_loss_fn(recon, x_mix, log_mag=True, per_channel=True))
-        if tex_use_swd and λ_swd > 0:
+        if cfg["tex_use_swd"] and λ_swd > 0:
             tex_B_total = tex_B_total + (λ_swd * swd_loss_images_fn(
                 recon, x_mix, levels=swd_levels, patch=swd_patch, proj=swd_proj, max_patches=swd_max_patches
             ))
 
     gateB, ratioB = spade_gate_reg(G_B, margin=cfg["spade_margin"])
-
-    # ----------------------------
-    # JEPA (style + content)  [inchangé ici, supposé déjà dans ton code]
-    # ----------------------------
-    jepa_styleB = torch.tensor(0.0, device=dev)
-    jepa_styleB_kd = torch.tensor(0.0, device=dev)
-    jepa_contentB = torch.tensor(0.0, device=dev)
-    jepa_contentB_kd = torch.tensor(0.0, device=dev)
-
-    jepa_totalB = (
-        λ_jepa_style * jepa_styleB
-        + λ_jepa_content * jepa_contentB
-        + λ_jepa_kd * (jepa_styleB_kd + jepa_contentB_kd)
-    )
 
     totalB = (
         advB
@@ -2084,7 +2042,6 @@ def train_step_phase_B(
         + λ_style_B_eff * styB
         + cfg["λ_spade"] * gateB
         + tex_B_total
-        + jepa_totalB
     )
 
     if torch.is_tensor(totalB):
@@ -2097,16 +2054,19 @@ def train_step_phase_B(
             pt.data.mul_(nce_m).add_(po.data, alpha=1.0 - nce_m)
 
     # =============================================================================
-    # ✅ SEM branch on B (optional) + evolution curves
+    # ✅ SEM branch (B) — ALWAYS LOG (even if SEM fails)
     # =============================================================================
-    sem_loss_val_B = None
-    sem_stats_B = None
-    q_vec_B = None
-    k_vec_B = None
-    sem_exc_B = 0
-
     sem_on_B = bool(cfg.get("sem_on_B", True))
     sem_enabled = sem_on_B and bool(cfg.get("sem_enable", False)) and ("SEM" in state)
+
+    moco_v = 0.0
+    jepa_v = 0.0
+    sem_total_v = 0.0
+    lam_sem = float(cfg.get("lambda_sem", 0.0))
+    lam_jepa = float(cfg.get("lambda_jepa_content", 0.0))
+    q_vec = None
+    k_vec = None
+    sem_exc_B = 0
 
     if sem_enabled:
         try:
@@ -2114,16 +2074,25 @@ def train_step_phase_B(
             cfg_semB["sem_two_styles"] = False
             sem_outB = semantic_content_step_moco_jepa(x_mix, recon, y=None, state=state, cfg=cfg_semB)
             if sem_outB is not None:
-                sem_loss_val_B, sem_stats_B, q_vec_B, k_vec_B = sem_outB
-
+                sem_loss_val_B, sem_stats_B, q_vec, k_vec = sem_outB
                 moco_v = _get_stat(sem_stats_B, "moco", "MoCo", default=0.0)
                 jepa_v = _get_stat(sem_stats_B, "jepa", "JEPA_content", default=0.0)
-                epoch_meters["SEM"]["MoCo_B"].add(float(moco_v))
-                epoch_meters["SEM"]["JEPA_content_B"].add(float(jepa_v))
-                epoch_meters["SEM"]["total_B"].add(float(_to_float(sem_loss_val_B, 0.0)))
+                sem_total_v = _get_stat(sem_stats_B, "loss_total", "total", default=_to_float(sem_loss_val_B, 0.0))
         except Exception:
             sem_exc_B = 1
             state["sem_exceptions"] = int(state.get("sem_exceptions", 0)) + 1
+
+    # epoch meters SEM B (always)
+    if "SEM" in epoch_meters:
+        try:
+            if "MoCo_B" in epoch_meters["SEM"]:
+                epoch_meters["SEM"]["MoCo_B"].add(float(moco_v))
+            if "JEPA_content_B" in epoch_meters["SEM"]:
+                epoch_meters["SEM"]["JEPA_content_B"].add(float(jepa_v))
+            if "total_B" in epoch_meters["SEM"]:
+                epoch_meters["SEM"]["total_B"].add(float(sem_total_v))
+        except Exception:
+            pass
 
     # ----------------------------
     # TensorBoard logs (B) + SEM curves
@@ -2163,22 +2132,25 @@ def train_step_phase_B(
         writer.add_images("B/imgs/far_mix_noisy(input)", fno[:4], global_step)
         writer.add_images("B/imgs/recon→x_mix", rc[:4], global_step)
 
+    # ✅ SEM TB always
     if writer and sem_enabled and (global_step % tb_freq_sem == 0):
+        writer.add_scalars(
+            "SEM/B/raw_direct",
+            {"MoCo": float(moco_v), "JEPA_content": float(jepa_v), "loss_total": float(sem_total_v),
+             "λ_sem": float(lam_sem), "λ_jepa": float(lam_jepa)},
+            global_step
+        )
+        sem_stats = {"moco": moco_v, "jepa": jepa_v, "loss_total": sem_total_v, "lam_sem": lam_sem, "lam_jepa": lam_jepa}
+        _log_sem_curves(writer, "B", sem_total_v, sem_stats, global_step, q_vec=q_vec, k_vec=k_vec)
+
         writer.add_scalar("SEM/exceptions_total", float(state.get("sem_exceptions", 0)), global_step)
         writer.add_scalar("SEM/B/exception_step", float(sem_exc_B), global_step)
 
-    if (sem_loss_val_B is not None) and (sem_stats_B is not None):
-        if writer and (global_step % tb_freq_sem == 0):
-            _log_sem_curves(writer, "B", sem_loss_val_B, sem_stats_B, global_step, q_vec=q_vec_B, k_vec=k_vec_B)
-
-        if (global_step % sem_print_every) == 0:
-            moco_v = _get_stat(sem_stats_B, "moco", "MoCo", default=0.0)
-            jepa_v = _get_stat(sem_stats_B, "jepa", "JEPA_content", default=0.0)
-            tot_v = _get_stat(sem_stats_B, "loss_total", default=_to_float(sem_loss_val_B, 0.0))
-            _tqdm_write(
-                f"[SEM/B] step={global_step}  "
-                f"MoCo={moco_v:.4f}  JEPAc={jepa_v:.4f}  total={tot_v:.4f}"
-            )
+    if sem_enabled and ((global_step % sem_print_every) == 0):
+        _tqdm_write(
+            f"[SEM/B] step={global_step}  "
+            f"MoCo={moco_v:.4f}  JEPAc={jepa_v:.4f}  total={sem_total_v:.4f}  exc={sem_exc_B}"
+        )
 
     # ----------------------------
     # meters epoch (B)

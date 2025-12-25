@@ -14,6 +14,12 @@ Ce fichier est conçu pour :
 - une gestion robuste des checkpoints (epoch/step/none)
 - une compatibilité avec branche sémantique (ResNet50 + MoCo + JEPA-content) en mode auto
 - une intégration claire des options de détection (head: fasterrcnn/detr/vitdet/fastrnn) via opt.det_head
+
+⚠️ NOTES D’INTÉGRATION
+- Ce fichier suppose l’existence des modules importés (data/models/training/helpers…).
+- Si certains noms diffèrent dans ton repo (ex: SemanticMoCoJEPA / SemAugConfig), adapte les imports.
+- Les fonctions train_step_phase_A / train_step_phase_B sont importées depuis helpers.py et doivent
+  inclure les ajouts SEM (courbes raw/rel/ema, q/k diagnostics, etc.) que tu as donnés.
 """
 
 import json
@@ -32,7 +38,7 @@ from tqdm import tqdm
 from data import build_dataloader
 from models.generator import UNetGenerator
 from models.discriminator import PatchDiscriminator
-from models.semantic_moco_jepa import SemanticMoCOJEPA, SemAugConfig  # NOTE: adapte au nom réel si différent
+from models.semantic_moco_jepa import SemanticMoCoJEPA, SemAugConfig  # adapte si nom différent
 from models.losses_nce import (
     PatchNCELoss,
     fft_texture_loss,
@@ -423,6 +429,10 @@ def train_alternating(opt):
         "tok_jepa_B_content": None,
 
         "λ_style_B_dyn": float(getattr(opt, "lambda_style_b", 0.005)),
+
+        # SEM tracking (EMA/rel) + error counters
+        "sem_track": {},
+        "sem_exceptions": 0,
     }
 
     # --- Teachers EMA pour JEPA/NCE
@@ -437,7 +447,10 @@ def train_alternating(opt):
     # =====================================================================================
     #  SEMANTIC CONTENT BRANCH (ResNet50 + MoCo + optional JEPA-content)
     # =====================================================================================
+    # ⚠️ Ici on active SEM en "auto" si opt.sem_content est True (tu peux élargir à hybrid si tu veux)
     sem_enable = bool(getattr(opt, "sem_content", False) and mode == "auto")
+    cfg_sem_enable_flag = sem_enable  # exposé dans cfg plus bas
+
     state["SEM"] = None
     state["opt_SEM"] = None
 
@@ -460,7 +473,7 @@ def train_alternating(opt):
         sem_pretrained_strict = bool(int(getattr(opt, "sem_pretrained_strict", 0)) != 0)
         sem_pretrained_verbose = bool(int(getattr(opt, "sem_pretrained_verbose", 1)) != 0)
 
-        sem_model = SemanticMoCOJEPA(
+        sem_model = SemanticMoCoJEPA(
             dim=int(getattr(opt, "sem_dim", 256)),
             tok_dim=int(getattr(opt, "sem_tok_dim", 256)),
             queue_size=int(getattr(opt, "sem_queue", 65536)),
@@ -523,6 +536,13 @@ def train_alternating(opt):
     cfg["writer"] = writer
     cfg["tb_freq"] = tb_freq
     cfg["tb_freq_C"] = tb_freq_C
+
+    # --- Ajouts SEM : fréquence / affichage / courbes (utilisés dans train_step_phase_A/B)
+    cfg["tb_freq_sem"] = int(getattr(opt, "tb_freq_sem", tb_freq))
+    cfg["sem_print_every"] = int(getattr(opt, "sem_print_every", cfg["tb_freq_sem"]))
+    cfg["sem_ema_beta"] = float(getattr(opt, "sem_ema_beta", 0.98))
+    cfg["sem_rel_eps"] = float(getattr(opt, "sem_rel_eps", 1e-8))
+    cfg["sem_on_B"] = bool(int(getattr(opt, "sem_on_B", 1)) != 0)
 
     cfg["l1_loss"] = torch.nn.L1Loss().to(dev)
 
@@ -645,7 +665,8 @@ def train_alternating(opt):
     cfg["jepa_on_style"] = jepa_on_style
     cfg["jepa_on_content"] = jepa_on_content
 
-    cfg["sem_enable"] = sem_enable
+    # --- SEM config (branch moCo+JEPA-content)
+    cfg["sem_enable"] = cfg_sem_enable_flag
     cfg["lambda_sem"] = float(getattr(opt, "lambda_sem", 0.0))
     cfg["sem_every"] = int(getattr(opt, "sem_every", 1))
     cfg["sem_sym"] = bool(getattr(opt, "sem_sym", False))
@@ -815,7 +836,8 @@ def train_alternating(opt):
         #  Boucle batch : phases A/B
         # =================================================================================
         if mode in ["auto", "hybrid"]:
-            pbar = tqdm(range(nbatchs), ncols=180, leave=False)
+            # ✅ terminal plus stable : refresh moins agressif
+            pbar = tqdm(range(nbatchs), ncols=180, leave=False, mininterval=0.5, dynamic_ncols=True)
             for _ in pbar:
                 try:
                     x, _ = next(src_iter)
@@ -848,9 +870,11 @@ def train_alternating(opt):
                             writer=writer,
                         )
 
-                    state["global_step"] += 1
-
+                    # IMPORTANT :
+                    # train_step_phase_A/B mettent déjà à jour state["global_step"] = old+1
+                    # donc ici on ne ré-incrémente PAS (sinon double comptage).
                     step = int(state["global_step"])
+
                     now = time.time()
                     dt = max(1e-6, now - last_step_wall)
                     last_step_wall = now
@@ -891,15 +915,16 @@ def train_alternating(opt):
                         save_state_json(epoch, step, opt, out_dir)
 
                 except Exception as ex:
-                    msg = f"[ERROR] step={state['global_step']} epoch={epoch} {type(ex).__name__}: {ex}"
+                    msg = f"[ERROR] step={state.get('global_step', -1)} epoch={epoch} {type(ex).__name__}: {ex}"
                     tqdm.write(msg)
                     if getattr(opt, "print_trace_on_error", False):
                         import traceback as _tb
                         tqdm.write(_tb.format_exc())
                     if writer:
                         import traceback as _tb
-                        _tb_add_text(writer, "errors/exception", f"{msg}\n{_tb.format_exc()}", int(state["global_step"]))
-                    state["global_step"] += 1
+                        _tb_add_text(writer, "errors/exception", f"{msg}\n{_tb.format_exc()}", int(state.get("global_step", 0)))
+                    # on tente de continuer sans casser le run
+                    state["global_step"] = int(state.get("global_step", 0)) + 1
                     continue
 
         # --- Supervision hybride (phase C) après warmup
