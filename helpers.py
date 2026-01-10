@@ -20,7 +20,7 @@ from training.checkpoint import save_supheads_rich, save_checkpoint, save_state_
 from training.texture_fft_swd import (
     spectral_noise,  # bruit spectral (texture)
 )
-
+from training.scheduler import ensure_sem_scheduler_in_state, step_sem_scheduler, sem_scheduler_get_lr
 
 # =========================================================================================
 #                       Meters / résumé d'époque (A/B/C)
@@ -1684,7 +1684,10 @@ def train_step_phase_A(
             global_step
         )
         # evolution curves (raw/rel/ema/qk)
-        sem_stats = {"moco": moco_v, "jepa": jepa_v, "loss_total": sem_total_v, "lam_sem": lam_sem, "lam_jepa": lam_jepa}
+        sem_stats = {"moco": moco_v, "jepa": jepa_v, "loss_total": sem_total_v,
+                     "lam_sem": lam_sem, "lam_jepa": lam_jepa,
+                      "lr_sem": float(state.get("opt_SEM", None).param_groups[0]["lr"]) if state.get("opt_SEM", None) else 0.0}
+
         _log_sem_curves(writer, "A", sem_total_v, sem_stats, global_step, q_vec=q_vec, k_vec=k_vec)
 
         writer.add_scalar("SEM/exceptions_total", float(state.get("sem_exceptions", 0)), global_step)
@@ -2140,7 +2143,10 @@ def train_step_phase_B(
              "λ_sem": float(lam_sem), "λ_jepa": float(lam_jepa)},
             global_step
         )
-        sem_stats = {"moco": moco_v, "jepa": jepa_v, "loss_total": sem_total_v, "lam_sem": lam_sem, "lam_jepa": lam_jepa}
+        sem_stats = {"moco": moco_v, "jepa": jepa_v, "loss_total": sem_total_v,
+                     "lam_sem": lam_sem, "lam_jepa": lam_jepa,
+                      "lr_sem": float(state.get("opt_SEM", None).param_groups[0]["lr"]) if state.get("opt_SEM", None) else 0.0}
+
         _log_sem_curves(writer, "B", sem_total_v, sem_stats, global_step, q_vec=q_vec, k_vec=k_vec)
 
         writer.add_scalar("SEM/exceptions_total", float(state.get("sem_exceptions", 0)), global_step)
@@ -2356,10 +2362,14 @@ def log_sem_tensorboard(
                     pass
 
 
+# =========================================================================================
+#  ✅ MODIF: semantic_content_step_moco_jepa avec Warmup + Cosine decay (SEM LR)
+#  -> Remplace complètement ta fonction actuelle par celle-ci.
+# =========================================================================================
+
 import traceback
 import torch
-import traceback
-import torch
+import torch.nn.functional as F
 
 def semantic_content_step_moco_jepa(x, far, y, state, cfg):
     dev = cfg["device"]
@@ -2375,14 +2385,16 @@ def semantic_content_step_moco_jepa(x, far, y, state, cfg):
     if sem is None or opt_sem is None:
         return None
 
+    # ✅ create scheduler (once)
+    ensure_sem_scheduler_in_state(state, cfg)
+
     sem_use_aug = bool(cfg.get("sem_use_aug", False))
     sem_sym = bool(cfg.get("sem_sym", False))
     sem_two_styles = bool(cfg.get("sem_two_styles", False))
     sem_detach_far = bool(int(cfg.get("sem_detach_far", 1)) != 0)
 
-    # writer + step
     writer = state.get("writer", None) or cfg.get("writer", None)
-    step = int(state.get("global_step", -1))
+    step_global = int(state.get("global_step", -1))
 
     x_in = x.to(dev, non_blocking=True)
     far_in = (far.detach() if sem_detach_far else far).to(dev, non_blocking=True)
@@ -2417,7 +2429,6 @@ def semantic_content_step_moco_jepa(x, far, y, state, cfg):
         loss_moco = loss_moco_1
         moco_val = float(st1.get("loss", loss_moco_1.item())) if isinstance(st1, dict) else float(loss_moco_1.item())
 
-        # collect logits stats if any
         logits_pos = float(st1.get("logits_pos", 0.0)) if isinstance(st1, dict) else 0.0
         logits_neg = float(st1.get("logits_neg", 0.0)) if isinstance(st1, dict) else 0.0
 
@@ -2455,7 +2466,8 @@ def semantic_content_step_moco_jepa(x, far, y, state, cfg):
         jepa_mask_ratio = float(cfg.get("jepa_mask_ratio", 0.6))
         loss_jepa = x_in.new_tensor(0.0)
         jepa_val = 0.0
-        if jepa_on and getattr(sem, "jepa_use", False) and (step % max(1, jepa_every) == 0):
+
+        if jepa_on and getattr(sem, "jepa_use", False) and (step_global % max(1, jepa_every) == 0):
             loss_jepa, info = sem.loss_jepa(x_in, far_in, mask_ratio=jepa_mask_ratio, apply_aug=sem_use_aug)
             try:
                 jepa_val = float(info.get("loss_total", info.get("loss", loss_jepa.item())))
@@ -2469,7 +2481,10 @@ def semantic_content_step_moco_jepa(x, far, y, state, cfg):
         total.backward()
         opt_sem.step()
 
-        # enqueue AFTER backward/step (avoid inplace versioning issues)
+        # ✅ Step scheduler SEM (Warmup + Cosine) : 1 step par update SEM
+        step_sem_scheduler(state)
+
+        # enqueue AFTER step (safe)
         if len(keys_to_enqueue) > 0 and hasattr(sem, "_dequeue_and_enqueue"):
             with torch.no_grad():
                 for kk in keys_to_enqueue:
@@ -2481,34 +2496,42 @@ def semantic_content_step_moco_jepa(x, far, y, state, cfg):
                 sem.momentum_update()
 
         total_val = float(total.item())
+        lr_sem = sem_scheduler_get_lr(opt_sem)
+
         stats = {
             "MoCo": float(moco_val),
             "JEPA_content": float(jepa_val) if jepa_on else 0.0,
             "loss_total": float(total_val),
             "λ_sem": float(lam_sem),
             "λ_sem_jepa": float(lam_jepa),
+            "lr_sem": float(lr_sem),  # ✅ nouveau
+            "sem_lr_step": float(state.get("sem_lr_step", 0)),  # ✅ utile pour debug
         }
 
-        # ---------------- TB writer ----------------
-        if writer is not None and step >= 0:
+        # TB scalars
+        if writer is not None and step_global >= 0:
             try:
-                writer.add_scalar("SEM/MoCo", stats["MoCo"], step)
-                writer.add_scalar("SEM/JEPA_content", stats["JEPA_content"], step)
-                writer.add_scalar("SEM/total", stats["loss_total"], step)
-                writer.add_scalar("SEM/lambda_sem", stats["λ_sem"], step)
-                writer.add_scalar("SEM/lambda_sem_jepa", stats["λ_sem_jepa"], step)
+                writer.add_scalar("SEM/MoCo", stats["MoCo"], step_global)
+                writer.add_scalar("SEM/JEPA_content", stats["JEPA_content"], step_global)
+                writer.add_scalar("SEM/total", stats["loss_total"], step_global)
+                writer.add_scalar("SEM/lambda_sem", stats["λ_sem"], step_global)
+                writer.add_scalar("SEM/lambda_sem_jepa", stats["λ_sem_jepa"], step_global)
+                writer.add_scalar("SEM/lr_sem", stats["lr_sem"], step_global)  # ✅ nouveau
+                writer.add_scalar("SEM/sem_lr_step", stats["sem_lr_step"], step_global)  # ✅ nouveau
                 if logits_pos != 0.0 or logits_neg != 0.0:
-                    writer.add_scalar("SEM/logits_pos", logits_pos, step)
-                    writer.add_scalar("SEM/logits_neg", logits_neg, step)
+                    writer.add_scalar("SEM/logits_pos", logits_pos, step_global)
+                    writer.add_scalar("SEM/logits_neg", logits_neg, step_global)
             except Exception:
                 pass
 
+        # (q_vec, k_vec) optionnels: ici on ne les renvoie pas (comme ton code actuel)
         return total_val, stats, None, None
 
     except Exception as e:
-        print(f"[SEM][ERROR] sem step failed @step={step}: {type(e).__name__}: {e}")
+        print(f"[SEM][ERROR] sem step failed @step={step_global}: {type(e).__name__}: {e}")
         print(traceback.format_exc())
         return None
+
 
 
 def d_forward_logits(D, x):

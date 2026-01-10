@@ -470,7 +470,46 @@ def get_opts():
     p.add_argument("--sem_sym", action="store_true", help="Loss symétrique.")
     p.add_argument("--sem_two_styles", action="store_true", help="Deux styles comme positifs supplémentaires.")
     p.add_argument("--sem_detach_far", type=int, default=1, help="1: contraste ne rétro-propage pas vers G_A.")
-    p.add_argument("--lr_sem", type=float, default=None, help="LR branche sem (None=>--lr).")
+    p.add_argument("--lr_sem", type=float, default=1e-4, help="LR branche sem (None=>--lr).")
+    # ---------------------------------------------------------------------
+    # SEM LR schedule : Warmup + Cosine decay
+    # ---------------------------------------------------------------------
+    p.add_argument(
+        "--sem_lr_sched",
+        type=str,
+        default="warmup_cosine",
+        choices=["none", "warmup_cosine"],
+        help="Scheduler LR pour la branche SEM (recommandé: warmup_cosine)."
+    )
+
+    p.add_argument(
+        "--sem_warmup_epochs",
+        type=int,
+        default=5,
+        help="Nb d'époques de warmup pour SEM (recommandé: 5)."
+    )
+
+    p.add_argument(
+        "--sem_min_lr",
+        type=float,
+        default=1e-6,
+        help="LR minimum atteint en fin de cosine decay (recommandé: 1e-6)."
+    )
+
+    p.add_argument(
+        "--sem_warmup_init_lr",
+        type=float,
+        default=1e-5,
+        help="LR initial au début du warmup (recommandé: 1e-5)."
+    )
+
+    p.add_argument(
+        "--sem_sched_by",
+        type=str,
+        default="epoch",
+        choices=["epoch", "step"],
+        help="Appliquer le scheduler SEM par epoch (par défaut, plus stable)."
+    )
 
     p.add_argument("--sem_pretrained", type=int, default=1, help="1: ResNet50 ImageNet pré-entraîné.")
     p.add_argument("--sem_dim", type=int, default=256, help="Dim embedding global MoCo.")
@@ -537,5 +576,24 @@ def get_opts():
         args.det_ckpt = ""
     if isinstance(args.det_resume, str) and args.det_resume.strip() == "":
         args.det_resume = ""
+
+    # ---- SEM scheduler compat / sécurités
+    if args.sem_lr_sched == "warmup_cosine":
+        args.sem_warmup_epochs = max(0, int(args.sem_warmup_epochs))
+        args.sem_min_lr = float(args.sem_min_lr)
+
+        # Valeur de départ warmup
+        if args.sem_warmup_init_lr is None:
+            args.sem_warmup_init_lr = 0.0
+        args.sem_warmup_init_lr = float(args.sem_warmup_init_lr)
+
+        # Si lr_sem n'est pas défini, fallback sur lr global
+        if args.lr_sem is None:
+            args.lr_sem = args.lr
+
+        # clamp simple
+        if args.sem_min_lr < 0:
+            args.sem_min_lr = 0.0
+
 
     return args

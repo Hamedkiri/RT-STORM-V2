@@ -11,7 +11,7 @@ Entraînement alterné ST-STORM / SC-STORM : Double-GAN (G_A, D_A, G_B, D_B)
 
 Ce fichier est conçu pour :
 - un logging robuste terminal/tqdm + TensorBoard
-- une gestion robuste des checkpoints (epoch/step/none)
+- une gestion robuste des checkpoints (epoch/step/none) + sauvegarde finale
 - une compatibilité avec branche sémantique (ResNet50 + MoCo + JEPA-content) en mode auto
 - une intégration claire des options de détection (head: fasterrcnn/detr/vitdet/fastrnn) via opt.det_head
 
@@ -19,11 +19,12 @@ Ce fichier est conçu pour :
 - Ce fichier suppose l’existence des modules importés (data/models/training/helpers…).
 - Si certains noms diffèrent dans ton repo (ex: SemanticMoCoJEPA / SemAugConfig), adapte les imports.
 - Les fonctions train_step_phase_A / train_step_phase_B sont importées depuis helpers.py et doivent
-  inclure les ajouts SEM (courbes raw/rel/ema, q/k diagnostics, etc.) que tu as donnés.
+  inclure les ajouts SEM (courbes raw/rel/ema, q/k diagnostics, etc.).
 """
 
 import json
 import time
+import math
 from collections import deque, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -52,6 +53,7 @@ from training.checkpoint import (
     save_state_json,
     last_epoch,
     load_checkpoint,
+    should_save_ckpt,  # ✅ décision centralisée (epoch/step/none + final)
 )
 from training.train_detection_transformer import train_detection_transformer
 from helpers import (
@@ -101,12 +103,10 @@ def _meter_value(m: Any) -> Optional[float]:
     if m is None:
         return None
 
-    # objets type SmoothedValue
     for attr in ("avg", "value", "val", "mean"):
         if hasattr(m, attr):
             return _to_float(getattr(m, attr))
 
-    # dicts
     if isinstance(m, dict):
         for k in ("avg", "value", "val", "mean"):
             if k in m:
@@ -265,11 +265,52 @@ def _parse_save_freq(save_freq_str):
 
 
 # =========================================================================================
+#   SEM Warmup + Cosine scheduler helper (LambdaLR)
+# =========================================================================================
+
+def build_warmup_cosine_lambda(
+    base_lr: float,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr: float = 0.0,
+    warmup_init_lr: float = 0.0,
+):
+    """
+    Retourne f(step)->multiplier pour LambdaLR (lr = base_lr * multiplier),
+    avec warmup linéaire (warmup_init_lr -> base_lr) puis cosine decay (base_lr -> min_lr).
+    """
+    warmup_steps = max(0, int(warmup_steps))
+    total_steps = max(1, int(total_steps))
+    min_lr = float(min_lr)
+    warmup_init_lr = float(warmup_init_lr)
+
+    # Clamp valeurs
+    min_lr = max(0.0, min(min_lr, base_lr))
+    warmup_init_lr = max(0.0, min(warmup_init_lr, base_lr))
+
+    def _lr_mult(step_idx: int) -> float:
+        s = int(step_idx)
+        if warmup_steps > 0 and s < warmup_steps:
+            lr = warmup_init_lr + (base_lr - warmup_init_lr) * (float(s + 1) / float(warmup_steps))
+        else:
+            if total_steps <= warmup_steps:
+                lr = min_lr
+            else:
+                t = float(s - warmup_steps)
+                T = float(max(1, total_steps - warmup_steps))
+                cos_v = 0.5 * (1.0 + math.cos(math.pi * min(1.0, t / T)))
+                lr = min_lr + (base_lr - min_lr) * cos_v
+
+        return float(lr / base_lr) if base_lr > 0 else 1.0
+
+    return _lr_mult
+
+
+# =========================================================================================
 #   Helper : validation minimale des options de détection
 # =========================================================================================
 
 def _validate_detection_opts(opt):
-    # Dataset paths
     required = ["det_train_img_root", "det_train_ann", "det_val_img_root", "det_val_ann"]
     missing = [k for k in required if not getattr(opt, k, None)]
     if missing:
@@ -283,12 +324,10 @@ def _validate_detection_opts(opt):
     if head not in {"fasterrcnn", "detr", "vitdet", "fastrnn"}:
         raise ValueError(f"[DET] det_head invalide: {head}")
 
-    # Classes
     det_num_classes = int(getattr(opt, "det_num_classes", 91))
     if det_num_classes <= 1:
         raise ValueError("[DET] det_num_classes doit être >= 2 (incluant background).")
 
-    # Image size
     h = int(getattr(opt, "det_img_h", 256))
     w = int(getattr(opt, "det_img_w", 256))
     if h <= 0 or w <= 0:
@@ -332,15 +371,13 @@ def train_alternating(opt):
     loaders = build_dataloader(opt)
     k_folds = len(loaders)
     if k_folds == 0:
-        raise RuntimeError(
-            "[data] Aucun dataloader construit. Vérifie --data/--data_json/--search_folder..."
-        )
+        raise RuntimeError("[data] Aucun dataloader construit. Vérifie --data/--data_json/--search_folder...")
+
     nbatchs = min(len(dl) for dl in loaders) if k_folds > 0 else 0
     if nbatchs <= 0:
         raise RuntimeError("[data] Dataloaders vides (nbatchs=0).")
 
     # --- Générateurs / Discriminateurs (style)
-    # NOTE: adapte token_dim au modèle réel (256 ici).
     G_A, D_A = UNetGenerator(token_dim=256).to(dev), PatchDiscriminator().to(dev)
     G_B, D_B = UNetGenerator(token_dim=256).to(dev), PatchDiscriminator().to(dev)
 
@@ -356,6 +393,10 @@ def train_alternating(opt):
     writer = SummaryWriter(opt.save_dir) if getattr(opt, "tb", False) else None
 
     resume_epoch = None
+
+    # --- Checkpoint I/O options (propagés à save_checkpoint)
+    ckpt_use_safetensors = bool(int(getattr(opt, "use_safetensors", 0)) != 0)
+    ckpt_safe_write = bool(int(getattr(opt, "safe_write", 1)) != 0)
 
     # --- Reprise éventuelle ---
     if getattr(opt, "resume_dir", None):
@@ -397,7 +438,7 @@ def train_alternating(opt):
         if k.strip()
     )
 
-    # --- Gestion globale de save_freq
+    # --- Gestion globale de save_freq (string -> (mode, interval))
     save_freq_mode, save_freq_interval = _parse_save_freq(getattr(opt, "save_freq", "epoch"))
     epoch_ckpt_interval = getattr(opt, "epoch_ckpt_interval", None)
     if save_freq_mode == "epoch" and epoch_ckpt_interval is not None:
@@ -405,7 +446,9 @@ def train_alternating(opt):
             save_freq_interval = max(1, int(epoch_ckpt_interval))
         except Exception:
             pass
+
     print(f"[CKPT] save_freq = {getattr(opt, 'save_freq', 'epoch')} → mode={save_freq_mode}, interval={save_freq_interval}")
+    print(f"[CKPT] use_safetensors={ckpt_use_safetensors} | safe_write={ckpt_safe_write}")
 
     # --- État global de l'entraînement ---
     state: Dict[str, Any] = {
@@ -423,16 +466,18 @@ def train_alternating(opt):
         "style_bank": deque(maxlen=2000),
 
         # JEPA caches
-        "tok_jepa_A_style": None,
-        "tok_jepa_A_content": None,
-        "tok_jepa_B_style": None,
-        "tok_jepa_B_content": None,
+        "tokJEPA_A": None,
+        "tokJEPA_B": None,
 
         "λ_style_B_dyn": float(getattr(opt, "lambda_style_b", 0.005)),
 
-        # SEM tracking (EMA/rel) + error counters
+        # SEM tracking + errors
         "sem_track": {},
         "sem_exceptions": 0,
+
+        # SEM sched
+        "sch_SEM": None,
+        "sem_lr_step": 0,
     }
 
     # --- Teachers EMA pour JEPA/NCE
@@ -447,9 +492,8 @@ def train_alternating(opt):
     # =====================================================================================
     #  SEMANTIC CONTENT BRANCH (ResNet50 + MoCo + optional JEPA-content)
     # =====================================================================================
-    # ⚠️ Ici on active SEM en "auto" si opt.sem_content est True (tu peux élargir à hybrid si tu veux)
     sem_enable = bool(getattr(opt, "sem_content", False) and mode == "auto")
-    cfg_sem_enable_flag = sem_enable  # exposé dans cfg plus bas
+    cfg_sem_enable_flag = sem_enable
 
     state["SEM"] = None
     state["opt_SEM"] = None
@@ -464,10 +508,7 @@ def train_alternating(opt):
             blur_p=float(getattr(opt, "sem_blur", 0.1)),
         )
 
-        sem_jepa_on = bool(
-            getattr(opt, "jepa_on_content", 0)
-            and getattr(opt, "jepa_tokens", False)
-        )
+        sem_jepa_on = bool(getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False))
 
         sem_pretrained_path = getattr(opt, "sem_pretrained_path", None)
         sem_pretrained_strict = bool(int(getattr(opt, "sem_pretrained_strict", 0)) != 0)
@@ -501,6 +542,43 @@ def train_alternating(opt):
         state["SEM"] = sem_model
         state["opt_SEM"] = opt_sem
 
+        # -----------------------------
+        # SEM LR Scheduler (Warmup + Cosine)
+        # -----------------------------
+        sem_sched = str(getattr(opt, "sem_lr_sched", "none")).lower().strip()
+        sem_sched_by = str(getattr(opt, "sem_sched_by", "epoch")).lower().strip()
+
+        if sem_sched == "warmup_cosine":
+            warmup_epochs = int(getattr(opt, "sem_warmup_epochs", 0))
+            min_lr = float(getattr(opt, "sem_min_lr", 0.0))
+            warmup_init_lr = float(getattr(opt, "sem_warmup_init_lr", 0.0))
+
+            base_sem_lr = float(opt_sem.param_groups[0].get("lr", sem_lr))
+            sem_every = max(1, int(getattr(opt, "sem_every", 1)))
+
+            if sem_sched_by == "step":
+                updates_per_epoch = int(math.ceil(float(nbatchs) / float(sem_every)))
+                total_steps = max(1, updates_per_epoch * int(getattr(opt, "epochs", 1)))
+                warmup_steps = max(0, updates_per_epoch * warmup_epochs)
+            else:
+                total_steps = max(1, int(getattr(opt, "epochs", 1)))
+                warmup_steps = max(0, warmup_epochs)
+
+            lr_lambda = build_warmup_cosine_lambda(
+                base_lr=base_sem_lr,
+                warmup_steps=warmup_steps,
+                total_steps=total_steps,
+                min_lr=min_lr,
+                warmup_init_lr=warmup_init_lr,
+            )
+
+            state["sch_SEM"] = torch.optim.lr_scheduler.LambdaLR(opt_sem, lr_lambda=lr_lambda, last_epoch=-1)
+
+            print(
+                f"[SEM][sched] warmup_cosine | by={sem_sched_by} | base_lr={base_sem_lr:.3e} "
+                f"| warmup={warmup_steps} | total={total_steps} | min_lr={min_lr:.3e} | init_lr={warmup_init_lr:.3e}"
+            )
+
         print(
             f"[SEM] enabled | pretrained={getattr(opt, 'sem_pretrained', 1)} "
             f"| sem_pretrained_path={sem_pretrained_path} | strict={int(sem_pretrained_strict)}"
@@ -522,10 +600,14 @@ def train_alternating(opt):
                 strict=False,
                 sem_model=state.get("SEM", None),
                 opt_sem=state.get("opt_SEM", None),
+                T_A=state.get("T_A", None),
+                T_B=state.get("T_B", None),
+                tokJEPA_A=state.get("tokJEPA_A", None),
+                tokJEPA_B=state.get("tokJEPA_B", None),
             )
-            print("✓ reprise SEM depuis checkpoint")
+            print("✓ reprise SEM/Teachers/JEPA depuis checkpoint")
         except Exception as e:
-            print(f"[WARN] reprise SEM impossible: {e}")
+            print(f"[WARN] reprise SEM/Teachers/JEPA impossible: {e}")
 
     # =====================================================================================
     #  Config partagée (helpers / phases)
@@ -556,7 +638,6 @@ def train_alternating(opt):
 
     nce_layers = [l.strip() for l in str(getattr(opt, "nce_layers", "bot,skip64,skip32")).split(",") if l.strip()]
     w_str = getattr(opt, "nce_layer_weights", None) or ",".join(["1"] * len(nce_layers))
-    layer_w = []
     try:
         layer_w = [float(x) for x in str(w_str).split(",") if str(x).strip() != ""]
     except Exception:
@@ -793,8 +874,10 @@ def train_alternating(opt):
         "SEM": state.get("opt_SEM", None),
     }
 
+    epochs_total = int(getattr(opt, "epochs", 1))
+
     # --- boucle epochs
-    while state["epoch"] < int(getattr(opt, "epochs", 1)):
+    while state["epoch"] < epochs_total:
         epoch = int(state["epoch"])
         epoch_meters = new_epoch_meters()
 
@@ -821,7 +904,7 @@ def train_alternating(opt):
 
         budgets = cycle_sched.budgets()
         print(
-            f"\n📅 Epoch {epoch + 1:03d}/{int(getattr(opt, 'epochs', 1))}"
+            f"\n📅 Epoch {epoch + 1:03d}/{epochs_total}"
             f" | ROUND={budgets['round']}  A={budgets['A_done']}/{budgets['adv'] + budgets['mix']}"
             f"  R={budgets['R_done']}/{budgets['rec']}  | phase={phase:<6}"
             f" | λN={λN:.3f} λL1/ID={λR:.3f} λ_style_A={cfg['λ_style_A']:.3f}"
@@ -831,12 +914,16 @@ def train_alternating(opt):
             writer.add_scalar("phase/epoch", float(epoch), state["global_step"])
             writer.add_scalar("A/style_lambda_epoch", float(cfg["λ_style_A"]), epoch)
             _tb_add_scalars(writer, _get_lrs(optimizers), epoch, prefix="epoch_")
+            if state.get("opt_SEM", None) is not None:
+                try:
+                    writer.add_scalar("lr/SEM_epoch_start", float(state["opt_SEM"].param_groups[0]["lr"]), epoch)
+                except Exception:
+                    pass
 
         # =================================================================================
         #  Boucle batch : phases A/B
         # =================================================================================
         if mode in ["auto", "hybrid"]:
-            # ✅ terminal plus stable : refresh moins agressif
             pbar = tqdm(range(nbatchs), ncols=180, leave=False, mininterval=0.5, dynamic_ncols=True)
             for _ in pbar:
                 try:
@@ -870,10 +957,29 @@ def train_alternating(opt):
                             writer=writer,
                         )
 
-                    # IMPORTANT :
-                    # train_step_phase_A/B mettent déjà à jour state["global_step"] = old+1
-                    # donc ici on ne ré-incrémente PAS (sinon double comptage).
+                    # IMPORTANT : train_step_phase_A/B incrémentent déjà global_step.
                     step = int(state["global_step"])
+
+                    # -----------------------------
+                    # SEM Scheduler step (by step)
+                    # -----------------------------
+                    sch_sem = state.get("sch_SEM", None)
+                    if sch_sem is not None:
+                        sem_sched = str(getattr(opt, "sem_lr_sched", "none")).lower().strip()
+                        sem_sched_by = str(getattr(opt, "sem_sched_by", "epoch")).lower().strip()
+                        if sem_sched == "warmup_cosine" and sem_sched_by == "step":
+                            sem_every = max(1, int(getattr(opt, "sem_every", 1)))
+                            sem_on_B = bool(int(getattr(opt, "sem_on_B", 1)) != 0)
+                            sem_update_now = (step % sem_every == 0) and (sem_on_B or str(phase).startswith("A"))
+                            if sem_update_now and state.get("opt_SEM", None) is not None:
+                                state["sem_lr_step"] = int(state.get("sem_lr_step", 0)) + 1
+                                sch_sem.step()
+                                if writer and tb_freq > 0 and (step % tb_freq == 0):
+                                    try:
+                                        lr_now = float(state["opt_SEM"].param_groups[0]["lr"])
+                                        writer.add_scalar("lr/SEM_sched", lr_now, step)
+                                    except Exception:
+                                        pass
 
                     now = time.time()
                     dt = max(1e-6, now - last_step_wall)
@@ -901,18 +1007,33 @@ def train_alternating(opt):
                         _tb_add_scalars(writer, scalars, step, prefix="train/")
                         _tb_maybe_flush(writer, every_steps=int(getattr(opt, "tb_flush", tb_freq)), step=step)
 
-                    # --- save_freq step
-                    if save_freq_mode == "step" and save_freq_interval is not None and step % int(save_freq_interval) == 0:
+                    # ✅ Checkpoint: décision centralisée (PAS de "final" dans la boucle step)
+                    do_save, reason = should_save_ckpt(
+                        save_mode=save_freq_mode,
+                        interval=save_freq_interval,
+                        step=step,
+                        epoch=epoch,
+                        epochs_total=epochs_total,
+                        final_save=False,
+                    )
+                    if do_save:
                         save_checkpoint(
                             epoch,
                             G_A, D_A, G_B, D_B,
                             opt_GA, opt_DA, opt_GB, opt_DB,
                             step,
                             out_dir,
+                            use_safetensors=ckpt_use_safetensors,
+                            safe_write=ckpt_safe_write,
                             sem_model=state.get("SEM", None),
                             opt_sem=state.get("opt_SEM", None),
+                            T_A=state.get("T_A", None),
+                            T_B=state.get("T_B", None),
+                            tokJEPA_A=state.get("tokJEPA_A", None),
+                            tokJEPA_B=state.get("tokJEPA_B", None),
                         )
                         save_state_json(epoch, step, opt, out_dir)
+                        tqdm.write(f"[CKPT] saved ({reason}) @epoch={epoch} step={step}")
 
                 except Exception as ex:
                     msg = f"[ERROR] step={state.get('global_step', -1)} epoch={epoch} {type(ex).__name__}: {ex}"
@@ -923,7 +1044,6 @@ def train_alternating(opt):
                     if writer:
                         import traceback as _tb
                         _tb_add_text(writer, "errors/exception", f"{msg}\n{_tb.format_exc()}", int(state.get("global_step", 0)))
-                    # on tente de continuer sans casser le run
                     state["global_step"] = int(state.get("global_step", 0)) + 1
                     continue
 
@@ -949,17 +1069,32 @@ def train_alternating(opt):
             )
 
             step = int(state["global_step"])
-            if save_freq_mode == "step" and save_freq_interval is not None and step % int(save_freq_interval) == 0:
+            do_save, reason = should_save_ckpt(
+                save_mode=save_freq_mode,
+                interval=save_freq_interval,
+                step=step,
+                epoch=epoch,
+                epochs_total=epochs_total,
+                final_save=False,
+            )
+            if do_save:
                 save_checkpoint(
                     epoch,
                     G_A, D_A, G_B, D_B,
                     opt_GA, opt_DA, opt_GB, opt_DB,
                     step,
                     out_dir,
+                    use_safetensors=ckpt_use_safetensors,
+                    safe_write=ckpt_safe_write,
                     sem_model=state.get("SEM", None),
                     opt_sem=state.get("opt_SEM", None),
+                    T_A=state.get("T_A", None),
+                    T_B=state.get("T_B", None),
+                    tokJEPA_A=state.get("tokJEPA_A", None),
+                    tokJEPA_B=state.get("tokJEPA_B", None),
                 )
                 save_state_json(epoch, step, opt, out_dir)
+                print(f"[CKPT] saved ({reason}) @epoch={epoch} step={step}")
 
         # --- EMA D_B <- D_A (optionnel)
         if ema_tau > 0:
@@ -992,26 +1127,49 @@ def train_alternating(opt):
                 print(f"🔁 SWITCH FOLD → {current_fold}")
             cycle_sched.next_round()
 
-        # --- save_freq epoch / final
-        do_save_epoch = False
-        if save_freq_mode == "epoch" and save_freq_interval is not None:
-            if (epoch + 1) % int(save_freq_interval) == 0:
-                do_save_epoch = True
-        elif save_freq_mode in ("none", "step"):
-            if (epoch + 1) == int(getattr(opt, "epochs", 1)):
-                do_save_epoch = True
+        # -----------------------------
+        # SEM Scheduler step (by epoch)
+        # -----------------------------
+        sch_sem = state.get("sch_SEM", None)
+        if sch_sem is not None:
+            sem_sched = str(getattr(opt, "sem_lr_sched", "none")).lower().strip()
+            sem_sched_by = str(getattr(opt, "sem_sched_by", "epoch")).lower().strip()
+            if sem_sched == "warmup_cosine" and sem_sched_by == "epoch":
+                sch_sem.step()
+                if writer and state.get("opt_SEM", None) is not None:
+                    try:
+                        writer.add_scalar("lr/SEM_epoch", float(state["opt_SEM"].param_groups[0]["lr"]), epoch)
+                    except Exception:
+                        pass
 
+        # ✅ Checkpoint "epoch" + "final" (une seule fois à la fin de l'epoch)
+        step_now = int(state["global_step"])
+        do_save_epoch, reason_epoch = should_save_ckpt(
+            save_mode=save_freq_mode,
+            interval=save_freq_interval,
+            step=step_now,
+            epoch=epoch,
+            epochs_total=epochs_total,
+            final_save=True,
+        )
         if do_save_epoch:
             save_checkpoint(
                 epoch,
                 G_A, D_A, G_B, D_B,
                 opt_GA, opt_DA, opt_GB, opt_DB,
-                int(state["global_step"]),
+                step_now,
                 out_dir,
+                use_safetensors=ckpt_use_safetensors,
+                safe_write=ckpt_safe_write,
                 sem_model=state.get("SEM", None),
                 opt_sem=state.get("opt_SEM", None),
+                T_A=state.get("T_A", None),
+                T_B=state.get("T_B", None),
+                tokJEPA_A=state.get("tokJEPA_A", None),
+                tokJEPA_B=state.get("tokJEPA_B", None),
             )
-            save_state_json(epoch, int(state["global_step"]), opt, out_dir)
+            save_state_json(epoch, step_now, opt, out_dir)
+            print(f"[CKPT] saved ({reason_epoch}) @epoch={epoch} step={step_now}")
 
         state["epoch"] += 1
 
