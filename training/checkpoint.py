@@ -1,14 +1,19 @@
 # training/checkpoint.py
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 from typing import Any, Optional, Union, Tuple, Dict, List
-import json, os, tempfile, random, re
+import json
+import os
+import tempfile
+import random
+import re
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
-
 from tqdm import tqdm
 
 
@@ -21,7 +26,6 @@ def _log(msg: str) -> None:
     try:
         tqdm.write(str(msg))
     except Exception:
-        # fallback si tqdm pas actif
         print(msg)
 
 
@@ -29,9 +33,11 @@ def _log(msg: str) -> None:
 # 1) Détection du dernier epoch
 # ======================================================================
 
-def last_epoch(dir_path: Union[str, Path],
-               stem: str,
-               exts: Tuple[str, ...] = (".pt", ".pth", ".safetensors")) -> Optional[int]:
+def last_epoch(
+    dir_path: Union[str, Path],
+    stem: str,
+    exts: Tuple[str, ...] = (".pt", ".pth", ".safetensors"),
+) -> Optional[int]:
     """
     Renvoie l’index d’époque le plus élevé pour des fichiers :
         <stem>_epoch{n}{ext}
@@ -55,6 +61,67 @@ def last_epoch(dir_path: Union[str, Path],
                 pass
 
     return max(epochs) if epochs else None
+
+
+# ======================================================================
+# 1b) Décision centralisée de sauvegarde (nouveau)
+# ======================================================================
+
+def should_save_ckpt(
+    *,
+    save_mode: str,
+    interval: Optional[int],
+    step: int,
+    epoch: int,
+    epochs_total: int,
+    final_save: bool = True,
+) -> Tuple[bool, str]:
+    """
+    Décide si on doit sauvegarder, et renvoie (do_save, reason).
+
+    - epoch est 0-based
+    - step est l'itération globale
+    - save_mode ∈ {"none","step","epoch"}
+    - interval: N (pour step:N ou epoch:N)
+    - final_save: si True, on sauvegarde aussi au dernier epoch.
+
+    Reasons typiques: "step:1000", "epoch:5", "final"
+    """
+    mode = (save_mode or "none").strip().lower()
+    if mode not in {"none", "step", "epoch"}:
+        mode = "none"
+
+    if interval is not None:
+        try:
+            interval = max(1, int(interval))
+        except Exception:
+            interval = None
+
+    # final
+    is_final_epoch = (epoch + 1) >= int(epochs_total)
+
+    if mode == "none":
+        if final_save and is_final_epoch:
+            return True, "final"
+        return False, ""
+
+    if mode == "step":
+        if interval is None:
+            interval = 1
+        if interval > 0 and (int(step) % int(interval) == 0):
+            return True, f"step:{int(interval)}"
+        if final_save and is_final_epoch:
+            return True, "final"
+        return False, ""
+
+    # mode == "epoch"
+    if interval is None:
+        interval = 1
+    if (int(epoch) + 1) % int(interval) == 0:
+        return True, f"epoch:{int(interval)}"
+    if final_save and is_final_epoch:
+        return True, "final"
+    return False, ""
 
 
 # ────────────────────────────────────────────────────────────────
@@ -115,10 +182,12 @@ def _remap_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
 # 3) Chargement générique (DP + remap + safetensors)
 # ────────────────────────────────────────────────────────────────
 
-def _load_weights(model: nn.Module,
-                  path: Path,
-                  device: torch.device,
-                  strict: bool = True) -> None:
+def _load_weights(
+    model: nn.Module,
+    path: Path,
+    device: torch.device,
+    strict: bool = True,
+) -> None:
     """
     Charge un state_dict sur 'model' depuis 'path' (.pt/.pth/.safetensors).
     Remappe/filtre les anciennes clés, gère le préfixe DataParallel 'module.'
@@ -149,8 +218,10 @@ def _load_weights(model: nn.Module,
     )
     is_legacy_attn_style = any(any(k.startswith(pref) for pref in legacy_prefixes) for k in raw_sd.keys())
     if is_legacy_attn_style:
-        _log("[INFO] Checkpoint *legacy* détecté (AttnStyleEncoder). "
-             "Les clés de style obsolètes seront ignorées (SPADE/SEAN multi-échelles).")
+        _log(
+            "[INFO] Checkpoint *legacy* détecté (AttnStyleEncoder). "
+            "Les clés de style obsolètes seront ignorées (SPADE/SEAN multi-échelles)."
+        )
 
     # --- remap + filtrage legacy
     sd = _remap_keys(raw_sd)
@@ -333,7 +404,12 @@ def save_jepa_rich(jepa_mod: nn.Module, out_path: Path, *, safe_write: bool = Tr
     _log(f"✓ JEPA (rich) sauvegardé → {out_path}")
 
 
-def _load_jepa_weights(jepa_mod: nn.Module, path: Path, device: torch.device, strict: bool = True) -> Dict[str, Any]:
+def _load_jepa_weights(
+    jepa_mod: nn.Module,
+    path: Path,
+    device: torch.device,
+    strict: bool = True,
+) -> Dict[str, Any]:
     """
     Charge une tête JEPA depuis un bundle .pth (meta+state_dict) ou un state_dict simple.
     Retourne un dict meta (possiblement vide).
@@ -365,32 +441,42 @@ def _load_jepa_weights(jepa_mod: nn.Module, path: Path, device: torch.device, st
 # 7) Sauvegarde complète d’un checkpoint (+ Teachers + JEPA + SEM)
 # ────────────────────────────────────────────────────────────────
 
-def save_checkpoint(epoch: int, G_A, D_A, G_B, D_B,
-                    opt_GA, opt_DA, opt_GB, opt_DB,
-                    global_step: int, out_dir: Path,
-                    *,
-                    # options IO
-                    use_safetensors: bool = False,
-                    safe_write: bool = True,
-                    # états entraînement optionnels
-                    amp_scaler: Optional[Any] = None,
-                    sched_GA: Optional[Any] = None,
-                    sched_GB: Optional[Any] = None,
-                    # ======== Semantic content (MoCo+JEPA) ========
-                    sem_model: Optional[nn.Module] = None,
-                    opt_sem: Optional[Any] = None,
-                    sem_filename: str = "SemMoCo",
-                    # SupHeads
-                    sup_heads: Optional[nn.Module] = None,
-                    sup_filename: str = "SupHeads",
-                    save_supheads_every_epoch: bool = True,
-                    # ======== Teachers EMA & JEPA ========
-                    T_A: Optional[nn.Module] = None,
-                    T_B: Optional[nn.Module] = None,
-                    save_teachers: bool = True,
-                    tokJEPA_A: Optional[nn.Module] = None,
-                    tokJEPA_B: Optional[nn.Module] = None,
-                    save_jepa_every_epoch: bool = True) -> None:
+def save_checkpoint(
+    epoch: int,
+    G_A,
+    D_A,
+    G_B,
+    D_B,
+    opt_GA,
+    opt_DA,
+    opt_GB,
+    opt_DB,
+    global_step: int,
+    out_dir: Path,
+    *,
+    # options IO
+    use_safetensors: bool = False,
+    safe_write: bool = True,
+    # états entraînement optionnels
+    amp_scaler: Optional[Any] = None,
+    sched_GA: Optional[Any] = None,
+    sched_GB: Optional[Any] = None,
+    # ======== Semantic content (MoCo+JEPA) ========
+    sem_model: Optional[nn.Module] = None,
+    opt_sem: Optional[Any] = None,
+    sem_filename: str = "SemMoCo",
+    # SupHeads
+    sup_heads: Optional[nn.Module] = None,
+    sup_filename: str = "SupHeads",
+    save_supheads_every_epoch: bool = True,
+    # ======== Teachers EMA & JEPA ========
+    T_A: Optional[nn.Module] = None,
+    T_B: Optional[nn.Module] = None,
+    save_teachers: bool = True,
+    tokJEPA_A: Optional[nn.Module] = None,
+    tokJEPA_B: Optional[nn.Module] = None,
+    save_jepa_every_epoch: bool = True,
+) -> None:
     """
     Sauvegarde :
       • G_A, D_A, G_B, D_B           (.pt / .safetensors)
@@ -427,9 +513,17 @@ def save_checkpoint(epoch: int, G_A, D_A, G_B, D_B,
     if sem_model is not None:
         try:
             if use_safetensors:
-                _atomic_save_safetensors(sem_model.state_dict(), out_dir / f"{sem_filename}_epoch{epoch}.safetensors", safe_write=safe_write)
+                _atomic_save_safetensors(
+                    sem_model.state_dict(),
+                    out_dir / f"{sem_filename}_epoch{epoch}.safetensors",
+                    safe_write=safe_write,
+                )
             else:
-                _atomic_save_torch(sem_model.state_dict(), out_dir / f"{sem_filename}_epoch{epoch}.pt", safe_write=safe_write)
+                _atomic_save_torch(
+                    sem_model.state_dict(),
+                    out_dir / f"{sem_filename}_epoch{epoch}.pt",
+                    safe_write=safe_write,
+                )
         except Exception as e:
             _log(f"[WARN] sauvegarde {sem_filename} impossible: {e}")
 
@@ -471,11 +565,13 @@ def save_checkpoint(epoch: int, G_A, D_A, G_B, D_B,
 
     # --- 3) Export SupHeads “riche”
     if save_supheads_every_epoch:
-        sup = (sup_heads
-               or getattr(G_A, "sup_heads", None)
-               or getattr(G_B, "sup_heads", None)
-               or getattr(G_A, "Sup", None)
-               or getattr(G_B, "Sup", None))
+        sup = (
+            sup_heads
+            or getattr(G_A, "sup_heads", None)
+            or getattr(G_B, "sup_heads", None)
+            or getattr(G_A, "Sup", None)
+            or getattr(G_B, "Sup", None)
+        )
         if isinstance(sup, nn.Module):
             save_supheads_rich(sup, out_dir / f"{sup_filename}_epoch{epoch}.pth", safe_write=safe_write)
 
@@ -506,28 +602,36 @@ def save_checkpoint(epoch: int, G_A, D_A, G_B, D_B,
 # 8) Chargement checkpoints (+ Teachers + JEPA + SEM)
 # ────────────────────────────────────────────────────────────────
 
-def load_checkpoint(run_dir: Union[str, Path],
-                    epoch: int,
-                    G_A, D_A, G_B, D_B,
-                    opt_GA=None, opt_DA=None, opt_GB=None, opt_DB=None,
-                    *,
-                    sem_model: Optional[nn.Module] = None,
-                    opt_sem: Optional[Any] = None,
-                    sem_filename: str = "SemMoCo",
-                    device: str = "cpu",
-                    strict_GA: bool = False,
-                    strict_GB: bool = False,
-                    strict: Optional[bool] = None,
-                    weights_only: bool = False,
-                    prefer_exts: Tuple[str, ...] = (".pt", ".safetensors"),
-                    # ======== Teachers EMA & JEPA ========
-                    T_A: Optional[nn.Module] = None,
-                    T_B: Optional[nn.Module] = None,
-                    strict_TA: bool = False,
-                    strict_TB: bool = False,
-                    tokJEPA_A: Optional[nn.Module] = None,
-                    tokJEPA_B: Optional[nn.Module] = None,
-                    strict_tokJEPA: bool = True) -> dict:
+def load_checkpoint(
+    run_dir: Union[str, Path],
+    epoch: int,
+    G_A,
+    D_A,
+    G_B,
+    D_B,
+    opt_GA=None,
+    opt_DA=None,
+    opt_GB=None,
+    opt_DB=None,
+    *,
+    sem_model: Optional[nn.Module] = None,
+    opt_sem: Optional[Any] = None,
+    sem_filename: str = "SemMoCo",
+    device: str = "cpu",
+    strict_GA: bool = False,
+    strict_GB: bool = False,
+    strict: Optional[bool] = None,
+    weights_only: bool = False,
+    prefer_exts: Tuple[str, ...] = (".pt", ".safetensors"),
+    # ======== Teachers EMA & JEPA ========
+    T_A: Optional[nn.Module] = None,
+    T_B: Optional[nn.Module] = None,
+    strict_TA: bool = False,
+    strict_TB: bool = False,
+    tokJEPA_A: Optional[nn.Module] = None,
+    tokJEPA_B: Optional[nn.Module] = None,
+    strict_tokJEPA: bool = True,
+) -> dict:
     """
     Charge les poids de G_A, D_A, G_B, D_B et (optionnel) l'état des optimiseurs + RNG.
 
@@ -701,16 +805,12 @@ def load_checkpoint(run_dir: Union[str, Path],
 # 9) Snapshot JSON lisible – étendu avec + d’options JEPA
 # ────────────────────────────────────────────────────────────────
 
-def save_state_json(epoch: int,
-                    global_step: int,
-                    opt,
-                    out_dir: Path) -> None:
+def save_state_json(epoch: int, global_step: int, opt, out_dir: Path) -> None:
     """
     Écrit un snapshot lisible (<out_dir>/train_state.json).
     """
     snapshot = {
         "schema_version": 7,
-
         "epoch": int(epoch),
         "global_step": int(global_step),
 
