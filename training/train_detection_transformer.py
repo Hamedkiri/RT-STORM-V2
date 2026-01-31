@@ -8,22 +8,25 @@ Detection TRAINING only (no eval/camera here).
 Called from train_style_disentangle.py when --mode detect_transformer.
 
 Supported heads via --det_head:
-  - fasterrcnn : torchvision Faster R-CNN (custom backbone = ResNet50 layer{2,3,4} via IntermediateLayerGetter)
-  - fastrnn    : custom FastRNNDetector (models/detection/fastrnn_detector.py) using same backbone output dict {"0": feat}
+  - fastrnn    : custom FastRNNDetector (models/detection/fastrnn_detector.py)  ✅ DEFAULT (comme main_moco_modified_classifier.py)
+  - fasterrcnn : torchvision Faster R-CNN
 
-✅ Robust handling of empty targets:
-  - If your data.py filters empty images at dataset init (recommended), FasterRCNN should never see empty boxes.
-  - We still keep an additional safety filter per-batch (optional) to avoid crashes if something slips through
-    (missing file, corrupted ann, broken box, etc).
+✅ Default backbone return layer:
+  - --det_sem_return_layer = layer4 ✅ DEFAULT (mêmes couches par défaut que ton script main_moco)
+    (tu peux toujours passer layer2/layer3/layer4 via l’option)
+
+✅ Main-moco-like training:
+  - data.py returns (imgs, targets) with imgs = list[Tensor] by default (variable sizes)
+  - forward: loss_dict = model(imgs, targets)
+  - move imgs/targets to device (list-wise)
+  - optional warmup + StepLR
+  - dataset can drop empty images; optional per-batch safety filter remains
 
 Checkpoints:
   - save_dir/detector_last.pth
   - save_dir/detector_epoch_XXXX.pth (periodic)
-  - save_dir/hparams_detection.json (exact hparams used)
-
-These artifacts are designed to be reloaded by testsFile/detectionUtils.py:
-  - build_detector_from_checkpoint(...), or
-  - build_detector_from_checkpoint(ckpt_path, hparams_json=..., auto_hparams_json=True, ...)
+  - save_dir/hparams_detection.json
+  - save_dir/det_train_log.json
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from tqdm import tqdm
@@ -85,9 +88,39 @@ def _strip_module_prefix_if_needed(state: Dict[str, Any]) -> Dict[str, Any]:
     return {k[len("module.") :]: v for k, v in state.items()}
 
 
+def _to_device_target(t: Dict[str, Any], dev: torch.device) -> Dict[str, Any]:
+    out = {}
+    for k, v in t.items():
+        out[k] = v.to(dev) if torch.is_tensor(v) else v
+    return out
+
+
+def _to_device_images_targets(
+    imgs: Union[List[torch.Tensor], torch.Tensor],
+    targets: List[Dict[str, Any]],
+    dev: torch.device,
+) -> Tuple[List[torch.Tensor], List[Dict[str, Any]]]:
+    """
+    Accepts:
+      - imgs as list[Tensor] (main_moco-like default)
+      - imgs as Tensor (B,C,H,W) if user enabled det_stack_batch
+
+    Returns:
+      - imgs_list: list[Tensor] on device
+      - targets_list: list[dict] on device
+    """
+    if torch.is_tensor(imgs):
+        imgs_list = [im.to(dev) for im in imgs]  # split along batch
+    else:
+        imgs_list = [im.to(dev) for im in imgs]
+
+    targets_list = [_to_device_target(t, dev) for t in targets]
+    return imgs_list, targets_list
+
+
 def _is_valid_boxes_tensor(boxes: Any) -> bool:
     """
-    FasterRCNN expects boxes: FloatTensor [N,4], N>=1 during training.
+    FasterRCNN training expects boxes: FloatTensor [N,4], N>=1 for that image.
     """
     if not torch.is_tensor(boxes):
         return False
@@ -100,48 +133,42 @@ def _is_valid_boxes_tensor(boxes: Any) -> bool:
     return True
 
 
-def _filter_empty_targets_batch(
-    images: torch.Tensor,
-    targets: List[Dict[str, Any]],
-    dev: torch.device,
+def _filter_empty_targets(
+    imgs_list: List[torch.Tensor],
+    targets_list: List[Dict[str, Any]],
     debug: bool = False,
 ) -> Tuple[List[torch.Tensor], List[Dict[str, Any]], Dict[str, int]]:
     """
-    images: (B,C,H,W)
-    targets: list of dicts with at least "boxes" and "labels"
-    Return: list_images(CHW), list_targets, stats dict
+    Per-sample safety filter. Keeps only samples with valid boxes & labels.
     """
-    B = images.shape[0]
-    imgs_list: List[torch.Tensor] = []
-    tgts_list: List[Dict[str, Any]] = []
-
-    total = int(B)
+    total = len(imgs_list)
     used = 0
     ignored = 0
+    out_imgs: List[torch.Tensor] = []
+    out_tgts: List[Dict[str, Any]] = []
 
-    for i in range(B):
-        t = targets[i]
+    for i in range(total):
+        t = targets_list[i]
         boxes = t.get("boxes", None)
         labels = t.get("labels", None)
-
         ok = _is_valid_boxes_tensor(boxes) and (torch.is_tensor(labels) and labels.numel() > 0)
 
         if not ok:
             ignored += 1
             if debug:
                 shape = getattr(boxes, "shape", None)
-                print(f"[DEBUG DET] ignore batch img[{i}] invalid target (boxes_shape={shape})")
+                print(f"[DEBUG DET] ignore sample[{i}] invalid target (boxes_shape={shape})")
             continue
 
-        imgs_list.append(images[i].to(dev))
-        tgts_list.append({k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in t.items()})
+        out_imgs.append(imgs_list[i])
+        out_tgts.append(t)
         used += 1
 
-    return imgs_list, tgts_list, {"total": total, "used": used, "ignored": ignored}
+    return out_imgs, out_tgts, {"total": int(total), "used": int(used), "ignored": int(ignored)}
 
 
 # --------------------------------------------------------------------------------------
-# ✅ NEW: robust loader for SSL ResNet50 backbone checkpoints
+# ✅ Robust loader for SSL ResNet50 backbone checkpoints (keeps strict=True possible)
 # --------------------------------------------------------------------------------------
 def _load_resnet50_backbone_weights(
     *,
@@ -152,124 +179,77 @@ def _load_resnet50_backbone_weights(
     verbose: bool = True,
 ) -> None:
     """
-    Load SSL/MoCo-style ResNet50 backbone weights into a torchvision ResNet50
-    WHILE KEEPING strict=True.
+    Load SSL/MoCo-style ResNet50 backbone weights into a torchvision ResNet50.
 
     ✅ Key idea to keep strict=True:
-      - We build a *full* state_dict with ALL expected keys from `resnet.state_dict()`,
-        then we overwrite only the matching backbone keys coming from the checkpoint.
-      - This means `fc.weight` / `fc.bias` remain present (kept from the model init),
-        so strict=True will not complain about missing classifier head.
-
-    Supports common prefix patterns:
-      - 'module.' / 'model.' / 'state_dict' nesting
-      - 'backbone_q.' (MoCo queue encoder)
-      - 'encoder_q.' / 'encoder.' / 'backbone.' etc.
-      - ResNet stem mapping:
-          checkpoint: stem.0/1/...  -> torchvision: conv1/bn1/...
+      - Build a *full* target state_dict from `resnet.state_dict()` (includes fc.*),
+        overwrite only matching keys from ckpt, then load with strict=True.
     """
-
     import os
-    import torch
 
     if ckpt_path is None or str(ckpt_path).strip() == "":
         raise ValueError("ckpt_path is empty")
-
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
 
-    # -------------------------
     # 1) Extract raw state dict
-    # -------------------------
     state = None
     if isinstance(ckpt, dict):
-        # Common patterns
         for k in ["state_dict", "model", "model_state", "net", "encoder", "backbone"]:
             if k in ckpt and isinstance(ckpt[k], dict):
                 state = ckpt[k]
                 break
         if state is None:
-            # maybe it's already a state_dict-like dict
             state = ckpt
     else:
         raise RuntimeError(f"Unsupported checkpoint type: {type(ckpt)}")
 
-    # -----------------------------------------
-    # 2) Strip DDP prefixes like 'module.'
-    # -----------------------------------------
+    # 2) Strip DDP "module." repeatedly
     def strip_prefix(sd: dict, pref: str) -> dict:
-        out = {}
+        fixed = {}
         for k, v in sd.items():
             if k.startswith(pref):
-                out[k[len(pref):]] = v
+                fixed[k[len(pref):]] = v
             else:
-                out[k] = v
-        return out
+                fixed[k] = v
+        return fixed
 
-    # strip "module." repeatedly (sometimes nested "module.module.")
     for _ in range(3):
         if any(k.startswith("module.") for k in state.keys()):
             state = strip_prefix(state, "module.")
 
-    # ----------------------------------------------------------
-    # 3) Remap checkpoint keys -> torchvision ResNet50 keys
-    # ----------------------------------------------------------
+    # 3) Remap keys
     def remap_key(k: str) -> str:
-        """
-        Convert common SSL/MoCo naming to torchvision resnet naming.
-        """
-        # Prefer query encoder if both exist
-        # (We don't attempt to merge q/k; we just take what is in sd)
-        prefixes = [
-            "backbone_q.",
-            "encoder_q.",
-            "encoder.",
-            "backbone.",
-            "model.",
-            "net.",
-        ]
+        prefixes = ["backbone_q.", "encoder_q.", "encoder.", "backbone.", "model.", "net."]
         for p in prefixes:
             if k.startswith(p):
                 k = k[len(p):]
                 break
 
-        # MoCo-v3 / custom stem naming
-        # checkpoint: stem.0.weight -> torchvision: conv1.weight
-        # checkpoint: stem.1.*      -> torchvision: bn1.*
-        # Some codebases also have stem.2=relu, stem.3=maxpool (no params)
         if k.startswith("stem.0."):
             k = "conv1." + k[len("stem.0."):]
         elif k.startswith("stem.1."):
             k = "bn1." + k[len("stem.1."):]
-        # stem.2 / stem.3 have no params; nothing to map
-
-        # Some SSL checkpoints store fc as "head" or "classifier"
-        # We intentionally DO NOT map those to resnet.fc to avoid overwriting;
-        # we keep resnet.fc init weights to satisfy strict=True.
         if k.startswith("head.") or k.startswith("classifier."):
-            # map to something that won't match; it will be dropped later
             k = "__DROP__." + k
-
         return k
 
-    remapped = {}
+    remapped: Dict[str, Any] = {}
     for k, v in state.items():
         rk = remap_key(k)
         if rk.startswith("__DROP__."):
             continue
         remapped[rk] = v
 
-    # -------------------------------------------------------------------
-    # 4) Build a FULL state dict (keeps fc.* keys) then overwrite matches
-    # -------------------------------------------------------------------
+    # 4) Full target state dict then overwrite matches
     target_sd = resnet.state_dict()
     target_keys = set(target_sd.keys())
 
-    # Only copy tensors that exist in target AND have same shape
-    loaded_keys = []
-    shape_mismatch = []
+    loaded_keys: List[str] = []
+    shape_mismatch: List[Tuple[str, Tuple[int, ...], Tuple[int, ...]]] = []
+
     for k, v in remapped.items():
         if k not in target_keys:
             continue
@@ -281,21 +261,12 @@ def _load_resnet50_backbone_weights(
         target_sd[k] = v
         loaded_keys.append(k)
 
-    # Optionally: you can also explicitly keep fc from init (already kept).
-    # target_sd["fc.weight"] and target_sd["fc.bias"] remain untouched.
-
-    # -------------------------------------------------------------------
-    # 5) strict=True load (will pass because ALL keys exist in target_sd)
-    # -------------------------------------------------------------------
-    # With strict=True:
-    #  - missing keys: none (we pass full dict)
-    #  - unexpected keys: none (we pass only target keys)
-    resnet.load_state_dict(target_sd, strict=strict)
+    resnet.load_state_dict(target_sd, strict=bool(strict))
 
     if verbose:
         print(f"[DET][SEM] Loaded ckpt: {ckpt_path}")
         print(f"[DET][SEM] strict={strict} | loaded_backbone_keys={len(loaded_keys)}")
-        if len(loaded_keys) > 0:
+        if loaded_keys:
             print(f"[DET][SEM] example loaded keys: {loaded_keys[:8]}")
         if shape_mismatch:
             print(f"[DET][SEM] ⚠️ shape mismatches skipped: {len(shape_mismatch)}")
@@ -303,38 +274,44 @@ def _load_resnet50_backbone_weights(
                 print(f"  - {k}: ckpt{s_src} != model{s_tgt}")
 
 
-
-
 # --------------------------------------------------------------------------------------
-# HParams (align with testsFile/detectionUtils.py fields)
+# HParams
 # --------------------------------------------------------------------------------------
 @dataclass
 class DetectorHParams:
     # Core
-    head_type: str = "fastrnn"         # "fastrnn" | "fasterrcnn"
-    num_classes: int = 81              # inclut bg=0
+    head_type: str = "fastrnn"         # ✅ DEFAULT comme main_moco_modified_classifier.py
+    num_classes: int = 81              # incl bg=0
     feat_source: str = "sem_resnet50"
-    freeze_backbone: bool = True
-    img_h: int = 256
-    img_w: int = 256
+    freeze_backbone: bool = False
     sem_pretrained: bool = True
-    det_sem_return_layer: str = "layer4"
+    det_sem_return_layer: str = "layer4"  # ✅ DEFAULT (mêmes couches par défaut)
 
-    # ✅ NEW: path to SSL-pretrained backbone checkpoint
-    sem_pretrained_path: str = ""      # if non-empty, overrides ImageNet init for ResNet50 backbone
+    # SSL-pretrained backbone checkpoint (optional)
+    sem_pretrained_path: str = ""
     sem_pretrained_strict: bool = False
     sem_pretrained_verbose: bool = True
 
     # Data / robustness
-    det_drop_empty: bool = True        # should match data.py dataset filtering (recommended)
-    det_filter_batch_safety: bool = True  # extra safety filter inside training loop
+    det_drop_empty: bool = True
+    det_filter_batch_safety: bool = True
 
-    # Optim
+    # Optim / schedule
     det_epochs: int = 20
-    det_lr_head: float = 1e-4
-    det_lr_backbone: float = 1e-5
+    det_optimizer: str = "sgd"         # "sgd" | "adamw"
+    det_lr_head: float = 5e-3
+    det_lr_backbone: float = 5e-4
     det_weight_decay: float = 1e-4
+    det_sgd_momentum: float = 0.9
     det_grad_clip: float = 0.0
+
+    # LR scheduler (StepLR)
+    det_lr_step_size: int = 8
+    det_lr_gamma: float = 0.1
+
+    # Warmup (iterations)
+    det_warmup_iters: int = 500
+    det_warmup_factor: float = 1.0 / 1000.0
 
     # FastRNN
     fastrnn_hidden: int = 256
@@ -347,7 +324,7 @@ class DetectorHParams:
     fastrnn_topk: int = 1000
     fastrnn_size_divisible: int = 32
 
-    # FasterRCNN (RPN/box postprocess)
+    # FasterRCNN extras
     frcnn_rpn_pre_nms_top_n_train: int = 2000
     frcnn_rpn_pre_nms_top_n_test: int = 1000
     frcnn_rpn_post_nms_top_n_train: int = 2000
@@ -365,29 +342,39 @@ class DetectorHParams:
     @staticmethod
     def from_opt(opt, num_classes: int) -> "DetectorHParams":
         hp = DetectorHParams()
-        hp.head_type = str(getattr(opt, "det_head", "fasterrcnn")).lower().strip()
+
+        # ✅ IMPORTANT: default det_head = "fastrnn" (pas fasterrcnn)
+        hp.head_type = str(getattr(opt, "det_head", "fastrnn")).lower().strip()
+
         hp.num_classes = int(getattr(opt, "det_num_classes", num_classes))
         hp.feat_source = str(getattr(opt, "det_feat_source", "sem_resnet50")).lower().strip()
         hp.freeze_backbone = bool(int(getattr(opt, "det_freeze_backbone", 0)))
-        hp.img_h = int(getattr(opt, "det_img_h", getattr(opt, "crop_size", 256)))
-        hp.img_w = int(getattr(opt, "det_img_w", getattr(opt, "crop_size", 256)))
         hp.sem_pretrained = bool(int(getattr(opt, "sem_pretrained", 1)))
+
+        # ✅ IMPORTANT: default return layer = layer4
         hp.det_sem_return_layer = str(getattr(opt, "det_sem_return_layer", "layer4")).lower().strip()
 
-        # ✅ NEW
         hp.sem_pretrained_path = str(getattr(opt, "sem_pretrained_path", "") or "")
         hp.sem_pretrained_strict = bool(int(getattr(opt, "sem_pretrained_strict", 0)))
         hp.sem_pretrained_verbose = bool(int(getattr(opt, "sem_pretrained_verbose", 1)))
 
-        # robustness flags (consistent with data.py)
         hp.det_drop_empty = bool(int(getattr(opt, "det_drop_empty", 1)))
         hp.det_filter_batch_safety = bool(int(getattr(opt, "det_filter_batch_safety", 1)))
 
         hp.det_epochs = int(getattr(opt, "det_epochs", 20))
-        hp.det_lr_head = float(getattr(opt, "det_lr_head", 1e-4))
-        hp.det_lr_backbone = float(getattr(opt, "det_lr_backbone", 1e-5))
+        hp.det_optimizer = str(getattr(opt, "det_optimizer", "sgd")).lower().strip()
+
+        hp.det_lr_head = float(getattr(opt, "det_lr_head", 5e-3))
+        hp.det_lr_backbone = float(getattr(opt, "det_lr_backbone", 5e-4))
         hp.det_weight_decay = float(getattr(opt, "det_weight_decay", 1e-4))
+        hp.det_sgd_momentum = float(getattr(opt, "det_sgd_momentum", 0.9))
         hp.det_grad_clip = float(getattr(opt, "det_grad_clip", 0.0))
+
+        hp.det_lr_step_size = int(getattr(opt, "det_lr_step_size", 8))
+        hp.det_lr_gamma = float(getattr(opt, "det_lr_gamma", 0.1))
+
+        hp.det_warmup_iters = int(getattr(opt, "det_warmup_iters", 500))
+        hp.det_warmup_factor = float(getattr(opt, "det_warmup_factor", 1.0 / 1000.0))
 
         hp.fastrnn_hidden = int(getattr(opt, "fastrnn_hidden", 256))
         hp.fastrnn_dropout = float(getattr(opt, "fastrnn_dropout", 0.0))
@@ -398,7 +385,6 @@ class DetectorHParams:
         hp.fastrnn_nms_thresh = float(getattr(opt, "fastrnn_nms_thresh", 0.5))
         hp.fastrnn_topk = int(getattr(opt, "fastrnn_topk", 1000))
         hp.fastrnn_size_divisible = int(getattr(opt, "fastrnn_size_divisible", 32))
-
         return hp
 
 
@@ -409,7 +395,7 @@ def _write_hparams_json(save_dir: Path, hp: DetectorHParams) -> Path:
 
 
 # --------------------------------------------------------------------------------------
-# Backbone builders (same logic as testsFile/detectionUtils.py)
+# Backbone / detector builders
 # --------------------------------------------------------------------------------------
 def _build_sem_resnet50_backbone(
     *,
@@ -423,7 +409,6 @@ def _build_sem_resnet50_backbone(
     from torchvision.models._utils import IntermediateLayerGetter
 
     weights = None
-    # If a custom pretrained_path is provided, we don't need ImageNet weights.
     if pretrained and not str(pretrained_path).strip():
         try:
             weights = torchvision.models.ResNet50_Weights.DEFAULT
@@ -432,7 +417,6 @@ def _build_sem_resnet50_backbone(
 
     m = torchvision.models.resnet50(weights=weights)
 
-    # ✅ NEW: override/initialize from SSL checkpoint if provided
     if str(pretrained_path).strip():
         _load_resnet50_backbone_weights(
             resnet=m,
@@ -465,7 +449,6 @@ def _build_fasterrcnn_detector(backbone: torch.nn.Module, num_classes: int, hp: 
         backbone=backbone,
         num_classes=int(num_classes),
         rpn_anchor_generator=anchor_generator,
-
         rpn_pre_nms_top_n_train=int(hp.frcnn_rpn_pre_nms_top_n_train),
         rpn_pre_nms_top_n_test=int(hp.frcnn_rpn_pre_nms_top_n_test),
         rpn_post_nms_top_n_train=int(hp.frcnn_rpn_post_nms_top_n_train),
@@ -475,7 +458,6 @@ def _build_fasterrcnn_detector(backbone: torch.nn.Module, num_classes: int, hp: 
         rpn_bg_iou_thresh=float(hp.frcnn_rpn_bg_iou_thresh),
         rpn_batch_size_per_image=int(hp.frcnn_rpn_batch_size_per_image),
         rpn_positive_fraction=float(hp.frcnn_rpn_positive_fraction),
-
         box_score_thresh=float(hp.frcnn_box_score_thresh),
         box_nms_thresh=float(hp.frcnn_box_nms_thresh),
         box_detections_per_img=int(hp.frcnn_box_detections_per_img),
@@ -488,10 +470,7 @@ def _build_detector(opt, dev: torch.device, hp: DetectorHParams) -> Tuple[torch.
     Returns (det_model, backbone_module_for_freeze)
     """
     if hp.feat_source != "sem_resnet50":
-        raise ValueError(
-            f"[train_detection] Unsupported det_feat_source='{hp.feat_source}' in this simplified script. "
-            "Use sem_resnet50 for now."
-        )
+        raise ValueError(f"[train_detection] Unsupported det_feat_source='{hp.feat_source}'. Use sem_resnet50.")
 
     backbone, out_ch = _build_sem_resnet50_backbone(
         pretrained=bool(hp.sem_pretrained),
@@ -502,13 +481,8 @@ def _build_detector(opt, dev: torch.device, hp: DetectorHParams) -> Tuple[torch.
     )
     backbone = backbone.to(dev)
 
-    if hp.head_type == "fasterrcnn":
-        det_model = _build_fasterrcnn_detector(backbone=backbone, num_classes=hp.num_classes, hp=hp).to(dev)
-        backbone_module = det_model.backbone  # for freeze toggles
-
-    elif hp.head_type == "fastrnn":
+    if hp.head_type == "fastrnn":
         from models.detection.fastrnn_detector import FastRNNDetector
-
         det_model = FastRNNDetector(
             backbone=backbone,
             out_channels=int(out_ch),
@@ -523,12 +497,15 @@ def _build_detector(opt, dev: torch.device, hp: DetectorHParams) -> Tuple[torch.
             nms_thresh=float(hp.fastrnn_nms_thresh),
             topk=int(hp.fastrnn_topk),
         ).to(dev)
-        backbone_module = backbone  # FastRNNDetector uses our backbone directly
+        backbone_module = backbone
+
+    elif hp.head_type == "fasterrcnn":
+        det_model = _build_fasterrcnn_detector(backbone=backbone, num_classes=hp.num_classes, hp=hp).to(dev)
+        backbone_module = det_model.backbone
 
     else:
-        raise ValueError(f"[train_detection] Unknown det_head='{hp.head_type}'. Use fasterrcnn or fastrnn.")
+        raise ValueError(f"[train_detection] Unknown det_head='{hp.head_type}'. Use fastrnn or fasterrcnn.")
 
-    # Freeze backbone if requested
     if hp.freeze_backbone:
         for p in backbone_module.parameters():
             p.requires_grad = False
@@ -537,7 +514,7 @@ def _build_detector(opt, dev: torch.device, hp: DetectorHParams) -> Tuple[torch.
 
 
 # --------------------------------------------------------------------------------------
-# Optim groups (head vs backbone)
+# Optim + sched
 # --------------------------------------------------------------------------------------
 def _build_optimizer(det_model: torch.nn.Module, hp: DetectorHParams) -> torch.optim.Optimizer:
     head_params: List[torch.nn.Parameter] = []
@@ -560,11 +537,61 @@ def _build_optimizer(det_model: torch.nn.Module, hp: DetectorHParams) -> torch.o
     if not param_groups:
         raise RuntimeError("No trainable parameters found (everything frozen?).")
 
-    return torch.optim.AdamW(param_groups, weight_decay=float(hp.det_weight_decay))
+    if hp.det_optimizer == "adamw":
+        return torch.optim.AdamW(param_groups, weight_decay=float(hp.det_weight_decay))
+
+    return torch.optim.SGD(
+        param_groups,
+        lr=float(hp.det_lr_head),
+        momentum=float(hp.det_sgd_momentum),
+        weight_decay=float(hp.det_weight_decay),
+        nesterov=True,
+    )
+
+
+class _WarmupLinearLR:
+    def __init__(self, optimizer: torch.optim.Optimizer, warmup_iters: int, warmup_factor: float):
+        self.optimizer = optimizer
+        self.warmup_iters = max(0, int(warmup_iters))
+        self.warmup_factor = float(warmup_factor)
+        self._it = 0
+        self.base_lrs = [pg.get("lr", 0.0) for pg in optimizer.param_groups]
+
+    def step(self) -> None:
+        if self.warmup_iters <= 0:
+            return
+        self._it += 1
+        if self._it > self.warmup_iters:
+            return
+        alpha = float(self._it) / float(self.warmup_iters)
+        factor = self.warmup_factor + (1.0 - self.warmup_factor) * alpha
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            pg["lr"] = float(base_lr) * float(factor)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"it": int(self._it), "warmup_iters": int(self.warmup_iters), "warmup_factor": float(self.warmup_factor)}
+
+    def load_state_dict(self, d: Dict[str, Any]) -> None:
+        self._it = int(d.get("it", 0))
+        self.warmup_iters = int(d.get("warmup_iters", self.warmup_iters))
+        self.warmup_factor = float(d.get("warmup_factor", self.warmup_factor))
+        if self.warmup_iters > 0 and self._it > 0:
+            alpha = min(1.0, float(self._it) / float(self.warmup_iters))
+            factor = self.warmup_factor + (1.0 - self.warmup_factor) * alpha
+            for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+                pg["lr"] = float(base_lr) * float(factor)
+
+
+def _build_epoch_scheduler(optimizer: torch.optim.Optimizer, hp: DetectorHParams):
+    return torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=max(1, int(hp.det_lr_step_size)),
+        gamma=float(hp.det_lr_gamma),
+    )
 
 
 # --------------------------------------------------------------------------------------
-# Checkpoint IO (compatible with testsFile/detectionUtils.py)
+# Checkpoint IO
 # --------------------------------------------------------------------------------------
 def _save_ckpt(
     path: Path,
@@ -574,6 +601,8 @@ def _save_ckpt(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     hp: DetectorHParams,
+    scheduler: Optional[Any] = None,
+    warmup: Optional[Any] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload: Dict[str, Any] = {
@@ -583,6 +612,8 @@ def _save_ckpt(
         "hparams": asdict(hp),
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "warmup": warmup.state_dict() if warmup is not None else None,
         "time": time.time(),
     }
     if extra:
@@ -601,24 +632,22 @@ def _load_ckpt(path: str, map_location: str = "cpu") -> Dict[str, Any]:
 # Training entry
 # --------------------------------------------------------------------------------------
 def train_detection_transformer(opt, dev: torch.device):
-    """
-    Training only.
-    Evaluation/camera are handled elsewhere in your codebase (testsFile/*).
-    """
     save_dir = Path(opt.save_dir)
     _ensure_dir(save_dir)
 
-    # Data (data.py prints counts filtered in dataset init)
+    # Data
     train_loader, _val_loader, num_classes_dl = build_detection_dataloader(opt)
 
     # HParams
     hp = DetectorHParams.from_opt(opt, num_classes=num_classes_dl)
     _write_hparams_json(save_dir, hp)
+
     print(f"[DET] hparams -> {save_dir / 'hparams_detection.json'}")
     print(
         f"[DET] head={hp.head_type} | num_classes={hp.num_classes} | "
+        f"return_layer={hp.det_sem_return_layer} | "
         f"freeze_backbone={hp.freeze_backbone} | drop_empty={hp.det_drop_empty} | "
-        f"batch_safety={hp.det_filter_batch_safety}"
+        f"batch_safety={hp.det_filter_batch_safety} | optim={hp.det_optimizer}"
     )
     if str(hp.sem_pretrained_path).strip():
         print(
@@ -629,10 +658,12 @@ def train_detection_transformer(opt, dev: torch.device):
     # Model
     det_model, _backbone_module = _build_detector(opt, dev=dev, hp=hp)
 
-    # Optim
+    # Optim + sched
     optimizer = _build_optimizer(det_model, hp)
+    epoch_scheduler = _build_epoch_scheduler(optimizer, hp)
+    warmup = _WarmupLinearLR(optimizer, warmup_iters=int(hp.det_warmup_iters), warmup_factor=float(hp.det_warmup_factor))
 
-    # Resume (optional)
+    # Resume
     start_epoch = 0
     global_step = 0
     det_resume = getattr(opt, "det_resume", "")
@@ -640,11 +671,25 @@ def train_detection_transformer(opt, dev: torch.device):
         ckpt = _load_ckpt(det_resume, map_location="cpu")
         sd = _strip_module_prefix_if_needed(ckpt["model"])
         det_model.load_state_dict(sd, strict=True)
+
         if ckpt.get("optimizer", None) is not None:
             try:
                 optimizer.load_state_dict(ckpt["optimizer"])
             except Exception as e:
                 print(f"[DET] ⚠️ optimizer state not loaded: {e}")
+
+        if ckpt.get("scheduler", None) is not None:
+            try:
+                epoch_scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception as e:
+                print(f"[DET] ⚠️ scheduler state not loaded: {e}")
+
+        if ckpt.get("warmup", None) is not None:
+            try:
+                warmup.load_state_dict(ckpt["warmup"])
+            except Exception as e:
+                print(f"[DET] ⚠️ warmup state not loaded: {e}")
+
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         global_step = int(ckpt.get("global_step", 0))
         print(f"[DET] resumed from {det_resume} (start_epoch={start_epoch}, global_step={global_step})")
@@ -658,16 +703,16 @@ def train_detection_transformer(opt, dev: torch.device):
         except Exception:
             pass
 
-    # Training loop
-    total_ignored_batches = 0          # batches entirely skipped due to empty targets after filtering
-    total_ignored_samples = 0          # samples removed by safety filter during training
+    # Stats
+    total_ignored_batches = 0
+    total_ignored_samples = 0
     total_seen_samples = 0
 
     det_model.train()
     for epoch in range(start_epoch, int(hp.det_epochs)):
         det_model.train()
         total_loss = 0.0
-        n_batches = 0
+        n_steps = 0
 
         pbar = tqdm(
             train_loader,
@@ -677,76 +722,57 @@ def train_detection_transformer(opt, dev: torch.device):
         )
 
         for imgs, targets in pbar:
-            total_seen_samples += int(imgs.shape[0])
+            B = int(len(imgs)) if isinstance(imgs, list) else int(imgs.shape[0])
+            total_seen_samples += B
+
+            imgs_list, targets_list = _to_device_images_targets(imgs, targets, dev)
+
+            if hp.det_filter_batch_safety:
+                imgs_list, targets_list, st = _filter_empty_targets(
+                    imgs_list, targets_list, debug=bool(getattr(opt, "debug_detection", False))
+                )
+                total_ignored_samples += int(st["ignored"])
+                if st["used"] == 0:
+                    total_ignored_batches += 1
+                    continue
 
             optimizer.zero_grad(set_to_none=True)
 
-            if hp.head_type == "fasterrcnn":
-                # FasterRCNN expects list[Tensor] and list[Dict]
-                if hp.det_filter_batch_safety:
-                    valid_imgs, valid_tgts, st = _filter_empty_targets_batch(
-                        images=imgs,
-                        targets=targets,
-                        dev=dev,
-                        debug=bool(getattr(opt, "debug_detection", False)),
-                    )
-                    total_ignored_samples += int(st["ignored"])
-                    if st["used"] == 0:
-                        total_ignored_batches += 1
-                        continue
-                    imgs_list = valid_imgs
-                    targets_list = valid_tgts
-                else:
-                    imgs = imgs.to(dev)
-                    imgs_list = [im for im in imgs]
-                    targets_list = [{k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
-
-                loss_dict = det_model(imgs_list, targets_list)
-                loss = sum(loss_dict.values())
-
-            elif hp.head_type == "fastrnn":
-                if hp.det_filter_batch_safety:
-                    valid_imgs, valid_tgts, st = _filter_empty_targets_batch(
-                        images=imgs,
-                        targets=targets,
-                        dev=dev,
-                        debug=bool(getattr(opt, "debug_detection", False)),
-                    )
-                    total_ignored_samples += int(st["ignored"])
-                    if st["used"] == 0:
-                        total_ignored_batches += 1
-                        continue
-                    loss_dict = det_model(valid_imgs, valid_tgts)
-                else:
-                    imgs = imgs.to(dev)
-                    targets_list = [{k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
-                    loss_dict = det_model([im for im in imgs], targets_list)
-
-                loss = sum(loss_dict.values())
-
-            else:
-                raise ValueError(f"Unexpected head_type={hp.head_type}")
+            # main_moco-like: direct call with list inputs
+            loss_dict = det_model(imgs_list, targets_list)
+            loss = sum(loss_dict.values())
 
             loss.backward()
+
             if float(hp.det_grad_clip) > 0:
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in det_model.parameters() if p.requires_grad],
                     max_norm=float(hp.det_grad_clip),
                 )
+
             optimizer.step()
+            warmup.step()
 
             total_loss += float(loss.item())
-            n_batches += 1
+            n_steps += 1
             global_step += 1
-            pbar.set_postfix(loss=f"{total_loss / max(1, n_batches):.4f}")
 
-        train_loss = total_loss / max(1, n_batches)
+            cur_lrs = [pg.get("lr", 0.0) for pg in optimizer.param_groups]
+            mean_lr = float(sum(cur_lrs) / max(1, len(cur_lrs)))
+            pbar.set_postfix(loss=f"{total_loss / max(1, n_steps):.4f}", lr=f"{mean_lr:.2e}")
+
+        train_loss = total_loss / max(1, n_steps)
+
+        try:
+            epoch_scheduler.step()
+        except Exception as e:
+            print(f"[DET] ⚠️ scheduler.step failed: {e}")
+
         print(
             f"[DET] epoch {epoch+1}/{hp.det_epochs} | train_loss={train_loss:.4f} | "
             f"ignored_samples_total={total_ignored_samples} | ignored_batches_total={total_ignored_batches}"
         )
 
-        # Save last
         _save_ckpt(
             save_dir / "detector_last.pth",
             epoch=epoch,
@@ -754,6 +780,8 @@ def train_detection_transformer(opt, dev: torch.device):
             model=det_model,
             optimizer=optimizer,
             hp=hp,
+            scheduler=epoch_scheduler,
+            warmup=warmup,
             extra={
                 "train_loss": float(train_loss),
                 "ignored_samples_total": int(total_ignored_samples),
@@ -762,7 +790,6 @@ def train_detection_transformer(opt, dev: torch.device):
             },
         )
 
-        # Save periodic
         if save_freq_mode == "epoch" and save_freq_interval is not None and ((epoch + 1) % int(save_freq_interval) == 0):
             _save_ckpt(
                 save_dir / f"detector_epoch_{epoch+1:04d}.pth",
@@ -771,6 +798,8 @@ def train_detection_transformer(opt, dev: torch.device):
                 model=det_model,
                 optimizer=optimizer,
                 hp=hp,
+                scheduler=epoch_scheduler,
+                warmup=warmup,
                 extra={
                     "train_loss": float(train_loss),
                     "ignored_samples_total": int(total_ignored_samples),
@@ -779,7 +808,6 @@ def train_detection_transformer(opt, dev: torch.device):
                 },
             )
 
-        # Tiny json log (optional)
         (save_dir / "det_train_log.json").write_text(
             json.dumps(
                 {
