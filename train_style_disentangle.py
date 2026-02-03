@@ -521,6 +521,7 @@ def train_alternating(opt):
             m=float(getattr(opt, "sem_m", 0.999)),
             T=float(getattr(opt, "sem_t", 0.2)),
             pretrained=bool(int(getattr(opt, "sem_pretrained", 1)) != 0),
+            backbone_arch=str(getattr(opt, "sem_backbone", "resnet50")),
             pretrained_path=sem_pretrained_path,
             pretrained_strict=sem_pretrained_strict,
             pretrained_verbose=sem_pretrained_verbose,
@@ -1007,15 +1008,20 @@ def train_alternating(opt):
                         _tb_add_scalars(writer, scalars, step, prefix="train/")
                         _tb_maybe_flush(writer, every_steps=int(getattr(opt, "tb_flush", tb_freq)), step=step)
 
-                    # ✅ Checkpoint: décision centralisée (PAS de "final" dans la boucle step)
-                    do_save, reason = should_save_ckpt(
-                        save_mode=save_freq_mode,
-                        interval=save_freq_interval,
-                        step=step,
-                        epoch=epoch,
-                        epochs_total=epochs_total,
-                        final_save=False,
-                    )
+                    # ✅ Checkpoint: en mode "step", on sauvegarde au fil de l'entraînement.
+                    # En mode "epoch", la sauvegarde est faite une seule fois en fin d'époque (voir plus bas).
+                    if save_freq_mode == "step":
+                        do_save, reason = should_save_ckpt(
+                            save_mode=save_freq_mode,
+                            interval=save_freq_interval,
+                            step=step,
+                            epoch=epoch,
+                            epochs_total=epochs_total,
+                            final_save=False,
+                        )
+                    else:
+                        do_save, reason = (False, "")
+
                     if do_save:
                         save_checkpoint(
                             epoch,

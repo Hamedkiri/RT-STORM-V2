@@ -247,11 +247,16 @@ class DetectorHParams:
     # Core
     head_type: str = "fastrnn"         # "fastrnn" | "fasterrcnn"
     num_classes: int = 81              # inclut background = 0
-    feat_source: str = "sem_resnet50"
+    # Older ckpts may store feat_source="sem_resnet50".
+    # Newer code uses feat_source="sem_resnet" and selects depth via det_sem_backbone.
+    feat_source: str = "sem_resnet"
     freeze_backbone: bool = True
     img_h: int = 256
     img_w: int = 256
     sem_pretrained: bool = True
+
+    # ✅ ResNet semantic backbone depth (resnet50/resnet101/resnet152)
+    det_sem_backbone: str = "resnet50"
 
     det_sem_return_layer: str = "layer4"
 
@@ -291,26 +296,51 @@ class DetectorHParams:
 # ---------------------------------------------------------------------
 # Backbone builders
 # ---------------------------------------------------------------------
-def _build_sem_resnet50_backbone(
+def _build_sem_resnet_backbone(
     *,
+    arch: str,
     pretrained: bool,
     return_layer: str = "layer4",
 ) -> Tuple[torch.nn.Module, int]:
-    """
-    Backbone torchvision ResNet50 -> IntermediateLayerGetter -> {"0": feat}
-    Keys du state_dict: backbone.body.* (compatible torchvision detection).
+    """Build a torchvision ResNet backbone (50/101/152) for detection.
+
+    Why this exists:
+      - The detector checkpoints contain the semantic backbone weights.
+      - When you trained with ResNet-101/152, you MUST rebuild the same
+        backbone architecture at test-time, otherwise state_dict loading fails.
+
+    Returns an IntermediateLayerGetter with output key "0".
     """
     import torchvision
     from torchvision.models._utils import IntermediateLayerGetter
 
-    weights = None
-    if pretrained:
-        try:
-            weights = torchvision.models.ResNet50_Weights.DEFAULT
-        except Exception:
-            weights = None
-
-    m = torchvision.models.resnet50(weights=weights)
+    arch = str(arch).lower().strip().replace("_", "-")
+    if arch in ("resnet50", "resnet-50"):
+        weights = None
+        if pretrained:
+            try:
+                weights = torchvision.models.ResNet50_Weights.DEFAULT
+            except Exception:
+                weights = None
+        m = torchvision.models.resnet50(weights=weights)
+    elif arch in ("resnet101", "resnet-101"):
+        weights = None
+        if pretrained:
+            try:
+                weights = torchvision.models.ResNet101_Weights.DEFAULT
+            except Exception:
+                weights = None
+        m = torchvision.models.resnet101(weights=weights)
+    elif arch in ("resnet152", "resnet-152"):
+        weights = None
+        if pretrained:
+            try:
+                weights = torchvision.models.ResNet152_Weights.DEFAULT
+            except Exception:
+                weights = None
+        m = torchvision.models.resnet152(weights=weights)
+    else:
+        raise ValueError("arch must be one of: resnet50, resnet101, resnet152")
 
     layer_to_c = {"layer1": 256, "layer2": 512, "layer3": 1024, "layer4": 2048}
     if return_layer not in layer_to_c:
@@ -451,13 +481,17 @@ def build_detector_from_checkpoint(
 
     # ---- build backbone ----
     feat_source = str(hp.feat_source).lower().strip()
-    if feat_source == "sem_resnet50":
-        backbone, out_ch = _build_sem_resnet50_backbone(
+    if feat_source in ("sem_resnet", "sem_resnet50"):
+        backbone, out_ch = _build_sem_resnet_backbone(
+            arch=str(getattr(hp, "det_sem_backbone", "resnet50")),
             pretrained=bool(hp.sem_pretrained),
             return_layer=str(hp.det_sem_return_layer),
         )
     else:
-        raise ValueError(f"[detection_utils] Unsupported feat_source='{hp.feat_source}' (only sem_resnet50).")
+        raise ValueError(
+            f"[detection_utils] Unsupported feat_source='{hp.feat_source}'. "
+            "Expected 'sem_resnet' (new) or 'sem_resnet50' (legacy)."
+        )
 
     if hp.freeze_backbone:
         for p in backbone.parameters():

@@ -350,6 +350,14 @@ def get_opts():
         help="Couche ResNet sémantique fournie au head (si sem_resnet50).",
     )
 
+    p.add_argument(
+        "--det_sem_backbone",
+        type=str,
+        default="resnet50",
+        choices=["resnet50", "resnet101", "resnet152"],
+        help="Backbone sémantique pour la détection: resnet50|resnet101|resnet152 (défaut: resnet50).",
+    )
+
     # Freeze
     p.add_argument(
         "--det_freeze_backbone",
@@ -510,8 +518,20 @@ def get_opts():
         choices=["epoch", "step"],
         help="Appliquer le scheduler SEM par epoch (par défaut, plus stable)."
     )
+    p.add_argument(
+        "--sem_backbone",
+        type=str,
+        default="resnet50",
+        choices=["resnet50", "resnet101", "resnet152"],
+        help="Backbone sémantique/contenu pour SSL: resnet50|resnet101|resnet152 (défaut: resnet50).",
+    )
 
-    p.add_argument("--sem_pretrained", type=int, default=1, help="1: ResNet50 ImageNet pré-entraîné.")
+    p.add_argument(
+        "--sem_pretrained",
+        type=int,
+        default=1,
+        help="(0/1) utiliser un backbone ImageNet pré-entraîné (sur --sem_backbone).",
+    )
     p.add_argument("--sem_dim", type=int, default=256, help="Dim embedding global MoCo.")
     p.add_argument("--sem_tok_dim", type=int, default=256, help="Dim tokens sémantiques (JEPA-content).")
     p.add_argument("--sem_queue", type=int, default=65536, help="Taille queue MoCo.")

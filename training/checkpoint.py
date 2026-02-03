@@ -510,17 +510,36 @@ def save_checkpoint(
         _atomic_save_torch(D_B.state_dict(), out_dir / f"D_B_epoch{epoch}.pt", safe_write=safe_write)
 
     # --- 1b) Branche sémantique (optionnelle)
+    # ✅ On sauvegarde aussi des métadonnées (arch/return_layer/...) pour pouvoir
+    #    reconstruire le même backbone au moment des tests / fine-tuning.
     if sem_model is not None:
         try:
+            meta: Dict[str, Any] = {}
+            try:
+                bb = getattr(sem_model, "backbone", None)
+                if bb is not None:
+                    meta["backbone_arch"] = str(getattr(bb, "arch", ""))
+                    meta["return_layer"] = str(getattr(bb, "return_layer", ""))
+                meta["embed_dim"] = int(getattr(sem_model, "embed_dim", 0) or 0)
+            except Exception:
+                pass
+
             if use_safetensors:
+                # safetensors ne stocke que des tenseurs -> meta à côté en JSON
                 _atomic_save_safetensors(
                     sem_model.state_dict(),
                     out_dir / f"{sem_filename}_epoch{epoch}.safetensors",
                     safe_write=safe_write,
                 )
+                try:
+                    (out_dir / f"{sem_filename}_epoch{epoch}.meta.json").write_text(
+                        json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
+                    )
+                except Exception:
+                    pass
             else:
                 _atomic_save_torch(
-                    sem_model.state_dict(),
+                    {"state_dict": sem_model.state_dict(), "meta": meta},
                     out_dir / f"{sem_filename}_epoch{epoch}.pt",
                     safe_write=safe_write,
                 )

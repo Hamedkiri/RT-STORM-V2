@@ -170,7 +170,7 @@ def _filter_empty_targets(
 # --------------------------------------------------------------------------------------
 # ✅ Robust loader for SSL ResNet50 backbone checkpoints (keeps strict=True possible)
 # --------------------------------------------------------------------------------------
-def _load_resnet50_backbone_weights(
+def _load_resnet_backbone_weights(
     *,
     resnet: torch.nn.Module,
     ckpt_path: str,
@@ -274,6 +274,11 @@ def _load_resnet50_backbone_weights(
                 print(f"  - {k}: ckpt{s_src} != model{s_tgt}")
 
 
+# Backward-compat alias
+def _load_resnet50_backbone_weights(*args, **kwargs):
+    return _load_resnet_backbone_weights(*args, **kwargs)
+
+
 # --------------------------------------------------------------------------------------
 # HParams
 # --------------------------------------------------------------------------------------
@@ -286,6 +291,7 @@ class DetectorHParams:
     freeze_backbone: bool = False
     sem_pretrained: bool = True
     det_sem_return_layer: str = "layer4"  # ✅ DEFAULT (mêmes couches par défaut)
+    det_sem_backbone: str = "resnet50"    # ✅ resnet50|resnet101|resnet152
 
     # SSL-pretrained backbone checkpoint (optional)
     sem_pretrained_path: str = ""
@@ -353,6 +359,7 @@ class DetectorHParams:
 
         # ✅ IMPORTANT: default return layer = layer4
         hp.det_sem_return_layer = str(getattr(opt, "det_sem_return_layer", "layer4")).lower().strip()
+        hp.det_sem_backbone = str(getattr(opt, "det_sem_backbone", "resnet50")).lower().strip()
 
         hp.sem_pretrained_path = str(getattr(opt, "sem_pretrained_path", "") or "")
         hp.sem_pretrained_strict = bool(int(getattr(opt, "sem_pretrained_strict", 0)))
@@ -397,9 +404,10 @@ def _write_hparams_json(save_dir: Path, hp: DetectorHParams) -> Path:
 # --------------------------------------------------------------------------------------
 # Backbone / detector builders
 # --------------------------------------------------------------------------------------
-def _build_sem_resnet50_backbone(
+def _build_sem_resnet_backbone(
     *,
     pretrained: bool,
+    arch: str = "resnet50",
     return_layer: str = "layer4",
     pretrained_path: str = "",
     strict: bool = False,
@@ -407,18 +415,27 @@ def _build_sem_resnet50_backbone(
 ) -> Tuple[torch.nn.Module, int]:
     import torchvision
     from torchvision.models._utils import IntermediateLayerGetter
+    arch = str(arch).lower().strip()
+    if arch not in ("resnet50", "resnet101", "resnet152"):
+        raise ValueError(f"det_sem_backbone must be one of resnet50/resnet101/resnet152, got {arch}")
 
     weights = None
     if pretrained and not str(pretrained_path).strip():
         try:
-            weights = torchvision.models.ResNet50_Weights.DEFAULT
+            if arch == "resnet50":
+                weights = torchvision.models.ResNet50_Weights.DEFAULT
+            elif arch == "resnet101":
+                weights = torchvision.models.ResNet101_Weights.DEFAULT
+            else:
+                weights = torchvision.models.ResNet152_Weights.DEFAULT
         except Exception:
             weights = None
 
-    m = torchvision.models.resnet50(weights=weights)
+    fn = getattr(torchvision.models, arch)
+    m = fn(weights=weights)
 
     if str(pretrained_path).strip():
-        _load_resnet50_backbone_weights(
+        _load_resnet_backbone_weights(
             resnet=m,
             ckpt_path=str(pretrained_path),
             device=torch.device("cpu"),
@@ -472,8 +489,9 @@ def _build_detector(opt, dev: torch.device, hp: DetectorHParams) -> Tuple[torch.
     if hp.feat_source != "sem_resnet50":
         raise ValueError(f"[train_detection] Unsupported det_feat_source='{hp.feat_source}'. Use sem_resnet50.")
 
-    backbone, out_ch = _build_sem_resnet50_backbone(
+    backbone, out_ch = _build_sem_resnet_backbone(
         pretrained=bool(hp.sem_pretrained),
+        arch=str(hp.det_sem_backbone),
         return_layer=str(hp.det_sem_return_layer),
         pretrained_path=str(hp.sem_pretrained_path),
         strict=bool(hp.sem_pretrained_strict),
@@ -638,13 +656,36 @@ def train_detection_transformer(opt, dev: torch.device):
     # Data
     train_loader, _val_loader, num_classes_dl = build_detection_dataloader(opt)
 
-    # HParams
+    # HParams (possibly overridden by checkpoint)
     hp = DetectorHParams.from_opt(opt, num_classes=num_classes_dl)
+
+    # Resume (⚠️ we must read ckpt *before* building the model to rebuild the correct ResNet depth)
+    start_epoch = 0
+    global_step = 0
+    det_resume = getattr(opt, "det_resume", "")
+    ckpt: Optional[Dict[str, Any]] = None
+    if isinstance(det_resume, str) and det_resume.strip():
+        ckpt = _load_ckpt(det_resume, map_location="cpu")
+        # If checkpoint contains hparams, trust them to rebuild the same architecture
+        hpd = ckpt.get("hparams", None)
+        if isinstance(hpd, dict):
+            for k, v in hpd.items():
+                if hasattr(hp, k):
+                    try:
+                        setattr(hp, k, v)
+                    except Exception:
+                        pass
+
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        global_step = int(ckpt.get("global_step", 0))
+
+    # Save hparams (final)
     _write_hparams_json(save_dir, hp)
 
     print(f"[DET] hparams -> {save_dir / 'hparams_detection.json'}")
     print(
         f"[DET] head={hp.head_type} | num_classes={hp.num_classes} | "
+        f"sem_backbone={getattr(hp, 'det_sem_backbone', 'resnet50')} | "
         f"return_layer={hp.det_sem_return_layer} | "
         f"freeze_backbone={hp.freeze_backbone} | drop_empty={hp.det_drop_empty} | "
         f"batch_safety={hp.det_filter_batch_safety} | optim={hp.det_optimizer}"
@@ -661,14 +702,14 @@ def train_detection_transformer(opt, dev: torch.device):
     # Optim + sched
     optimizer = _build_optimizer(det_model, hp)
     epoch_scheduler = _build_epoch_scheduler(optimizer, hp)
-    warmup = _WarmupLinearLR(optimizer, warmup_iters=int(hp.det_warmup_iters), warmup_factor=float(hp.det_warmup_factor))
+    warmup = _WarmupLinearLR(
+        optimizer,
+        warmup_iters=int(hp.det_warmup_iters),
+        warmup_factor=float(hp.det_warmup_factor),
+    )
 
-    # Resume
-    start_epoch = 0
-    global_step = 0
-    det_resume = getattr(opt, "det_resume", "")
-    if isinstance(det_resume, str) and det_resume.strip():
-        ckpt = _load_ckpt(det_resume, map_location="cpu")
+    # Load states if resuming
+    if ckpt is not None:
         sd = _strip_module_prefix_if_needed(ckpt["model"])
         det_model.load_state_dict(sd, strict=True)
 
@@ -690,8 +731,6 @@ def train_detection_transformer(opt, dev: torch.device):
             except Exception as e:
                 print(f"[DET] ⚠️ warmup state not loaded: {e}")
 
-        start_epoch = int(ckpt.get("epoch", -1)) + 1
-        global_step = int(ckpt.get("global_step", 0))
         print(f"[DET] resumed from {det_resume} (start_epoch={start_epoch}, global_step={global_step})")
 
     # Save frequency

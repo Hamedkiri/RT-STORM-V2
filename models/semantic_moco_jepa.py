@@ -184,20 +184,42 @@ def _remap_resnet_keys_to_wrapper(sd: Dict[str, torch.Tensor]) -> Dict[str, torc
 
 # -------------------------- backbone --------------------------
 
-class ResNet50Backbone(nn.Module):
-    """ResNet50 trunk up to layer4, outputs a spatial feature map."""
-    def __init__(self, pretrained: bool = True):
+class ResNetBackbone(nn.Module):
+    """ResNet{50,101,152} trunk up to layer4, outputs a spatial feature map.
+
+    Note: All three have the same channel dimension at layer4 (2048).
+    """
+
+    def __init__(self, arch: str = "resnet50", pretrained: bool = True):
         super().__init__()
+        arch = str(arch).lower().strip()
+        if arch not in ("resnet50", "resnet101", "resnet152"):
+            raise ValueError(f"Unsupported sem_backbone='{arch}'. Use resnet50|resnet101|resnet152.")
+
+        # Select torchvision weights enum if available
         weights = None
         if pretrained:
             try:
-                weights = tvm.ResNet50_Weights.IMAGENET1K_V2
+                if arch == "resnet50":
+                    weights = tvm.ResNet50_Weights.IMAGENET1K_V2
+                elif arch == "resnet101":
+                    weights = tvm.ResNet101_Weights.IMAGENET1K_V2
+                else:
+                    weights = tvm.ResNet152_Weights.IMAGENET1K_V2
             except Exception:
                 try:
-                    weights = tvm.ResNet50_Weights.DEFAULT
+                    if arch == "resnet50":
+                        weights = tvm.ResNet50_Weights.DEFAULT
+                    elif arch == "resnet101":
+                        weights = tvm.ResNet101_Weights.DEFAULT
+                    else:
+                        weights = tvm.ResNet152_Weights.DEFAULT
                 except Exception:
                     weights = None
-        m = tvm.resnet50(weights=weights)
+
+        ctor = getattr(tvm, arch)
+        m = ctor(weights=weights)
+
         self.stem = nn.Sequential(m.conv1, m.bn1, m.relu, m.maxpool)
         self.layer1 = m.layer1
         self.layer2 = m.layer2
@@ -212,6 +234,12 @@ class ResNet50Backbone(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)  # (B,2048,H/32,W/32)
         return x
+
+
+# Backward-compatible alias (some old checkpoints/scripts may still reference the name)
+class ResNet50Backbone(ResNetBackbone):
+    def __init__(self, pretrained: bool = True):
+        super().__init__(arch="resnet50", pretrained=pretrained)
 
 
 class MLP(nn.Module):
@@ -244,6 +272,7 @@ class SemanticMoCoJEPA(nn.Module):
         m: float = 0.999,
         T: float = 0.2,
         pretrained: bool = True,
+        backbone_arch: str = "resnet50",
         aug_cfg: Optional[SemAugConfig] = None,
         img_size: int = 256,
         # external pretrained weights
@@ -264,12 +293,13 @@ class SemanticMoCoJEPA(nn.Module):
         self.K = int(queue_size)
         self.m = float(m)
         self.T = float(T)
+        self.backbone_arch = str(backbone_arch).lower().strip()
 
         self.augmenter = _BatchAugmenter(aug_cfg or SemAugConfig(use_aug=False))
 
         # Encoders
-        self.backbone_q = ResNet50Backbone(pretrained=pretrained)
-        self.backbone_k = ResNet50Backbone(pretrained=pretrained)
+        self.backbone_q = ResNetBackbone(arch=str(backbone_arch).lower().strip(), pretrained=pretrained)
+        self.backbone_k = ResNetBackbone(arch=str(backbone_arch).lower().strip(), pretrained=pretrained)
 
         # Token projections (1x1 conv) + global projection for MoCo
         self.tok_proj_q = nn.Conv2d(self.backbone_q.out_channels, self.tok_dim, kernel_size=1, bias=False)
