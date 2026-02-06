@@ -259,6 +259,11 @@ class DetectorHParams:
     det_sem_backbone: str = "resnet50"
 
     det_sem_return_layer: str = "layer4"
+    # Optional SSL-pretrained semantic backbone checkpoint (MoCo/JEPA/etc.)
+    sem_pretrained_path: str = ""
+    sem_pretrained_strict: bool = False
+    sem_pretrained_verbose: bool = True
+
 
     # FastRNN params
     fastrnn_hidden: int = 256
@@ -296,55 +301,183 @@ class DetectorHParams:
 # ---------------------------------------------------------------------
 # Backbone builders
 # ---------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
+# Robust SSL backbone loader (MoCo/JEPA-style) for torchvision ResNet{50,101,152}
+# --------------------------------------------------------------------------------------
+def _load_resnet_backbone_weights(
+    *,
+    resnet: torch.nn.Module,
+    ckpt_path: str,
+    device: torch.device = torch.device("cpu"),
+    strict: bool = True,
+    verbose: bool = True,
+) -> None:
+    """
+    Load SSL/MoCo-style backbone weights into a torchvision ResNet (50/101/152).
+
+    Supports checkpoints where backbone weights are under keys like:
+      - state_dict / model / backbone / encoder / net (auto-detected)
+    And parameter prefixes like:
+      - module.
+      - base_encoder. / backbone_q. / encoder_q. / backbone. / encoder.
+
+    Also remaps timm-like 'stem.0.*' -> 'conv1.*' and 'stem.1.*' -> 'bn1.*'.
+    Drops classification head keys (fc.*, head.*, classifier.*).
+
+    To keep strict=True possible:
+      - start from the model's full state_dict and overwrite only matching keys.
+    """
+    import os
+
+    if not ckpt_path or str(ckpt_path).strip() == "":
+        raise ValueError("ckpt_path is empty")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # 1) Extract raw state dict
+    state = None
+    if isinstance(ckpt, dict):
+        for k in ["state_dict", "model", "model_state", "net", "encoder", "backbone"]:
+            if k in ckpt and isinstance(ckpt[k], dict):
+                state = ckpt[k]
+                break
+        if state is None:
+            state = ckpt
+    else:
+        raise RuntimeError(f"Unsupported checkpoint type: {type(ckpt)}")
+
+    # 2) Strip DDP "module." repeatedly
+    def strip_prefix(sd: dict, pref: str) -> dict:
+        fixed = {}
+        for k, v in sd.items():
+            if k.startswith(pref):
+                fixed[k[len(pref):]] = v
+            else:
+                fixed[k] = v
+        return fixed
+
+    for _ in range(3):
+        if any(k.startswith("module.") for k in state.keys()):
+            state = strip_prefix(state, "module.")
+
+    # 3) Remap keys
+    def remap_key(k: str) -> str:
+        prefixes = [
+            "base_encoder.", "backbone_q.", "encoder_q.", "encoder.", "backbone.",
+            "model.", "net.",
+        ]
+        for p in prefixes:
+            if k.startswith(p):
+                k = k[len(p):]
+                break
+
+        if k.startswith("stem.0."):
+            k = "conv1." + k[len("stem.0."):]
+        elif k.startswith("stem.1."):
+            k = "bn1." + k[len("stem.1."):]
+        # drop heads
+        if k.startswith("fc.") or k.startswith("head.") or k.startswith("classifier."):
+            k = "__DROP__." + k
+        return k
+
+    remapped: Dict[str, Any] = {}
+    for k, v in state.items():
+        rk = remap_key(k)
+        if rk.startswith("__DROP__."):
+            continue
+        remapped[rk] = v
+
+    # 4) Full target state dict then overwrite matches
+    target_sd = resnet.state_dict()
+    target_keys = set(target_sd.keys())
+
+    loaded_keys: List[str] = []
+    shape_mismatch: List[Tuple[str, Tuple[int, ...], Tuple[int, ...]]] = []
+
+    for k, v in remapped.items():
+        if k not in target_keys:
+            continue
+        if not torch.is_tensor(v):
+            continue
+        if target_sd[k].shape != v.shape:
+            shape_mismatch.append((k, tuple(v.shape), tuple(target_sd[k].shape)))
+            continue
+        target_sd[k] = v
+        loaded_keys.append(k)
+
+    resnet.load_state_dict(target_sd, strict=bool(strict))
+
+    if verbose:
+        print(f"[DET][SEM] Loaded backbone ckpt: {ckpt_path}")
+        print(f"[DET][SEM] strict={strict} | loaded_backbone_keys={len(loaded_keys)}")
+        if loaded_keys:
+            print(f"[DET][SEM] example loaded keys: {loaded_keys[:8]}")
+        if shape_mismatch:
+            print(f"[DET][SEM] ⚠️ shape mismatches skipped: {len(shape_mismatch)}")
+            for k, s_src, s_tgt in shape_mismatch[:10]:
+                print(f"  - {k}: ckpt{s_src} != model{s_tgt}")
+
 def _build_sem_resnet_backbone(
     *,
-    arch: str,
     pretrained: bool,
-    return_layer: str = "layer4",
+    arch: str,
+    return_layer: str,
+    pretrained_path: str = "",
+    strict: bool = False,
+    verbose: bool = True,
 ) -> Tuple[torch.nn.Module, int]:
-    """Build a torchvision ResNet backbone (50/101/152) for detection.
+    """
+    Build semantic ResNet backbone (50/101/152) and return an IntermediateLayerGetter
+    exposing {return_layer: "0"} with attribute .out_channels.
 
-    Why this exists:
-      - The detector checkpoints contain the semantic backbone weights.
-      - When you trained with ResNet-101/152, you MUST rebuild the same
-        backbone architecture at test-time, otherwise state_dict loading fails.
+    If `pretrained_path` is provided, loads SSL weights (MoCo/JEPA-style) with
+    `_load_resnet_backbone_weights`, optionally with strict=True.
 
-    Returns an IntermediateLayerGetter with output key "0".
+    Otherwise, uses torchvision supervised weights when `pretrained=True`.
     """
     import torchvision
     from torchvision.models._utils import IntermediateLayerGetter
 
-    arch = str(arch).lower().strip().replace("_", "-")
-    if arch in ("resnet50", "resnet-50"):
-        weights = None
-        if pretrained:
-            try:
-                weights = torchvision.models.ResNet50_Weights.DEFAULT
-            except Exception:
-                weights = None
-        m = torchvision.models.resnet50(weights=weights)
-    elif arch in ("resnet101", "resnet-101"):
-        weights = None
-        if pretrained:
-            try:
-                weights = torchvision.models.ResNet101_Weights.DEFAULT
-            except Exception:
-                weights = None
-        m = torchvision.models.resnet101(weights=weights)
-    elif arch in ("resnet152", "resnet-152"):
-        weights = None
-        if pretrained:
-            try:
-                weights = torchvision.models.ResNet152_Weights.DEFAULT
-            except Exception:
-                weights = None
-        m = torchvision.models.resnet152(weights=weights)
-    else:
-        raise ValueError("arch must be one of: resnet50, resnet101, resnet152")
+    arch = str(arch).lower().strip()
+    if arch not in {"resnet50", "resnet101", "resnet152"}:
+        raise ValueError(f"det_sem_backbone must be one of {{resnet50,resnet101,resnet152}}, got {arch}")
 
-    layer_to_c = {"layer1": 256, "layer2": 512, "layer3": 1024, "layer4": 2048}
+    # torchvision supervised weights (optional)
+    weights = None
+    if pretrained and not str(pretrained_path).strip():
+        try:
+            if arch == "resnet50":
+                weights = torchvision.models.ResNet50_Weights.DEFAULT
+            elif arch == "resnet101":
+                weights = torchvision.models.ResNet101_Weights.DEFAULT
+            else:
+                weights = torchvision.models.ResNet152_Weights.DEFAULT
+        except Exception:
+            weights = None
+
+    if arch == "resnet50":
+        m = torchvision.models.resnet50(weights=weights)
+    elif arch == "resnet101":
+        m = torchvision.models.resnet101(weights=weights)
+    else:
+        m = torchvision.models.resnet152(weights=weights)
+
+    # SSL backbone override
+    if str(pretrained_path).strip():
+        _load_resnet_backbone_weights(
+            resnet=m,
+            ckpt_path=str(pretrained_path),
+            device=torch.device("cpu"),
+            strict=bool(strict),
+            verbose=bool(verbose),
+        )
+
+    layer_to_c = {"layer2": 512, "layer3": 1024, "layer4": 2048}
     if return_layer not in layer_to_c:
-        raise ValueError(f"return_layer must be one of {list(layer_to_c.keys())}, got {return_layer}")
+        raise ValueError(f"det_sem_return_layer must be one of {list(layer_to_c.keys())}, got {return_layer}")
 
     out_channels = layer_to_c[return_layer]
     backbone = IntermediateLayerGetter(m, return_layers={return_layer: "0"})

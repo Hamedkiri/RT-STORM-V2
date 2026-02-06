@@ -6,3 +6,6 @@
 /runs
 /Cancer_images
 /isic-2024-challenge-ST-STORM
+/EvalResNet101
+SemMoCo_epoch43.pt
+/EvalResNet50

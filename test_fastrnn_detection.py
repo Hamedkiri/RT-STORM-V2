@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 import torchvision.transforms as T
 from torchvision.datasets import CocoDetection
 
-from testsFile.detectionUtils import (
+from tests.detection_utils import (
     build_detector_from_checkpoint,
     evaluate_coco_map,
     infer_batch,
@@ -301,18 +301,28 @@ def write_json_summary(
     return out_path
 
 
-def _make_temp_hparams_with_head_override(
+def _make_temp_hparams_overrides(
     *,
     original_hparams_json: Optional[str],
-    head: str,
     save_dir: Path,
+    head: Optional[str] = None,
+    det_sem_backbone: Optional[str] = None,
+    sem_pretrained_path: Optional[str] = None,
+    sem_pretrained_strict: Optional[bool] = None,
+    sem_pretrained_verbose: Optional[bool] = None,
 ) -> Optional[str]:
-    head = str(head).lower().strip()
-    if head not in {"fastrnn", "fasterrcnn"}:
-        raise ValueError(f"--head must be in {{fastrnn,fasterrcnn}}, got {head}")
-
+    """
+    Create a temporary hparams JSON that overrides selected fields.
+    This lets you evaluate / finetune with a different semantic backbone than the one
+    stored in the checkpoint, while keeping the rest unchanged.
+    """
     save_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = save_dir / f"_tmp_hparams_override_head_{head}.json"
+    suffix_parts: List[str] = []
+    if head is not None:
+        suffix_parts.append(f"head-{str(head).lower().strip()}")
+    if det_sem_backbone is not None:
+        suffix_parts.append(f"bb-{str(det_sem_backbone).lower().strip()}")
+    tmp_path = save_dir / f"_tmp_hparams_override_{'_'.join(suffix_parts) if suffix_parts else 'custom'}.json"
 
     base: Dict[str, Any] = {}
     if original_hparams_json is not None:
@@ -323,7 +333,26 @@ def _make_temp_hparams_with_head_override(
             if isinstance(obj, dict):
                 base = obj
 
-    base["head_type"] = head
+    if head is not None:
+        h = str(head).lower().strip()
+        if h not in {"fastrnn", "fasterrcnn"}:
+            raise ValueError(f"--head must be in {{fastrnn,fasterrcnn}}, got {h}")
+        base["head_type"] = h
+
+    if det_sem_backbone is not None:
+        bb = str(det_sem_backbone).lower().strip()
+        if bb not in {"resnet50", "resnet101", "resnet152"}:
+            raise ValueError(f"--det_sem_backbone must be in {{resnet50,resnet101,resnet152}}, got {bb}")
+        base["det_sem_backbone"] = bb
+
+    if sem_pretrained_path is not None and str(sem_pretrained_path).strip() != "":
+        base["sem_pretrained_path"] = str(sem_pretrained_path)
+
+    if sem_pretrained_strict is not None:
+        base["sem_pretrained_strict"] = bool(sem_pretrained_strict)
+
+    if sem_pretrained_verbose is not None:
+        base["sem_pretrained_verbose"] = bool(sem_pretrained_verbose)
 
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(base, f, indent=2)
@@ -341,12 +370,22 @@ def main():
     p.add_argument("--strict", action="store_true", help="Load ckpt with strict=True (default False).")
     p.add_argument("--device", type=str, default="cuda", help="cuda|cpu")
 
+
+    # Semantic backbone override (for rebuilding detector at test time)
+    p.add_argument("--det_sem_backbone", type=str, default=None, choices=["resnet50", "resnet101", "resnet152"],
+                   help="Override semantic backbone architecture used by the detector (default from checkpoint/hparams).")
+    p.add_argument("--sem_pretrained_path", type=str, default=None,
+                   help="Optional SSL backbone checkpoint to load into the semantic ResNet (MoCo/JEPA-style).")
+    p.add_argument("--sem_pretrained_strict", action="store_true",
+                   help="Load semantic backbone ckpt with strict=True (default False).")
+    p.add_argument("--sem_pretrained_verbose", action="store_true",
+                   help="Verbose semantic backbone loading logs (default False).")
     p.add_argument("--coco_img_root", type=str, default=None)
     p.add_argument("--coco_ann", type=str, default=None)
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--max_images", type=int, default=None)
-    p.add_argument("--eval_score_thresh", type=float, default=0.05)
+    p.add_argument("--eval_score_thresh", type=float, default=0.5)
 
     p.add_argument("--show_or_save_images", action="store_true")
     p.add_argument("--save_dir", type=str, default="./runs/test_detection")
@@ -370,13 +409,17 @@ def main():
     save_dir = Path(args.save_dir)
 
     hparams_json_for_load = args.hparams_json
-    if args.head is not None:
-        hparams_json_for_load = _make_temp_hparams_with_head_override(
+    if (args.head is not None) or (args.det_sem_backbone is not None) or (args.sem_pretrained_path is not None) or args.sem_pretrained_strict or args.sem_pretrained_verbose:
+        hparams_json_for_load = _make_temp_hparams_overrides(
             original_hparams_json=args.hparams_json,
-            head=args.head,
             save_dir=save_dir,
+            head=args.head,
+            det_sem_backbone=args.det_sem_backbone,
+            sem_pretrained_path=args.sem_pretrained_path,
+            sem_pretrained_strict=True if args.sem_pretrained_strict else None,
+            sem_pretrained_verbose=True if args.sem_pretrained_verbose else None,
         )
-        print(f"[test] --head override -> using temp hparams: {hparams_json_for_load}")
+        print(f"[test] overrides -> using temp hparams: {hparams_json_for_load}")
 
     model, hp = build_detector_from_checkpoint(
         args.ckpt,

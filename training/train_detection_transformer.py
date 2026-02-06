@@ -136,6 +136,8 @@ def _is_valid_boxes_tensor(boxes: Any) -> bool:
 def _filter_empty_targets(
     imgs_list: List[torch.Tensor],
     targets_list: List[Dict[str, Any]],
+    *,
+    num_classes: Optional[int] = None,
     debug: bool = False,
 ) -> Tuple[List[torch.Tensor], List[Dict[str, Any]], Dict[str, int]]:
     """
@@ -151,7 +153,20 @@ def _filter_empty_targets(
         t = targets_list[i]
         boxes = t.get("boxes", None)
         labels = t.get("labels", None)
+
         ok = _is_valid_boxes_tensor(boxes) and (torch.is_tensor(labels) and labels.numel() > 0)
+        if ok and (num_classes is not None) and torch.is_tensor(labels) and labels.numel() > 0:
+            # torchvision FasterRCNN expects labels in [1, num_classes-1]
+            # (0 reserved for background, not used in targets)
+            lab_min = int(labels.min().item())
+            lab_max = int(labels.max().item())
+            if lab_min < 1 or lab_max >= int(num_classes):
+                ok = False
+                if debug:
+                    print(
+                        f"[DEBUG DET] ignore sample[{i}] labels out of range: "
+                        f"min={lab_min} max={lab_max} (num_classes={int(num_classes)})"
+                    )
 
         if not ok:
             ignored += 1
@@ -679,6 +694,24 @@ def train_detection_transformer(opt, dev: torch.device):
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         global_step = int(ckpt.get("global_step", 0))
 
+    # ------------------------------------------------------------------
+    # SAFETY (important for torchvision FasterRCNN):
+    # If hp.num_classes is smaller than what the dataloader produces,
+    # classification targets can contain labels >= num_classes, which
+    # triggers a CUDA "device-side assert" inside CrossEntropy.
+    # We auto-bump hp.num_classes to match the dataloader.
+    # ------------------------------------------------------------------
+    try:
+        nc_dl = int(num_classes_dl)
+        if int(hp.num_classes) < nc_dl:
+            print(
+                f"[DET] ⚠️ hp.num_classes={hp.num_classes} < dataloader_num_classes={nc_dl}. "
+                f"Overriding hp.num_classes -> {nc_dl} to avoid CUDA asserts."
+            )
+            hp.num_classes = nc_dl
+    except Exception:
+        pass
+
     # Save hparams (final)
     _write_hparams_json(save_dir, hp)
 
@@ -768,7 +801,10 @@ def train_detection_transformer(opt, dev: torch.device):
 
             if hp.det_filter_batch_safety:
                 imgs_list, targets_list, st = _filter_empty_targets(
-                    imgs_list, targets_list, debug=bool(getattr(opt, "debug_detection", False))
+                    imgs_list,
+                    targets_list,
+                    num_classes=int(hp.num_classes) if hp.num_classes is not None else None,
+                    debug=bool(getattr(opt, "debug_detection", False)),
                 )
                 total_ignored_samples += int(st["ignored"])
                 if st["used"] == 0:
