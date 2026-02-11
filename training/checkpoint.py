@@ -757,7 +757,7 @@ def load_checkpoint(
     if not tfile.exists():
         return {"epoch": epoch, "global_step": 0, "jepa_meta": jepa_meta}
 
-    trainer = torch.load(tfile, map_location=dev)
+    trainer = torch.load(tfile, map_location=dev, weights_only=False)
 
     # optimizers
     if opt_GA is not None and "opt_GA" in trainer:
