@@ -92,6 +92,26 @@ def main() -> None:
         action="store_true",
         help="Utiliser les embeddings SupHeads par tâche (k-NN/cluster par tâche).",
     )
+
+    # --- t-SNE : utiliser les embeddings produits par SupHeads ----------------
+    # Par défaut, en feature_mode=style et per_task=False, la t-SNE utilise les
+    # signatures de style extraites du générateur (tokens / maps) sans passer par
+    # les têtes supervisées.
+    #
+    # Quand les poids SupHeads sont disponibles, on peut vouloir visualiser une
+    # représentation *façonnée par SupHeads* (même espace que celui utilisé pour
+    # la classification / multi-tâches). Cette option force alors la branche
+    # per_task/composite : on passe par Wrap(G,Sup) et on récupère les embeddings
+    # renvoyés par SupHeads(return_task_embeddings=True).
+    ap.add_argument(
+        "--tsne_use_supheads",
+        action="store_true",
+        help=(
+            "En mode --mode tsne_interactive : utiliser les embeddings produits par SupHeads "
+            "(return_task_embeddings=True) au lieu des signatures de style brutes. "
+            "Requiert --sup_ckpt (SupHeads chargé)."
+        ),
+    )
     ap.add_argument("--num_samples", type=int)
 
     # embeddings -----------------------------------------------------------
@@ -344,6 +364,14 @@ def main() -> None:
     # Si on veut explicitement travailler sur les cls_tokens,
     # on force per_task (embeddings par tâche via SupHeads).
     if args.feature_mode == "cls_tokens":
+        args.per_task = True
+
+    # Option explicite : pour les modes t-SNE/metrics, utiliser les embeddings produits
+    # par SupHeads (utile même si feature_mode=style, tant que SupHeads est chargé).
+    # Cela s'applique à :
+    #  - tsne_interactive : affichage interactif
+    #  - passe_by_metrics : t-SNE + vues additionnelles (cluster/knn) basées sur des métriques
+    if args.mode in ("tsne_interactive", "passe_by_metrics") and args.tsne_use_supheads:
         args.per_task = True
 
     # ---------------------- MODE: DETECT_TRANSFORMER ----------------------

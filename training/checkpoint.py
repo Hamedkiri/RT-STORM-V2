@@ -64,7 +64,7 @@ def last_epoch(
 
 
 # ======================================================================
-# 1b) Décision centralisée de sauvegarde (nouveau)
+# 1b) Décision centralisée de sauvegarde
 # ======================================================================
 
 def should_save_ckpt(
@@ -84,8 +84,6 @@ def should_save_ckpt(
     - save_mode ∈ {"none","step","epoch"}
     - interval: N (pour step:N ou epoch:N)
     - final_save: si True, on sauvegarde aussi au dernier epoch.
-
-    Reasons typiques: "step:1000", "epoch:5", "final"
     """
     mode = (save_mode or "none").strip().lower()
     if mode not in {"none", "step", "epoch"}:
@@ -97,7 +95,6 @@ def should_save_ckpt(
         except Exception:
             interval = None
 
-    # final
     is_final_epoch = (epoch + 1) >= int(epochs_total)
 
     if mode == "none":
@@ -125,7 +122,7 @@ def should_save_ckpt(
 
 
 # ────────────────────────────────────────────────────────────────
-# 2) Remap rétro-compat + filtrage legacy attn-style (inchangé)
+# 2) Remap rétro-compat + filtrage legacy attn-style
 # ────────────────────────────────────────────────────────────────
 
 def _remap_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -137,10 +134,6 @@ def _remap_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     NOTE (SPADE) :
       Les anciennes clés du style-encoder attentionnel n'ont **pas d'équivalent**
       dans SPADE/SEAN avec tokens multi-échelles. On les ignore volontairement.
-
-    NOTE (SupHeads v2) :
-      Certains SupHeads utilisent 'mixers' au lieu de 'attentions' si token_mode="multi6".
-      On ne transpose pas automatiquement (formes différentes).
     """
     new_sd: Dict[str, torch.Tensor] = {}
 
@@ -258,10 +251,7 @@ def _load_weights(
 def save_supheads_rich(sup_heads: nn.Module, out_path: Path, *, safe_write: bool = True) -> None:
     """
     Sauvegarde un bundle 'rich' pour SupHeads :
-      {
-        "meta": {tasks, in_dim, token_mode, num_scales, heads, mlp_mult, dropout, ...},
-        "state_dict": ...
-      }
+      {"meta": {...}, "state_dict": ...}
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -303,14 +293,17 @@ def save_supheads_rich(sup_heads: nn.Module, out_path: Path, *, safe_write: bool
 # 5) Helpers d’écriture atomique (torch / safetensors)
 # ────────────────────────────────────────────────────────────────
 
-def _atomic_save_torch(obj, fpath: Path, *, safe_write: bool = True) -> None:
+def _atomic_save_torch(obj: Any, fpath: Path, *, safe_write: bool = True) -> None:
     fpath = Path(fpath)
     fpath.parent.mkdir(parents=True, exist_ok=True)
+
     if not safe_write:
         torch.save(obj, fpath)
         return
+
     with tempfile.NamedTemporaryFile(delete=False, dir=str(fpath.parent)) as tmp:
         tmp_name = tmp.name
+
     try:
         torch.save(obj, tmp_name)
         os.replace(tmp_name, fpath)
@@ -322,20 +315,22 @@ def _atomic_save_torch(obj, fpath: Path, *, safe_write: bool = True) -> None:
 
 
 def _atomic_save_safetensors(sd: Dict[str, torch.Tensor], fpath: Path, *, safe_write: bool = True) -> None:
-    # safetensors.torch recommandé (si dispo)
     try:
         from safetensors.torch import save_file
     except Exception:
-        # fallback ancien import si tu l'utilises ailleurs
+        # fallback (selon env)
         from torch.safetensors import save_file  # type: ignore
 
     fpath = Path(fpath)
     fpath.parent.mkdir(parents=True, exist_ok=True)
+
     if not safe_write:
         save_file(sd, str(fpath))
         return
+
     with tempfile.NamedTemporaryFile(delete=False, dir=str(fpath.parent)) as tmp:
         tmp_name = tmp.name
+
     try:
         save_file(sd, tmp_name)
         os.replace(tmp_name, fpath)
@@ -351,12 +346,6 @@ def _atomic_save_safetensors(sd: Dict[str, torch.Tensor], fpath: Path, *, safe_w
 # ────────────────────────────────────────────────────────────────
 
 def _infer_jepa_meta(jepa_mod: nn.Module) -> Dict[str, Any]:
-    """
-    Essaie d’inférer des infos structurantes depuis une tête JEPA :
-      - D (out_features du dernier Linear)
-      - hidden (Linear interne)
-      - heads / norm / scale_weights si exposés comme attributs
-    """
     meta = {
         "D": None,
         "hidden": None,
@@ -379,10 +368,6 @@ def _infer_jepa_meta(jepa_mod: nn.Module) -> Dict[str, Any]:
 
 
 def save_jepa_rich(jepa_mod: nn.Module, out_path: Path, *, safe_write: bool = True) -> None:
-    """
-    Sauvegarde un bundle JEPA 'rich' :
-      {"meta": {D, hidden, heads?, norm?, scale_weights?, mask_ratio?}, "state_dict": ...}
-    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     bundle = {"meta": _infer_jepa_meta(jepa_mod), "state_dict": jepa_mod.state_dict()}
@@ -410,10 +395,6 @@ def _load_jepa_weights(
     device: torch.device,
     strict: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Charge une tête JEPA depuis un bundle .pth (meta+state_dict) ou un state_dict simple.
-    Retourne un dict meta (possiblement vide).
-    """
     if not path.exists():
         _log(f"[WARN] JEPA manquant : {path}")
         return {}
@@ -424,6 +405,7 @@ def _load_jepa_weights(
     else:
         sd = obj
         meta = {}
+
     try:
         jepa_mod.load_state_dict(sd, strict=strict)
     except RuntimeError as e:
@@ -454,22 +436,17 @@ def save_checkpoint(
     global_step: int,
     out_dir: Path,
     *,
-    # options IO
     use_safetensors: bool = False,
     safe_write: bool = True,
-    # états entraînement optionnels
     amp_scaler: Optional[Any] = None,
     sched_GA: Optional[Any] = None,
     sched_GB: Optional[Any] = None,
-    # ======== Semantic content (MoCo+JEPA) ========
     sem_model: Optional[nn.Module] = None,
     opt_sem: Optional[Any] = None,
     sem_filename: str = "SemMoCo",
-    # SupHeads
     sup_heads: Optional[nn.Module] = None,
     sup_filename: str = "SupHeads",
     save_supheads_every_epoch: bool = True,
-    # ======== Teachers EMA & JEPA ========
     T_A: Optional[nn.Module] = None,
     T_B: Optional[nn.Module] = None,
     save_teachers: bool = True,
@@ -477,19 +454,10 @@ def save_checkpoint(
     tokJEPA_B: Optional[nn.Module] = None,
     save_jepa_every_epoch: bool = True,
 ) -> None:
-    """
-    Sauvegarde :
-      • G_A, D_A, G_B, D_B           (.pt / .safetensors)
-      • trainer_epoch{e}.pth         (optimiseurs + RNG + AMP/Schedulers)
-      • SupHeads_epoch{e}.pth        (bundle riche) si présent
-      • T_A/T_B                      (teachers EMA) si fournis/activés
-      • TokenJEPA_A/B_epoch{e}.pth   (bundles riches) si fournis
-      • SemMoCo_epoch{e}.pt          (branche sémantique) si présent
-    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- vérif safetensors dispo si demandé
+    # safetensors dispo ?
     if use_safetensors:
         try:
             import safetensors.torch as _st  # noqa: F401
@@ -497,7 +465,7 @@ def save_checkpoint(
             _log(f"[WARN] safetensors indisponible ({e}) → fallback .pt")
             use_safetensors = False
 
-    # --- 1) Poids réseaux
+    # 1) Poids réseaux
     if use_safetensors:
         _atomic_save_safetensors(G_A.state_dict(), out_dir / f"G_A_epoch{epoch}.safetensors", safe_write=safe_write)
         _atomic_save_safetensors(D_A.state_dict(), out_dir / f"D_A_epoch{epoch}.safetensors", safe_write=safe_write)
@@ -509,9 +477,7 @@ def save_checkpoint(
         _atomic_save_torch(G_B.state_dict(), out_dir / f"G_B_epoch{epoch}.pt", safe_write=safe_write)
         _atomic_save_torch(D_B.state_dict(), out_dir / f"D_B_epoch{epoch}.pt", safe_write=safe_write)
 
-    # --- 1b) Branche sémantique (optionnelle)
-    # ✅ On sauvegarde aussi des métadonnées (arch/return_layer/...) pour pouvoir
-    #    reconstruire le même backbone au moment des tests / fine-tuning.
+    # 1b) Branche sémantique
     if sem_model is not None:
         try:
             meta: Dict[str, Any] = {}
@@ -525,7 +491,6 @@ def save_checkpoint(
                 pass
 
             if use_safetensors:
-                # safetensors ne stocke que des tenseurs -> meta à côté en JSON
                 _atomic_save_safetensors(
                     sem_model.state_dict(),
                     out_dir / f"{sem_filename}_epoch{epoch}.safetensors",
@@ -546,8 +511,8 @@ def save_checkpoint(
         except Exception as e:
             _log(f"[WARN] sauvegarde {sem_filename} impossible: {e}")
 
-    # --- 2) État entraîneur (optimiseurs + RNG/AMP/Schedulers)
-    trainer = {
+    # 2) État entraîneur (optimiseurs + RNG/AMP/Schedulers)  ✅ FIX: try/except complets
+    trainer: Dict[str, Any] = {
         "epoch": int(epoch),
         "global_step": int(global_step),
         "opt_GA": opt_GA.state_dict(),
@@ -559,21 +524,25 @@ def save_checkpoint(
         "py_rng_state": random.getstate(),
         "np_rng_state": np.random.get_state(),
     }
+
     if torch.cuda.is_available():
         try:
             trainer["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
         except Exception:
             pass
+
     if amp_scaler is not None:
         try:
             trainer["amp_scaler"] = amp_scaler.state_dict()
         except Exception:
             pass
+
     if sched_GA is not None:
         try:
             trainer["sched_GA"] = sched_GA.state_dict()
         except Exception:
             pass
+
     if sched_GB is not None:
         try:
             trainer["sched_GB"] = sched_GB.state_dict()
@@ -582,7 +551,7 @@ def save_checkpoint(
 
     _atomic_save_torch(trainer, out_dir / f"trainer_epoch{epoch}.pth", safe_write=safe_write)
 
-    # --- 3) Export SupHeads “riche”
+    # 3) Export SupHeads “riche”
     if save_supheads_every_epoch:
         sup = (
             sup_heads
@@ -594,7 +563,7 @@ def save_checkpoint(
         if isinstance(sup, nn.Module):
             save_supheads_rich(sup, out_dir / f"{sup_filename}_epoch{epoch}.pth", safe_write=safe_write)
 
-    # --- 4) Teachers EMA (T_A/T_B)
+    # 4) Teachers EMA
     if save_teachers:
         if T_A is not None:
             if use_safetensors:
@@ -607,7 +576,7 @@ def save_checkpoint(
             else:
                 _atomic_save_torch(T_B.state_dict(), out_dir / f"T_B_epoch{epoch}.pt", safe_write=safe_write)
 
-    # --- 5) JEPA (bundles riches)
+    # 5) JEPA
     if save_jepa_every_epoch:
         if tokJEPA_A is not None:
             save_jepa_rich(tokJEPA_A, out_dir / f"TokenJEPA_A_epoch{epoch}.pth", safe_write=safe_write)
@@ -642,7 +611,6 @@ def load_checkpoint(
     strict: Optional[bool] = None,
     weights_only: bool = False,
     prefer_exts: Tuple[str, ...] = (".pt", ".safetensors"),
-    # ======== Teachers EMA & JEPA ========
     T_A: Optional[nn.Module] = None,
     T_B: Optional[nn.Module] = None,
     strict_TA: bool = False,
@@ -651,17 +619,6 @@ def load_checkpoint(
     tokJEPA_B: Optional[nn.Module] = None,
     strict_tokJEPA: bool = True,
 ) -> dict:
-    """
-    Charge les poids de G_A, D_A, G_B, D_B et (optionnel) l'état des optimiseurs + RNG.
-
-    Ajouts:
-      - SEM (sem_model/opt_sem)
-      - Teachers EMA (T_A/T_B) si fournis
-      - Têtes JEPA A/B depuis bundles “rich” TokenJEPA_* (si fournis)
-
-    Args:
-      prefer_exts: ordre de préférence des extensions de poids à charger pour réseaux/teachers.
-    """
     run_dir = Path(run_dir)
     dev = torch.device(device)
 
@@ -680,7 +637,7 @@ def load_checkpoint(
                 return p
         return None
 
-    # --- poids réseaux (multi-ext) ---
+    # --- poids réseaux ---
     pa = _find_weight_file("G_A")
     da = _find_weight_file("D_A")
     pb = _find_weight_file("G_B")
@@ -703,7 +660,7 @@ def load_checkpoint(
     else:
         _log(f"[WARN] Fichier poids manquant: D_B_epoch{epoch}(.pt|.safetensors)")
 
-    # --- Branche sémantique (si module fourni) ---
+    # --- SEM ---
     if sem_model is not None:
         ps = _find_weight_file(sem_filename)
         if ps is not None:
@@ -711,7 +668,7 @@ def load_checkpoint(
         else:
             _log(f"[INFO] Pas de poids trouvés pour {sem_filename} @epoch {epoch}")
 
-    # --- Teachers EMA (si modules fournis) ---
+    # --- Teachers ---
     if T_A is not None:
         ta = _find_weight_file("T_A")
         if ta is not None:
@@ -725,7 +682,7 @@ def load_checkpoint(
         else:
             _log(f"[INFO] Pas de poids teacher trouvés pour T_B @epoch {epoch}")
 
-    # --- JEPA (bundles .pth de préférence) ---
+    # --- JEPA ---
     jepa_meta: Dict[str, Any] = {}
     if tokJEPA_A is not None:
         jp = run_dir / f"TokenJEPA_A_epoch{epoch}.pth"
@@ -752,63 +709,64 @@ def load_checkpoint(
     if weights_only:
         return {"epoch": epoch, "global_step": 0, "jepa_meta": jepa_meta}
 
-    # --- état entraîneur (optimiseurs + RNG/AMP/Schedulers) ---
+    # --- état entraîneur ---
     tfile = run_dir / f"trainer_epoch{epoch}.pth"
     if not tfile.exists():
         return {"epoch": epoch, "global_step": 0, "jepa_meta": jepa_meta}
 
-    trainer = torch.load(tfile, map_location=dev, weights_only=False)
+    def _torch_load_full(path: Path, map_location: torch.device):
+        try:
+            return torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location=map_location)
 
-    # optimizers
-    if opt_GA is not None and "opt_GA" in trainer:
-        try:
-            opt_GA.load_state_dict(trainer["opt_GA"])
-        except Exception:
-            pass
-    if opt_DA is not None and "opt_DA" in trainer:
-        try:
-            opt_DA.load_state_dict(trainer["opt_DA"])
-        except Exception:
-            pass
-    if opt_GB is not None and "opt_GB" in trainer:
-        try:
-            opt_GB.load_state_dict(trainer["opt_GB"])
-        except Exception:
-            pass
-    if opt_DB is not None and "opt_DB" in trainer:
+    try:
+        trainer = _torch_load_full(tfile, dev)
+    except Exception as e:
+        _log(f"[WARN] trainer not loaded (will re-init trainer): {e}")
+        trainer = {}
+
+    if not isinstance(trainer, dict):
+        trainer = {"trainer_obj": trainer}
+
+    # Load optimizers (existant dans ton code initial : opt_DB & opt_sem)
+    if opt_DB is not None and isinstance(trainer.get("opt_DB", None), dict):
         try:
             opt_DB.load_state_dict(trainer["opt_DB"])
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"[WARN] opt_DB state not loaded: {e}")
 
-    # SEM optimizer
-    if opt_sem is not None and ("opt_SEM" in trainer) and (trainer.get("opt_SEM") is not None):
+    if opt_sem is not None and trainer.get("opt_SEM", None) is not None:
         try:
             opt_sem.load_state_dict(trainer["opt_SEM"])
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"[WARN] opt_SEM state not loaded: {e}")
 
-    # RNG CPU/CUDA
-    if "rng_state" in trainer:
+    # RNG states
+    if trainer.get("rng_state", None) is not None:
         try:
-            torch.set_rng_state(trainer["rng_state"].cpu())
-        except Exception:
-            pass
-    if "py_rng_state" in trainer:
+            rs = trainer["rng_state"]
+            torch.set_rng_state(rs.cpu() if hasattr(rs, "cpu") else rs)
+        except Exception as e:
+            _log(f"[WARN] torch RNG state not restored: {e}")
+
+    if trainer.get("py_rng_state", None) is not None:
         try:
             random.setstate(trainer["py_rng_state"])
-        except Exception:
-            pass
-    if "np_rng_state" in trainer:
+        except Exception as e:
+            _log(f"[WARN] python RNG state not restored: {e}")
+
+    if trainer.get("np_rng_state", None) is not None:
         try:
             np.random.set_state(trainer["np_rng_state"])
-        except Exception:
-            pass
-    if torch.cuda.is_available() and ("cuda_rng_state_all" in trainer):
+        except Exception as e:
+            _log(f"[WARN] numpy RNG state not restored: {e}")
+
+    if torch.cuda.is_available() and trainer.get("cuda_rng_state_all", None) is not None:
         try:
             torch.cuda.set_rng_state_all(trainer["cuda_rng_state_all"])
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"[WARN] cuda RNG state not restored: {e}")
 
     return {
         "epoch": trainer.get("epoch", epoch),
@@ -951,5 +909,5 @@ def save_state_json(epoch: int, global_step: int, opt, out_dir: Path) -> None:
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "train_state.json").write_text(json.dumps(snapshot, indent=4))
+    (out_dir / "train_state.json").write_text(json.dumps(snapshot, indent=4), encoding="utf-8")
     _log(f"✓ train_state.json mis à jour ({out_dir})")

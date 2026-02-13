@@ -11,3 +11,6 @@ SemMoCo_epoch43.pt
 /EvalResNet50
 /Poids-melanoma
 SemMoCo_epoch93.pt
+/__pycache__
+/__pycache__
+/models/__pycache__

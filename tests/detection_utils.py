@@ -761,6 +761,8 @@ def evaluate_coco_map(
     if coco_gt is None:
         raise RuntimeError("data_loader.dataset has no .coco (expected CocoDetection-like dataset)")
 
+    label2cat = getattr(ds, 'label2cat', None)
+
     model.eval()
     results: List[Dict[str, Any]] = []
     seen = 0
@@ -787,7 +789,7 @@ def evaluate_coco_map(
                 results.append(
                     {
                         "image_id": img_id,
-                        "category_id": int(labels[i].item()),
+                        "category_id": int(label2cat.get(int(labels[i].item()), int(labels[i].item()))) if isinstance(label2cat, dict) else int(labels[i].item()),
                         "bbox": [float(x) for x in boxes_xywh[i].tolist()],
                         "score": float(scores[i].item()),
                     }

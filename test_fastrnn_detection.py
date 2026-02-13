@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 import torchvision.transforms as T
 from torchvision.datasets import CocoDetection
 
-from tests.detection_utils import (
+from testsFile.detectionUtils import (
     build_detector_from_checkpoint,
     evaluate_coco_map,
     infer_batch,
@@ -29,6 +29,13 @@ class CocoDetectionWrapped(CocoDetection):
         except TypeError:
             super().__init__(img_folder, ann_file, transforms=None)
         self._tfm = transforms
+        # Map COCO category_id -> contiguous label_id (1..K), bg=0
+        # This avoids CUDA asserts in torchvision detectors which expect labels in [1..num_classes-1].
+        coco = self.coco
+        cats = coco.loadCats(coco.getCatIds())
+        cat_ids = sorted([int(c['id']) for c in cats])
+        self.cat2label = {cid: (i + 1) for i, cid in enumerate(cat_ids)}
+        self.label2cat = {v: k for k, v in self.cat2label.items()}
 
     def __getitem__(self, idx: int):
         img, anns = super().__getitem__(idx)
@@ -41,9 +48,13 @@ class CocoDetectionWrapped(CocoDetection):
         labels: List[int] = []
         for a in anns:
             x, y, w, h = a["bbox"]
+            cid = int(a["category_id"])
+            lab = self.cat2label.get(cid, None)
+            if lab is None:
+                continue
             x1, y1, x2, y2 = float(x), float(y), float(x + w), float(y + h)
             boxes.append([x1, y1, x2, y2])
-            labels.append(int(a["category_id"]))
+            labels.append(int(lab))
 
         if len(boxes) == 0:
             boxes_t = torch.zeros((0, 4), dtype=torch.float32)
@@ -66,9 +77,15 @@ def collate_detection(batch: List[Tuple[torch.Tensor, Dict[str, Any]]]):
 
 
 def build_coco_label_map(dataset: CocoDetectionWrapped) -> Dict[int, str]:
+    """Return mapping from contiguous label_id -> class name.
+
+    Note: dataset stores category_id->label mapping (cat2label) and reverse (label2cat).
+    """
     coco = dataset.coco
     cats = coco.loadCats(coco.getCatIds())
-    return {int(c["id"]): str(c["name"]) for c in cats}
+    id2name = {int(c['id']): str(c['name']) for c in cats}
+    # contiguous labels (1..K)
+    return {int(lab): id2name.get(int(cid), str(int(cid))) for lab, cid in dataset.label2cat.items()}
 
 
 # -------------------------------------------------------
@@ -385,7 +402,7 @@ def main():
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--max_images", type=int, default=None)
-    p.add_argument("--eval_score_thresh", type=float, default=0.5)
+    p.add_argument("--eval_score_thresh", type=float, default=0.05)
 
     p.add_argument("--show_or_save_images", action="store_true")
     p.add_argument("--save_dir", type=str, default="./runs/test_detection")

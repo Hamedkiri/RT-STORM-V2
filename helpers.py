@@ -1672,6 +1672,11 @@ def train_step_phase_A(
         except Exception:
             pass
 
+        try:
+            writer.flush()
+        except Exception:
+            pass
+
     # ----------------------------
     # ✅ SEM TensorBoard + terminal (A)  + evolution curves (ALWAYS)
     # ----------------------------
@@ -1692,6 +1697,11 @@ def train_step_phase_A(
 
         writer.add_scalar("SEM/exceptions_total", float(state.get("sem_exceptions", 0)), global_step)
         writer.add_scalar("SEM/A/exception_step", float(sem_exc), global_step)
+
+        try:
+            writer.flush()
+        except Exception:
+            pass
 
     if sem_enabled and ((global_step % sem_print_every) == 0):
         _tqdm_write(
