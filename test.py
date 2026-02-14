@@ -25,6 +25,8 @@ from torch.utils.data import DataLoader, Subset
 
 from tests.functions_for_test import (
     compute_style_embeddings,
+    compute_sem_embeddings,
+    build_sem_backbone_for_eval,
     load_models,
     compute_metrics,
     compute_embeddings_with_paths,
@@ -81,10 +83,19 @@ def main() -> None:
     # source des features pour tsne / metrics / sup_predict
     ap.add_argument(
         "--feature_mode",
-        choices=["style", "cls_tokens"],
+        choices=["style", "cls_tokens", "sem_resnet50"],
         default="style",
         help="Source des embeddings pour tsne/metrics/sup_predict : "
-             "'style' (GAN) ou 'cls_tokens' (SupHeads/per_task).",
+             "'style' (GAN), 'cls_tokens' (SupHeads/per_task) ou 'sem_resnet50' (backbone sémantique).",
+    )
+
+
+    # Source utilisée pour charger/entraîner SupHeads (utile pour auto-load du backbone sémantique)
+    ap.add_argument(
+        "--sup_feat_source",
+        choices=["generator", "sem_resnet50"],
+        default="generator",
+        help="Source des features attendues par SupHeads. Si sem_resnet50, on peut auto-charger le backbone sémantique depuis weights_dir (SemBackbone_epoch*.pt).",
     )
 
     ap.add_argument(
@@ -111,6 +122,50 @@ def main() -> None:
             "(return_task_embeddings=True) au lieu des signatures de style brutes. "
             "Requiert --sup_ckpt (SupHeads chargé)."
         ),
+    )
+
+    # --- Backbone sémantique (utilisé quand feature_mode=sem_resnet50) ---
+    ap.add_argument(
+        "--det_sem_backbone",
+        type=str,
+        default="resnet50",
+        help="Architecture du backbone sémantique (resnet50/resnet101/resnet152).",
+    )
+    ap.add_argument(
+        "--det_sem_return_layer",
+        type=str,
+        default="layer4",
+        help="Couche à récupérer (layer2/layer3/layer4).",
+    )
+    ap.add_argument(
+        "--sem_pretrained",
+        type=int,
+        default=1,
+        help="1=utiliser des poids pré-entraînés (ImageNet ou --sem_pretrained_path).",
+    )
+    ap.add_argument(
+        "--sem_pretrained_path",
+        type=str,
+        default="",
+        help="Chemin optionnel vers un checkpoint pour initialiser le backbone sémantique.",
+    )
+    ap.add_argument(
+        "--sem_pretrained_strict",
+        type=int,
+        default=0,
+        help="Chargement strict du checkpoint sémantique (0/1).",
+    )
+    ap.add_argument(
+        "--sem_pretrained_verbose",
+        type=int,
+        default=1,
+        help="Affiche les infos de chargement du backbone sémantique (0/1).",
+    )
+    ap.add_argument(
+        "--sem_imagenet_norm",
+        type=int,
+        default=1,
+        help="1=convertit [-1,1]→[0,1] puis normalise ImageNet avant ResNet (recommandé).",
     )
     ap.add_argument("--num_samples", type=int)
 
@@ -366,6 +421,14 @@ def main() -> None:
     if args.feature_mode == "cls_tokens":
         args.per_task = True
 
+    # Quand on travaille avec la source sémantique, on veut reproduire le comportement
+    # de la branche style :
+    #   - sans --tsne_use_supheads : t-SNE / metrics sur les features ResNet brutes
+    #   - avec --tsne_use_supheads : on passe ces features dans SupHeads et on visualise
+    #     l'espace "façonné" par SupHeads (per_task=True)
+    if args.feature_mode == "sem_resnet50" and args.tsne_use_supheads:
+        args.per_task = True
+
     # Option explicite : pour les modes t-SNE/metrics, utiliser les embeddings produits
     # par SupHeads (utile même si feature_mode=style, tant que SupHeads est chargé).
     # Cela s'applique à :
@@ -450,22 +513,151 @@ def main() -> None:
         except Exception:
             print("[WARN] --delta_weights invalide pour tok6_w ; utilisé tel quel.")
 
-    # Chargement des modèles style (G, SupHeads)
-    G, Sup, task_cls = load_models(
-        weights_dir=wdir,
-        device=device,
-        cfg=cfg,
-        ckpt_gen=args.ckpt,
-        sup_ckpt=args.sup_ckpt,
-        classes_json=args.classes_json,
-        sup_in_dim=args.sup_in_dim,
-        ckpt_GA=args.ckpt_GA,
-        ckpt_GB=args.ckpt_GB,
-    )
+    # ==============================================================
+    # Chargement des modèles
+    #
+    # IMPORTANT:
+    # - Quand --feature_mode sem_resnet50, les modes de test (tsne_interactive,
+    #   passe_by_metrics, sup_predict) n'ont **pas** besoin de charger G_A/G_B.
+    #   On charge uniquement le backbone sémantique + (optionnellement) SupHeads.
+    # - Sinon (style / cls_tokens / style_transfer), on charge le générateur.
+    # ==============================================================
 
-    # Récupération GA/GB (compat noms d'attributs GA/GB ou G_A/G_B)
-    G_A = getattr(G, "GA", getattr(G, "G_A", G))
-    G_B = getattr(G, "GB", getattr(G, "G_B", G))
+    def _infer_tasks_and_in_dim_from_sup_state(sd: dict) -> tuple[dict[str, int] | None, int | None]:
+        """Infère {task: n_classes} et in_dim depuis les poids SupHeads.
+        Compatible avec:
+          - keys préfixées 'sup_heads.' (bundle)
+          - keys directes 'classifiers.<task>....'
+        """
+        tasks_auto: dict[str, int] = {}
+        in_dim_auto: int | None = None
+
+        # Normaliser: enlever 'sup_heads.' si présent
+        for k, v in sd.items():
+            kk = k[len("sup_heads."):] if k.startswith("sup_heads.") else k
+            if not kk.startswith("classifiers."):
+                continue
+            if not isinstance(v, torch.Tensor) or v.dim() != 2:
+                continue
+            # classifiers.<task>.<...>.weight  OR  classifiers.<task>.weight
+            rest = kk[len("classifiers."):]
+            task, _, tail = rest.partition(".")
+            if not task:
+                continue
+            if not (tail.endswith("weight") or tail == "weight"):
+                continue
+            n_cls, in_d = int(v.shape[0]), int(v.shape[1])
+            # on prend le plus petit out (souvent la couche finale)
+            if task not in tasks_auto or n_cls < tasks_auto[task]:
+                tasks_auto[task] = n_cls
+                if in_dim_auto is None:
+                    in_dim_auto = in_d
+
+        return (tasks_auto if tasks_auto else None), in_dim_auto
+
+    def _read_state_any(path: Path, dev: torch.device) -> dict:
+        path = Path(path)
+        if path.suffix.lower() == ".safetensors":
+            from safetensors.torch import load_file
+            return load_file(str(path), device=str(dev))
+        obj = torch.load(path, map_location=dev)
+        return obj["state_dict"] if isinstance(obj, dict) and "state_dict" in obj else obj
+
+    def _find_latest_sem_ckpt(weights_dir: Path, sem_filename: str = "SemBackbone") -> Path | None:
+        pats = list(weights_dir.glob(f"{sem_filename}_epoch*.pt")) + list(weights_dir.glob(f"{sem_filename}_epoch*.safetensors"))
+        if not pats:
+            return None
+        pats.sort(key=lambda p: p.stat().st_mtime)
+        return pats[-1]
+
+    # ----------- Backbone sémantique (optionnel, pour tests) -----------
+    sem_backbone = None
+    sem_out_ch = None
+    if args.feature_mode == "sem_resnet50":
+        sem_backbone, sem_out_ch = build_sem_backbone_for_eval(
+            device=device,
+            arch=args.det_sem_backbone,
+            return_layer=args.det_sem_return_layer,
+            pretrained=bool(int(args.sem_pretrained)),
+            pretrained_path=str(args.sem_pretrained_path or ""),
+            strict=bool(int(args.sem_pretrained_strict)),
+            verbose=bool(int(args.sem_pretrained_verbose)),
+            weights_dir=(wdir if args.sup_feat_source == "sem_resnet50" else None),
+            sem_filename="SemBackbone",
+        )
+        print(f"✓ sem_backbone prêt | arch={args.det_sem_backbone} | layer={args.det_sem_return_layer} | out_ch={sem_out_ch}")
+
+    # ----------- Charger G/Sup selon le mode -----------
+    G, Sup, task_cls = None, None, None
+
+    sem_only_modes = {"tsne_interactive", "passe_by_metrics", "sup_predict"}
+    if (args.feature_mode == "sem_resnet50") and (args.mode in sem_only_modes):
+        # Pas besoin de G_A/G_B.
+        # Charger SupHeads si requis (sup_predict) ou si demandé (tsne_use_supheads / per_task)
+        need_sup = (args.mode == "sup_predict") or bool(args.tsne_use_supheads) or bool(args.per_task)
+        if need_sup:
+            if not args.sup_ckpt:
+                raise RuntimeError("SupHeads requis mais --sup_ckpt manquant (utilise sup_predict/tsne_use_supheads/per_task).")
+            from models.sup_heads import SupHeads
+
+            sup_path = Path(args.sup_ckpt)
+            if not sup_path.is_absolute():
+                # Permet --sup_ckpt relatif à weights_dir
+                cand = wdir / sup_path
+                if cand.exists():
+                    sup_path = cand
+            if not sup_path.exists():
+                raise FileNotFoundError(f"SupHeads introuvable: {sup_path}")
+
+            sd = _read_state_any(sup_path, device)
+            tasks_auto, in_dim_auto = _infer_tasks_and_in_dim_from_sup_state(sd)
+            # Si l'utilisateur donne classes_json, on peut préférer cette structure.
+            if (tasks_auto is None) and args.classes_json:
+                with open(args.classes_json, "r", encoding="utf-8") as f:
+                    cj = json.load(f)
+                # attendu: {task: [class_names...]}
+                if isinstance(cj, dict) and cj:
+                    tasks_auto = {str(t): len(v) for t, v in cj.items() if isinstance(v, (list, tuple))}
+
+            if tasks_auto is None:
+                raise RuntimeError("Impossible d'inférer les tâches depuis SupHeads. Fournis --classes_json ou un sup_ckpt valide.")
+
+            in_dim = int(args.sup_in_dim or (sem_out_ch or in_dim_auto or 2048))
+            # Sur sem_resnet, on veut un mode 'flat' (pas de mixers multi6)
+            Sup = SupHeads(tasks_auto, in_dim, token_mode="flat").to(device)
+
+            # Charger uniquement les clés SupHeads (tolérant)
+            # - sd peut contenir 'sup_heads.' prefix
+            sd_clean = { (k[len("sup_heads."):] if k.startswith("sup_heads.") else k): v for k, v in sd.items() }
+            missing, unexpected = Sup.load_state_dict(sd_clean, strict=False)
+            if missing:
+                print(f"[WARN] SupHeads: missing keys ({len(missing)})")
+            if unexpected:
+                print(f"[WARN] SupHeads: unexpected keys ({len(unexpected)})")
+            Sup.eval()
+            print(f"✓ SupHeads loaded (sem_resnet50) – {sup_path.name} | tasks={list(tasks_auto.keys())} | in_dim={in_dim}")
+
+    else:
+        # Chargement standard (style / cls_tokens / style_transfer)
+        G, Sup, task_cls = load_models(
+            weights_dir=wdir,
+            device=device,
+            cfg=cfg,
+            ckpt_gen=args.ckpt,
+            sup_ckpt=args.sup_ckpt,
+            classes_json=args.classes_json,
+            sup_in_dim=args.sup_in_dim,
+            ckpt_GA=args.ckpt_GA,
+            ckpt_GB=args.ckpt_GB,
+        )
+
+    # Récupération GA/GB uniquement si un générateur est chargé
+    if G is not None:
+        G_A = getattr(G, "GA", getattr(G, "G_A", G))
+        G_B = getattr(G, "GB", getattr(G, "G_B", G))
+    else:
+        G_A = None
+        G_B = None
 
     # DataLoader de test (gère --data_json / --data et renvoie ImageFolder si --data)
     loader, dataset, dataset_type = build_test_dataloader(args, cfg)
@@ -855,13 +1047,75 @@ def main() -> None:
 
     composite = None
     if Sup is not None:
-        composite = Wrap(
-            G, Sup, embed_type=args.embed_type, delta_weights=args.delta_weights
-        ).to(device)
-        print(
-            f"✓ composite prêt | tasks={composite.tasks} | "
-            f"feat_type={composite.feat_type} | Δw={composite.delta_weights}"
-        )
+        if args.feature_mode == "sem_resnet50":
+            # Wrapper léger : SupHeads consomme directement les features du backbone sémantique
+            class _SemAdapter(nn.Module):
+                """Expose des features sémantiques via une API G.sup_features compatible."""
+                def __init__(self, sem_backbone: nn.Module, imagenet_norm: bool = True):
+                    super().__init__()
+                    self.sem_backbone = sem_backbone
+                    self.imagenet_norm = bool(imagenet_norm)
+                    self.register_buffer("_im_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
+                    self.register_buffer("_im_std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
+
+                def sup_features(self, imgs: torch.Tensor, feat_type: str = "sem_resnet50", delta_weights: str | None = None):
+                    x = imgs
+                    if x.dim() != 4:
+                        raise ValueError(f"SemAdapter.sup_features: expected BCHW, got {tuple(x.shape)}")
+                    if x.size(1) == 1:
+                        x = x.repeat(1, 3, 1, 1)
+                    if self.imagenet_norm:
+                        # images du pipeline GAN: souvent [-1,1]
+                        x = (x + 1.0) * 0.5
+                        x = x.clamp(0.0, 1.0)
+                        x = (x - self._im_mean) / self._im_std
+                    out = self.sem_backbone(x)
+                    if isinstance(out, dict):
+                        feat = out.get("0", None)
+                        if feat is None:
+                            feat = next(iter(out.values()))
+                    else:
+                        feat = out
+                    # GAP
+                    feat = feat.mean(dim=(2, 3))
+                    return feat
+
+            class SemWrap(nn.Module):
+                """Composite compatible avec compute_embeddings_with_paths (attend .G.sup_features + .Sup)."""
+                def __init__(self, sem_backbone: nn.Module, Sup: nn.Module, imagenet_norm: bool = True):
+                    super().__init__()
+                    self.G = _SemAdapter(sem_backbone, imagenet_norm=imagenet_norm)
+                    self.Sup = Sup
+                    self.tasks = list(Sup.tasks.keys()) if hasattr(Sup, "tasks") else ["__DEFAULT__"]
+                    self.feat_type = "sem_resnet50"
+                    self.delta_weights = ""
+
+                def sup_features(self, imgs: torch.Tensor):
+                    return self.G.sup_features(imgs)
+
+                def forward(self, imgs: torch.Tensor, *, return_task_embeddings: bool = False, return_embeddings: bool = False):
+                    feats = self.G.sup_features(imgs)
+                    if return_task_embeddings:
+                        try:
+                            _, embs = self.Sup(feats, return_task_embeddings=True)
+                        except TypeError:
+                            logits = self.Sup(feats)
+                            embs = {t: v for t, v in logits.items()} if isinstance(logits, dict) else {"__DEFAULT__": logits}
+                        return None, embs
+                    if return_embeddings:
+                        return feats
+                    return self.Sup(feats)
+
+            composite = SemWrap(sem_backbone, Sup, imagenet_norm=bool(int(args.sem_imagenet_norm))).to(device)
+            print(f"✓ composite(sem) prêt | tasks={composite.tasks} | imagenet_norm={bool(int(args.sem_imagenet_norm))}")
+        else:
+            composite = Wrap(
+                G, Sup, embed_type=args.embed_type, delta_weights=args.delta_weights
+            ).to(device)
+            print(
+                f"✓ composite prêt | tasks={composite.tasks} | "
+                f"feat_type={composite.feat_type} | Δw={composite.delta_weights}"
+            )
     elif args.mode == "sup_predict":
         raise RuntimeError("Le mode 'sup_predict' requiert un SupHeads (--sup_ckpt).")
 
@@ -938,13 +1192,17 @@ def main() -> None:
 
             with torch.no_grad():
                 cam_feats_type = args.embed_type
-                if hasattr(G, "sup_features"):
-                    feats = G.sup_features(
-                        imgs, cam_feats_type, delta_weights=args.delta_weights
-                    )
+                if args.feature_mode == "sem_resnet50":
+                    # features sémantiques ResNet -> GAP
+                    feats = composite.sup_features(imgs)
                 else:
-                    z, _ = G.encode_content(imgs)
-                    feats = F.adaptive_avg_pool2d(z, 1).flatten(1)
+                    if hasattr(G, "sup_features"):
+                        feats = G.sup_features(
+                            imgs, cam_feats_type, delta_weights=args.delta_weights
+                        )
+                    else:
+                        z, _ = G.encode_content(imgs)
+                        feats = F.adaptive_avg_pool2d(z, 1).flatten(1)
                 logits = Sup(feats)
                 if not isinstance(logits, dict):
                     logits = {"__DEFAULT__": logits}
@@ -1662,18 +1920,28 @@ def main() -> None:
             )
         return
 
-    # =====================================================  global (style)  ===================================
-    embs_d, lbls_d, class_maps, paths_d = compute_style_embeddings(
-        G,
-        loader,
-        device,
-        embed_type=args.embed_type,
-        token_pool=args.token_pool,
-        layers=args.layers,
-        pca_dim=args.pca_dim if args.mode == "tsne_interactive" else None,
-        l2_norm=args.l2_norm if args.mode == "tsne_interactive" else False,
-        delta_weights=args.delta_weights,
-    )
+    # =====================================================  global (style | sem)  ===================================
+    if args.feature_mode == "sem_resnet50":
+        embs_d, lbls_d, class_maps, paths_d = compute_sem_embeddings(
+            sem_backbone,
+            loader,
+            device,
+            imagenet_norm=bool(int(args.sem_imagenet_norm)),
+            pca_dim=args.pca_dim if args.mode == "tsne_interactive" else None,
+            l2_norm=args.l2_norm if args.mode == "tsne_interactive" else False,
+        )
+    else:
+        embs_d, lbls_d, class_maps, paths_d = compute_style_embeddings(
+            G,
+            loader,
+            device,
+            embed_type=args.embed_type,
+            token_pool=args.token_pool,
+            layers=args.layers,
+            pca_dim=args.pca_dim if args.mode == "tsne_interactive" else None,
+            l2_norm=args.l2_norm if args.mode == "tsne_interactive" else False,
+            delta_weights=args.delta_weights,
+        )
 
     if args.mode == "tsne_interactive":
         if args.metrics.strip():

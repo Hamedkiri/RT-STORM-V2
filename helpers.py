@@ -235,6 +235,64 @@ def run_sup_freeze_mode(
     """
     from copy import deepcopy
 
+    # --- Optional: use a semantic ResNet backbone as feature source for SupHeads ---
+    sup_feat_source = str(getattr(opt, "sup_feat_source", "generator")).lower().strip()
+    sup_sem_imagenet_norm = int(getattr(opt, "sup_sem_imagenet_norm", 1)) == 1
+
+    sem_backbone = None
+    sem_out_channels = None
+
+    if sup_feat_source == "sem_resnet50":
+        # Reuse the same robust builder as detection training
+        from training.train_detection_transformer import _build_sem_resnet_backbone
+
+        sem_backbone, sem_out_channels = _build_sem_resnet_backbone(
+            pretrained=bool(int(getattr(opt, "sem_pretrained", 1))),
+            arch=str(getattr(opt, "det_sem_backbone", "resnet50")),
+            return_layer=str(getattr(opt, "det_sem_return_layer", "layer4")),
+            pretrained_path=str(getattr(opt, "sem_pretrained_path", "") or ""),
+            strict=bool(int(getattr(opt, "sem_pretrained_strict", 0))),
+            verbose=bool(int(getattr(opt, "sem_pretrained_verbose", 1))),
+        )
+        sem_backbone = sem_backbone.to(dev)
+        sem_backbone.eval()
+        for p in sem_backbone.parameters():
+            p.requires_grad_(False)
+
+        # ImageNet normalization constants
+        _im_mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
+        _im_std = torch.tensor([0.229, 0.224, 0.225], device=dev).view(1, 3, 1, 1)
+
+        def _sem_feats(imgs: torch.Tensor) -> torch.Tensor:
+            # imgs expected shape: (B,C,H,W)
+            x = imgs
+            if x.dim() != 4:
+                raise ValueError(f"sup_freeze: expected imgs BCHW, got {tuple(x.shape)}")
+            if x.size(1) == 1:
+                x = x.repeat(1, 3, 1, 1)
+            if sup_sem_imagenet_norm:
+                # many GAN pipelines use [-1,1]; convert to [0,1] then normalize
+                x = (x + 1.0) * 0.5
+                x = x.clamp(0.0, 1.0)
+                x = (x - _im_mean) / _im_std
+            out = sem_backbone(x)
+            if isinstance(out, dict):
+                feat = out.get("0", None)
+                if feat is None:
+                    feat = next(iter(out.values()))
+            else:
+                feat = out
+            # Global average pooling
+            feat = feat.mean(dim=(2, 3))
+            return feat
+
+    def _get_sup_feats(G_sup, imgs: torch.Tensor, feat_type: str, δw_str: str | None) -> torch.Tensor:
+        if sup_feat_source == "sem_resnet50":
+            return _sem_feats(imgs)
+        # NOTE: for cont_tok/cont_tok_vit, δw_str should be None
+        return G_sup.sup_features(imgs, feat_type, delta_weights=δw_str)
+
+
     def _parse_dw(dw: str, need: int) -> str:
         vals = [float(t) for t in str(dw).split(",") if t.strip()]
         if len(vals) == need:
@@ -281,7 +339,7 @@ def run_sup_freeze_mode(
             imgs = imgs.to(next(G_sup.parameters()).device)
 
             # NOTE : pour cont_tok / cont_tok_vit, δw_str sera None
-            feats = G_sup.sup_features(imgs, feat_type, delta_weights=δw_str)
+            feats = _get_sup_feats(G_sup, imgs, feat_type, δw_str)
             logits, attn = G_sup.sup_heads(feats, return_attn=True)
 
             if not isinstance(logits, dict):
@@ -376,17 +434,20 @@ def run_sup_freeze_mode(
         else:
             tasks = {"default": int(getattr(opt, "sup_num_classes", 2))}
 
-        in_dim = G_sup.sup_in_dim_for(feat_type)
+        in_dim = int(sem_out_channels) if (sup_feat_source == "sem_resnet50") else G_sup.sup_in_dim_for(feat_type)
 
         # token_mode en fonction du type de features
-        token_mode = (
-            "multi6"
-            if feat_type in ("tok6",)
-            else "single"
-            if feat_type in ("tokG", "style_tok", "tok6_mean", "tok6_w")
-            # Pour cont_tok / cont_tok_vit, on reste en "flat" par défaut
-            else "flat"
-        )
+        if sup_feat_source == "sem_resnet50":
+            token_mode = "flat"
+        else:
+            token_mode = (
+                "multi6"
+                if feat_type in ("tok6",)
+                else "single"
+                if feat_type in ("tokG", "style_tok", "tok6_mean", "tok6_w")
+                # Pour cont_tok / cont_tok_vit, on reste en "flat" par défaut
+                else "flat"
+            )
 
         G_sup.sup_heads = SupHeads(
             tasks,
@@ -456,7 +517,7 @@ def run_sup_freeze_mode(
                 imgs = imgs.to(dev)
 
                 # NOTE : pour cont_tok / cont_tok_vit, δw_str = None
-                feats = G_sup.sup_features(imgs, feat_type, delta_weights=δw_str)
+                feats = _get_sup_feats(G_sup, imgs, feat_type, δw_str)
                 logits, attn = G_sup.sup_heads(feats, return_attn=True)
 
                 if not isinstance(logits, dict):
@@ -564,6 +625,8 @@ def run_sup_freeze_mode(
                     opt_DB,
                     global_step,
                     Path(opt.save_dir),
+                    sem_model=(sem_backbone if sup_feat_source == "sem_resnet50" else None),
+                    sem_filename="SemBackbone",
                 )
                 save_state_json(epoch, global_step, opt, Path(opt.save_dir))
                 save_supheads_rich(

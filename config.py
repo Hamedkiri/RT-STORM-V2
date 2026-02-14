@@ -244,6 +244,22 @@ def get_opts():
     p.add_argument("--delta_weights", type=str, default="1,1,1,1,1", help="Poids échelles pour 'tok+delta'.")
     p.add_argument("--sup_tasks_json", type=str, default=None, help="JSON tâches: {task: n_classes ou [names]}")
 
+    # Source des features pour SupHeads (utile en sup_freeze/hybrid)
+    p.add_argument(
+        "--sup_feat_source",
+        type=str,
+        default="generator",
+        choices=["generator", "sem_resnet50"],
+        help="Source des features pour SupHeads: generator (G.sup_features) ou sem_resnet50 (backbone ResNet sémantique + GAP).",
+    )
+    p.add_argument(
+        "--sup_sem_imagenet_norm",
+        type=int,
+        default=1,
+        help="(0/1) Si sup_feat_source=sem_resnet50: convertir [-1,1]->[0,1] puis normaliser ImageNet (mean/std) avant ResNet.",
+    )
+
+
     # =========================================================================
     # 13) Backbone : freeze global + overrides
     # =========================================================================

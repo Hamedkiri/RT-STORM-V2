@@ -38,16 +38,89 @@ from typing import Tuple, Dict, List
 from training.checkpoint import _remap_keys
 
 
+# =========================================================
+#  Semantic backbone (ResNet) helpers for evaluation / t-SNE
+# =========================================================
 
 
+def build_sem_backbone_for_eval(
+    *,
+    device: torch.device,
+    arch: str = "resnet50",
+    return_layer: str = "layer4",
+    pretrained: bool = True,
+    pretrained_path: str = "",
+    strict: bool = False,
+    verbose: bool = True,
+    # --- NEW: auto-load semantic backbone weights from a run folder ---
+    weights_dir: Optional[Path] = None,
+    sem_filename: str = "SemBackbone",
+    epoch: Optional[int] = None,
+):
+    """Build the same semantic ResNet backbone as the detection branch.
 
+    If weights_dir is provided and contains saved semantic weights
+    (e.g. SemBackbone_epochXX.pt / .safetensors), they are loaded automatically.
 
+    Returns: (backbone, out_channels)
+    """
+    from training.train_detection_transformer import _build_sem_resnet_backbone
 
+    backbone, out_ch = _build_sem_resnet_backbone(
+        pretrained=bool(pretrained),
+        arch=str(arch),
+        return_layer=str(return_layer),
+        pretrained_path=str(pretrained_path or ""),
+        strict=bool(strict),
+        verbose=bool(verbose),
+    )
+    backbone = backbone.to(device)
+    backbone.eval()
+    for p in backbone.parameters():
+        p.requires_grad_(False)
 
+    # --- Auto-load saved weights if available ---
+    if weights_dir is not None:
+        try:
+            wdir = Path(weights_dir)
+            if epoch is not None:
+                # explicit epoch
+                cand = []
+                cand += list(wdir.glob(f"{sem_filename}_epoch{int(epoch)}.safetensors"))
+                cand += list(wdir.glob(f"{sem_filename}_epoch{int(epoch)}.pt"))
+                wfile = cand[0] if cand else None
+            else:
+                # pick latest by mtime
+                cand = sorted(
+                    list(wdir.glob(f"{sem_filename}_epoch*.safetensors")) + list(wdir.glob(f"{sem_filename}_epoch*.pt")),
+                    key=lambda p: p.stat().st_mtime,
+                )
+                wfile = cand[-1] if cand else None
 
+            if wfile is not None and wfile.exists():
+                if wfile.suffix == ".pt":
+                    obj = torch.load(str(wfile), map_location="cpu")
+                    sd = obj.get("state_dict", obj) if isinstance(obj, dict) else obj
+                    backbone.load_state_dict(sd, strict=False)
+                else:
+                    # safetensors
+                    try:
+                        from safetensors.torch import load_file as st_load
+                        sd = st_load(str(wfile))
+                        backbone.load_state_dict(sd, strict=False)
+                    except Exception as e:
+                        if verbose:
+                            print(f"[WARN] Impossible de charger {wfile} (safetensors): {e}")
+                if verbose:
+                    print(f"✓ sem_backbone chargé depuis {wfile}")
+            else:
+                if verbose:
+                    print(f"[INFO] Aucun poids sémantique trouvé dans {wdir} (pattern: {sem_filename}_epoch*). Utilisation backbone initialisé.")
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Auto-load sem_backbone échoué: {e}")
 
-
-
+    return backbone, out_ch
 def build_test_dataloader(opt, cfg) -> Tuple[DataLoader, torch.utils.data.Dataset, str]:
     """
     Construire DataLoader selon --data / --data_json ou config.
@@ -1997,6 +2070,140 @@ def compute_style_embeddings(
     return embs, labels, class_maps, paths
 
 
+def compute_sem_embeddings(
+    sem_backbone,
+    loader,
+    device,
+    *,
+    imagenet_norm: bool = True,
+    pca_dim: Optional[int] = None,
+    l2_norm: bool = False,
+):
+    """Compute embeddings from a semantic ResNet backbone (GAP(layerX)).
+
+    This mirrors compute_style_embeddings output contract:
+      (embs_by_task, labels_by_task, class_maps_by_task, paths_by_task)
+    """
+    import numpy as np
+    import torch
+    from torch.utils.data import Subset
+
+    sem_backbone.eval()
+
+    # Dataset / Subset for paths
+    ds_wrapped = loader.dataset
+    if isinstance(ds_wrapped, Subset):
+        base_ds, subset_idx = ds_wrapped.dataset, ds_wrapped.indices
+    else:
+        base_ds, subset_idx = ds_wrapped, None
+
+    # tasks & class maps
+    if hasattr(base_ds, "task_classes") and isinstance(getattr(base_ds, "task_classes"), dict):
+        task_names = list(base_ds.task_classes.keys())
+        class_maps = dict(base_ds.task_classes)
+    else:
+        classes = list(getattr(base_ds, "classes", []))
+        task_names = ["__DEFAULT__"]
+        class_maps = {"__DEFAULT__": classes}
+
+    embs: dict[str, list[np.ndarray]] = {t: [] for t in task_names}
+    labels: dict[str, list[np.ndarray]] = {t: [] for t in task_names}
+    paths: dict[str, list[str]] = {t: [] for t in task_names}
+
+    _im_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    _im_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    global_idx = 0
+    for batch in loader:
+        if len(batch) == 3:
+            imgs, lbl_batch, path_list = batch
+        else:
+            imgs, lbl_batch = batch
+            B = imgs.size(0)
+            ids = ([subset_idx[global_idx + i] for i in range(B)]
+                   if subset_idx is not None else
+                   list(range(global_idx, global_idx + B)))
+            samples = getattr(base_ds, "samples", None) or getattr(base_ds, "imgs", None)
+            if samples is None:
+                raise AttributeError("Le dataset ne possède pas d'attribut 'samples'/'imgs' pour récupérer les chemins.")
+            path_list = [samples[j][0] for j in ids]
+
+        imgs = imgs.to(device, non_blocking=True)
+        x = imgs
+        if x.size(1) == 1:
+            x = x.repeat(1, 3, 1, 1)
+        if imagenet_norm:
+            # convert [-1,1] -> [0,1] then ImageNet normalize
+            x = (x + 1.0) * 0.5
+            x = x.clamp(0.0, 1.0)
+            x = (x - _im_mean) / _im_std
+
+        with torch.no_grad():
+            out = sem_backbone(x)
+            if isinstance(out, dict):
+                feat = out.get("0", None)
+                if feat is None:
+                    feat = next(iter(out.values()))
+            else:
+                feat = out
+            feat = feat.mean(dim=(2, 3))  # GAP
+            feat_np = feat.detach().cpu().numpy().astype(np.float32)
+
+        if isinstance(lbl_batch, dict):
+            for t in task_names:
+                raw = lbl_batch.get(t, None)
+                if raw is None:
+                    continue
+                lbl_t = torch.as_tensor(raw)
+                mask = (lbl_t >= 0)
+                if mask.any():
+                    m = mask.cpu().numpy()
+                    embs[t].append(feat_np[m])
+                    labels[t].append(lbl_t[mask].cpu().numpy())
+                    paths[t].extend([p for p, keep in zip(path_list, m) if keep])
+        else:
+            t = "__DEFAULT__"
+            embs[t].append(feat_np)
+            labels[t].append(lbl_batch.cpu().numpy())
+            paths[t].extend(path_list)
+
+        global_idx += imgs.size(0)
+
+    for t in task_names:
+        embs[t] = np.concatenate(embs[t], 0) if embs[t] else np.zeros((0, 1), dtype=np.float32)
+        labels[t] = np.concatenate(labels[t], 0) if labels[t] else np.array([], dtype=np.int64)
+        paths[t] = list(paths[t])
+
+    # optional PCA + L2 like style branch
+    if (pca_dim is not None) or l2_norm:
+        order = list(task_names)
+        lengths = {t: embs[t].shape[0] for t in order}
+        X = np.concatenate([embs[t] for t in order], 0) if order else np.zeros((0, 1), dtype=np.float32)
+
+        if X.size and (pca_dim is not None) and 0 < pca_dim < X.shape[1]:
+            Xc = X - X.mean(axis=0, keepdims=True)
+            U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+            X = Xc @ Vt[:pca_dim].T
+
+        if X.size and l2_norm:
+            n = np.linalg.norm(X, axis=1, keepdims=True)
+            X = X / np.clip(n, 1e-12, None)
+
+        s = 0
+        for t in order:
+            n = lengths[t]
+            embs[t] = X[s:s+n]
+            s += n
+
+    if "__DEFAULT__" in embs and "default" not in embs:
+        embs["default"] = embs["__DEFAULT__"]
+        labels["default"] = labels["__DEFAULT__"]
+        paths["default"] = paths["__DEFAULT__"]
+        class_maps["default"] = class_maps["__DEFAULT__"]
+
+    return embs, labels, class_maps, paths
+
+
 
 
 
@@ -2103,7 +2310,14 @@ def compute_embeddings_with_paths(
     feat_type = getattr(model, "feat_type", "tok+delta")
     delta_weights = _normalize_delta_w(getattr(model, "delta_weights", "1,1,1,1,1"))
 
-    if use_manual:
+    # IMPORTANT: when using a semantic backbone adapter (feat_type like 'sem_resnet50'),
+    # we must NOT auto-guess another feat_type (tok6/tok+delta/...). Those names are
+    # meaningful only for the generator branch. For semantic backbones, G.sup_features
+    # ignores feat_type and always returns the semantic GAP vector; auto-guessing could
+    # confuse logging/debugging and (in some wrappers) fall back to a generator path.
+    force_feat_type = str(feat_type).lower().startswith("sem_resnet")
+
+    if use_manual and (not force_feat_type):
         target_in = getattr(model.Sup, "in_dim", None)
         if target_in is None and hasattr(model.Sup, "classifiers"):
             for m in model.Sup.classifiers.values():

@@ -14,3 +14,5 @@ SemMoCo_epoch93.pt
 /__pycache__
 /__pycache__
 /models/__pycache__
+/__pycache__
+/training/__pycache__
