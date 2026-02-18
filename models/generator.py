@@ -44,58 +44,71 @@ class UNetGenerator(nn.Module):
         style_nc: int = 3,
         spade_ch: int = 64,
         token_dim: int = 256,
+        *,
+        arch_depth_delta: int = 0,
+        style_token_levels: int = -1,
     ):
         super().__init__()
         self.ngf = int(ngf)
         self.hid_dim = int(token_dim)  # dim tokens style + contenu
         self.nc = int(nc)
 
-        # tailles des skips (s5..s1) côté encodeur
-        self.skip_channels: List[int] = [ngf * 8, ngf * 8, ngf * 4, ngf * 2, ngf]
+        # ---------------- architecture scaling ----------------
+        base_levels = 5
+        depth_delta = int(arch_depth_delta)
+        L = int(style_token_levels) if int(style_token_levels) > 0 else (base_levels + depth_delta)
+        L = max(1, L)
+        self.style_levels = L               # nb tokens locaux (tL..t1)
+        self.unet_levels = L                # nb niveaux de skip (s1..sL)
 
-        # --------------------- encodeur contenu ---------------------
-        self.d1 = Down(nc, ngf)        # → s1
-        self.d2 = Down(ngf, ngf * 2)   # → s2
-        self.d3 = Down(ngf * 2, ngf * 4)  # → s3
-        self.d4 = Down(ngf * 4, ngf * 8)  # → s4
-        self.d5 = Down(ngf * 8, ngf * 8)  # → s5
-        self.d6 = Down(ngf * 8, ngf * 8)  # → s6 (plus compact)
-        self.res5, self.res6 = ResBlock(ngf * 8), ResBlock(ngf * 8)
-        self.bot = ConvBlock(ngf * 8, ngf * 8)
+        def ch_for_level(lvl: int) -> int:
+            # lvl: 1..L (+ bottleneck L+1)
+            if lvl == 1: return self.ngf
+            if lvl == 2: return self.ngf * 2
+            if lvl == 3: return self.ngf * 4
+            return self.ngf * 8
 
-        # ------------------ encodeur style / SPADE ------------------
-        # Doit implémenter:
-        #   • __call__(img) → (maps, toks, tokG) (toléré: (toks,tokG), (maps,tokG), (tokG,))
-        #   • h5..h1(skip)  → maps m5..m1 (taille spade_ch)
-        self.style_enc = StylePyramidEncoder(style_nc, ngf, spade_ch, token_dim)
+        # tailles des skips (sL..s1) côté encodeur (deep -> shallow)
+        self.skip_channels: List[int] = [ch_for_level(lvl) for lvl in range(self.unet_levels, 0, -1)]
 
-        # ------------------------ décodeur --------------------------
-        self.u1 = SPADEUp(
-            c_up=ngf * 8, c_skip=ngf * 8, c_out=ngf * 8,
-            s_ch=spade_ch, token_dim=token_dim
-        )  # s5
-        self.u2 = SPADEUp(
-            c_up=ngf * 8, c_skip=ngf * 8, c_out=ngf * 8,
-            s_ch=spade_ch, token_dim=token_dim
-        )  # s4
-        self.u3 = SPADEUp(
-            c_up=ngf * 8, c_skip=ngf * 4, c_out=ngf * 4,
-            s_ch=spade_ch, token_dim=token_dim
-        )  # s3
-        self.u4 = SPADEUp(
-            c_up=ngf * 4, c_skip=ngf * 2, c_out=ngf * 2,
-            s_ch=spade_ch, token_dim=token_dim
-        )  # s2
-        self.u5 = SPADEUp(
-            c_up=ngf * 2, c_skip=ngf, c_out=ngf,
-            s_ch=spade_ch, token_dim=token_dim
-        )  # s1
+        # --------------------- encodeur contenu (variable) ---------------------
+        # On crée d1..dK comme attributs (compat state_dict), et on garde une liste `downs`.
+        self.downs = []  # list[Down] pour itération
+        in_ch = self.nc
+        for lvl in range(1, self.unet_levels + 2):
+            out_ch = ch_for_level(lvl)
+            m = Down(in_ch, out_ch)
+            setattr(self, f"d{lvl}", m)
+            self.downs.append(m)
+            in_ch = out_ch
+
+        # resblocks near bottom + bottleneck conv
+        self.res_skip = ResBlock(ch_for_level(self.unet_levels))
+        self.res_bot  = ResBlock(ch_for_level(self.unet_levels + 1))
+        self.bot = ConvBlock(ch_for_level(self.unet_levels + 1), ch_for_level(self.unet_levels + 1))
+
+        # ------------------ encodeur style / SPADE (scales variables) ------------------
+        self.style_enc = StylePyramidEncoder(style_nc, self.ngf, spade_ch, token_dim, num_levels=self.style_levels)
+
+        # ------------------------ décodeur (variable) --------------------------
+        # On crée u1..uL comme attributs (compat state_dict), et on garde une liste `ups`.
+        self.ups = []  # list[SPADEUp] pour itération
+        c_up = ch_for_level(self.unet_levels + 1)  # bottleneck
+        idx = 1
+        for lvl in range(self.unet_levels, 0, -1):
+            c_skip = ch_for_level(lvl)
+            c_out  = ch_for_level(lvl)
+            m = SPADEUp(c_up=c_up, c_skip=c_skip, c_out=c_out, s_ch=spade_ch, token_dim=token_dim)
+            setattr(self, f"u{idx}", m)
+            self.ups.append(m)
+            c_up = c_out
+            idx += 1
 
         self.final = nn.Sequential(
-            nn.Conv2d(ngf, ngf, 3, 1, 1),
+            nn.Conv2d(ch_for_level(1), ch_for_level(1), 3, 1, 1),
             nn.ReLU(True),
             nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(ngf, nc, 3, 1, 1),
+            nn.Conv2d(ch_for_level(1), self.nc, 3, 1, 1),
             nn.Tanh(),
         )
 
@@ -220,17 +233,22 @@ class UNetGenerator(nn.Module):
     def encode_content(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Retourne:
-          - z:   bottleneck (B, 8*ngf, h, w)
-          - skips: (s1..s5)
+          - z:   bottleneck (B, Cb, h, w)
+          - skips: (s1..sL) où L=self.unet_levels
         """
-        s1 = self.d1(x)
-        s2 = self.d2(s1)
-        s3 = self.d3(s2)
-        s4 = self.d4(s3)
-        s5 = self.res5(self.d5(s4))
-        z = self.res6(self.d6(s5))
+        skips = []
+        h = x
+        # levels 1..L
+        for lvl in range(1, self.unet_levels + 1):
+            h = self.downs[lvl-1](h)
+            skips.append(h)
+        # resblock on deepest skip
+        skips[-1] = self.res_skip(skips[-1])
+        # bottleneck extra down
+        z = self.downs[self.unet_levels](skips[-1])
+        z = self.res_bot(z)
         z = self.bot(z)
-        return z, (s1, s2, s3, s4, s5)
+        return z, tuple(skips)
 
     @torch.no_grad()
     def build_style(self, style_imgs: torch.Tensor):
@@ -239,48 +257,54 @@ class UNetGenerator(nn.Module):
 
     def forward(self, x: torch.Tensor, *, style: Optional[Union[torch.Tensor, dict]] = None):
         # 1) contenu
-        z, (s1, s2, s3, s4, s5) = self.encode_content(x)
+        z, skips = self.encode_content(x)  # skips: (s1..sL)
 
-        # 2) tokens de style
+        # 2) tokens de style (issus de l'image style)
         if style is None:
             _, toks, tokG = self._style_tokens_maps(x)  # identité
         elif isinstance(style, torch.Tensor):
-            _, toks, tokG = self._style_tokens_maps(style)  # style explicite y
+            _, toks, tokG = self._style_tokens_maps(style)
         elif isinstance(style, dict):
             toks = style.get("tokens", None)
             tokG = style.get("token", None)
             if toks is None and tokG is None:
                 _, toks, tokG = self._style_tokens_maps(x)
             elif toks is None and tokG is not None:
-                toks = (tokG, tokG, tokG, tokG, tokG)
+                # répéter tokG sur L tokens locaux
+                toks = tuple(tokG for _ in range(self.style_levels))
             elif toks is not None and tokG is None:
-                # approx tokG = moyenne des t*
                 comps = []
                 for t in toks:
                     comps.append(t[0] if (isinstance(t, (tuple, list)) and len(t) == 2) else t)
                 tokG = torch.stack(comps, dim=0).mean(0)
         else:
-            raise TypeError(
-                "style doit être None, Tensor(y), ou dict{'tokens':(t5..t1), 'token':tokG}."
-            )
+            raise TypeError("style doit être None, Tensor(y), ou dict{'tokens':(tL..t1), 'token':tokG}.")
 
-        # 3) cartes SPADE (depuis contenu x via h5..h1)
-        m5 = self.style_enc.h5(s5)
-        m4 = self.style_enc.h4(s4)
-        m3 = self.style_enc.h3(s3)
-        m2 = self.style_enc.h2(s2)
-        m1 = self.style_enc.h1(s1)
-        t5, t4, t3, t2, t1 = toks if isinstance(toks, (list, tuple)) else (None,) * 5
+        # 3) cartes SPADE depuis le contenu (hL..h1)
+        # skips are (s1..sL). We need deep->shallow ordering.
+        skips_ds = list(skips)[::-1]  # sL..s1
+        maps_ds = [getattr(self.style_enc, f'h{lvl}')(skips[lvl-1]) for lvl in range(self.style_levels, 0, -1)]
+
+        # tokens locaux deep->shallow
+        toks_ds = list(toks) if isinstance(toks, (list, tuple)) else []
+        # tolère ancien format (len=5). Si mismatch, on pad/trim.
+        if len(toks_ds) == 0:
+            toks_ds = [tokG for _ in range(self.style_levels)] if tokG is not None else [None] * self.style_levels
+        if len(toks_ds) != self.style_levels:
+            if len(toks_ds) < self.style_levels:
+                pad = toks_ds[-1] if len(toks_ds) else (tokG if tokG is not None else None)
+                toks_ds = (toks_ds + [pad] * self.style_levels)[: self.style_levels]
+            else:
+                toks_ds = toks_ds[: self.style_levels]
 
         # 4) décodeur conditionné
-        x = self.u1(z, s5, m5, t5)
-        x = self.u2(x, s4, m4, t4)
-        x = self.u3(x, s3, m3, t3)
-        x = self.u4(x, s2, m2, t2)
-        x = self.u5(x, s1, m1, t1)
+        h = z
+        for up, s, m, t in zip(self.ups, skips_ds, maps_ds, toks_ds):
+            h = up(h, s, m, t)
 
         # 5) sortie
-        return self.final(x)
+        return self.final(h)
+
 
     # ------------------- intégration SupHeads ----------------------
 
@@ -344,9 +368,9 @@ class UNetGenerator(nn.Module):
         # --- STYLE-BIASED ---
         if feat_type in ("style_tok", "tokG"):
             return self.hid_dim
-        if feat_type == "tok6":
-            return 6 * self.hid_dim
-        if feat_type in ("tok6_mean", "tok6_w"):
+        if feat_type in ("tok6", "tokL"):
+            return (1 + self.style_levels) * self.hid_dim
+        if feat_type in ("tok6_mean", "tok6_w", "tokL_mean", "tokL_w"):
             return self.hid_dim
         if feat_type == "bot+tok":
             return Cb + self.hid_dim
@@ -415,42 +439,53 @@ class UNetGenerator(nn.Module):
             if tokG is None:
                 # fallback: bot si tokG indispo
                 return self._gap(z)
-            return self._l2_norm_rows(tokG)  # (B,D)
-
-        # --- concat 6 tokens ---
-        if feat_type == "tok6":
+            return self._l2_norm_rows(tokG)  # (B,D)        # --- concat multi-tokens (tokG + tL..t1) ---
+        if feat_type in ("tok6", "tokL"):
             # tolère l’absence des tokens locaux
             if tokG is None and (toks is None or len(toks) == 0):
                 return self._gap(z)
             if tokG is None and toks is not None and len(toks) > 0:
                 tokG = toks[0].new_zeros(toks[0].shape[0], toks[0].shape[1])
-            seq = [self._l2_norm_rows(tokG)] + (
-                [self._l2_norm_rows(t) for t in toks] if toks is not None else []
-            )
-            return torch.cat(seq, dim=1)  # (B, 6*D)
 
-        # --- moyenne (uniforme/pondérée) des 6 tokens ---
-        if feat_type in ("tok6_mean", "tok6_w"):
+            toks_list = list(toks) if isinstance(toks, (list, tuple)) else []
+            # ajuste à self.style_levels
+            if len(toks_list) < self.style_levels:
+                pad = toks_list[-1] if len(toks_list) else tokG
+                toks_list = (toks_list + [pad] * self.style_levels)[: self.style_levels]
+            elif len(toks_list) > self.style_levels:
+                toks_list = toks_list[: self.style_levels]
+
+            seq = [self._l2_norm_rows(tokG)] + [self._l2_norm_rows(t) for t in toks_list]
+            return torch.cat(seq, dim=1)  # (B, (1+L)*D)
+
+        # --- moyenne (uniforme/pondérée) des tokens ---
+        if feat_type in ("tok6_mean", "tok6_w", "tokL_mean", "tokL_w"):
             if tokG is None and (toks is None or len(toks) == 0):
                 return self._gap(z)
             if tokG is None and toks is not None and len(toks) > 0:
                 tokG = toks[0].new_zeros(toks[0].shape[0], toks[0].shape[1])
 
-            seq = [self._l2_norm_rows(tokG)] + (
-                [self._l2_norm_rows(t) for t in toks] if toks is not None else []
-            )  # 6 × (B, D)
-            S = torch.stack(seq, dim=1)  # (B, 6, D)
+            toks_list = list(toks) if isinstance(toks, (list, tuple)) else []
+            if len(toks_list) < self.style_levels:
+                pad = toks_list[-1] if len(toks_list) else tokG
+                toks_list = (toks_list + [pad] * self.style_levels)[: self.style_levels]
+            elif len(toks_list) > self.style_levels:
+                toks_list = toks_list[: self.style_levels]
 
-            if feat_type == "tok6_mean":
-                return S.mean(dim=1)  # (B, D)
+            seq = [self._l2_norm_rows(tokG)] + [self._l2_norm_rows(t) for t in toks_list]
+            S = torch.stack(seq, dim=1)  # (B, 1+L, D)
 
-            # tok6_w: 6 poids wG,w5,w4,w3,w2,w1
-            w6 = self._parse_delta_weights(delta_weights, 6)
-            W = torch.tensor(w6, device=imgs.device, dtype=S.dtype).view(1, -1, 1)
+            if feat_type in ("tok6_mean", "tokL_mean"):
+                return S.mean(dim=1)
+
+            # pondéré: delta_weights fournit (1+L) poids
+            wN = self._parse_delta_weights(delta_weights, 1 + self.style_levels)
+            W = torch.tensor(wN, device=imgs.device, dtype=S.dtype).view(1, -1, 1)
             W = W / (W.sum() + 1e-8)
-            return (S * W).sum(1)  # (B, D)
+            return (S * W).sum(1)
 
         # --- mix bottleneck + token ---
+
         if feat_type == "bot+tok":
             if tokG is None:
                 return self._gap(z)
@@ -466,12 +501,12 @@ class UNetGenerator(nn.Module):
                     else torch.cat([self._l2_norm_rows(tokG), self._gap(z)], dim=1)
                 )
 
-            ws = self._parse_delta_weights(delta_weights, 5)
+            ws = self._parse_delta_weights(delta_weights, self.style_levels)
 
             # initialisation lazy des heads (proj m_i → c_skip[i])
             if self._delta_heads is None:
                 in_ch = int(maps[0].size(1))
-                outs = self.skip_channels  # [8ngf, 8ngf, 4ngf, 2ngf, ngf]
+                outs = self.skip_channels  # (deep->shallow), length = style_levels
                 self._delta_heads = nn.ModuleList(
                     [
                         nn.Sequential(

@@ -151,58 +151,79 @@ class SPADEUp(nn.Module):
 # ──────────────────────────────────────────────────────────────
 
 class StylePyramidEncoder(nn.Module):
-    """
+    """Encodeur pyramidal de style (scales variables).
+
     Retourne:
-      - maps:  (m5, m4, m3, m2, m1)  [s_ch canaux]
-      - toks:  (t5, t4, t3, t2, t1)  [token_dim]
+      - maps:  (mL, ..., m1)  [s_ch canaux]
+      - toks:  (tL, ..., t1)  [token_dim]
       - tokG:  token global (bottleneck)
+
+    Par défaut, L=5 (comportement historique).
     """
-    def __init__(self, in_nc: int, base: int, s_ch: int, token_dim: int):
+
+    def __init__(self, in_nc: int, base: int, s_ch: int, token_dim: int, *, num_levels: int = 5):
         super().__init__()
-        ngf = base
-        self.d1 = Down(in_nc,     ngf)
-        self.d2 = Down(ngf,       ngf * 2)
-        self.d3 = Down(ngf * 2,   ngf * 4)
-        self.d4 = Down(ngf * 4,   ngf * 8)
-        self.d5 = Down(ngf * 8,   ngf * 8)
-        self.d6 = Down(ngf * 8,   ngf * 8)
-        self.res5, self.res6 = ResBlock(ngf * 8), ResBlock(ngf * 8)
-        self.bot = ConvBlock(ngf * 8, ngf * 8)
+        ngf = int(base)
+        self.num_levels = int(num_levels)
+        assert self.num_levels >= 1
 
-        def head(c): return nn.Conv2d(c, s_ch, 3, 1, 1)
-        self.h1 = head(ngf)         # s1
-        self.h2 = head(ngf * 2)     # s2
-        self.h3 = head(ngf * 4)     # s3
-        self.h4 = head(ngf * 8)     # s4
-        self.h5 = head(ngf * 8)     # s5
+        def ch_for_level(lvl: int) -> int:
+            if lvl == 1: return ngf
+            if lvl == 2: return ngf * 2
+            if lvl == 3: return ngf * 4
+            return ngf * 8
 
-        def tok_head(c):
-            return nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(c, token_dim, 1))
-        self.t1 = tok_head(ngf)
-        self.t2 = tok_head(ngf * 2)
-        self.t3 = tok_head(ngf * 4)
-        self.t4 = tok_head(ngf * 8)
-        self.t5 = tok_head(ngf * 8)
-        self.tbot = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(ngf * 8, token_dim, 1))
+        # d1..dK (K = L+1) : L niveaux de skip + 1 down bottleneck
+        self.downs = []  # list[Down] pour itération
+        in_ch = in_nc
+        for lvl in range(1, self.num_levels + 2):
+            out_ch = ch_for_level(lvl)
+            m = Down(in_ch, out_ch)
+            setattr(self, f"d{lvl}", m)
+            self.downs.append(m)
+            in_ch = out_ch
+
+        self.res_skip = ResBlock(ch_for_level(self.num_levels))
+        self.res_bot = ResBlock(ch_for_level(self.num_levels + 1))
+        self.bot = ConvBlock(ch_for_level(self.num_levels + 1), ch_for_level(self.num_levels + 1))
+
+        # heads per skip level (registered only once)
+        self._h_list = []
+        self._t_list = []
+        for lvl in range(1, self.num_levels + 1):
+            h = nn.Conv2d(ch_for_level(lvl), s_ch, 3, 1, 1)
+            t = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(ch_for_level(lvl), token_dim, 1))
+            setattr(self, f"h{lvl}", h)
+            setattr(self, f"t{lvl}", t)
+            self._h_list.append(h)
+            self._t_list.append(t)
+
+        self.tokG_head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(ch_for_level(self.num_levels + 1), token_dim, 1))
 
     def forward(self, img: torch.Tensor):
-        s1 = self.d1(img)             # H/2
-        s2 = self.d2(s1)              # H/4
-        s3 = self.d3(s2)              # H/8
-        s4 = self.d4(s3)              # H/16
-        s5 = self.res5(self.d5(s4))   # H/32
-        z  = self.res6(self.d6(s5))   # H/64
-        z  = self.bot(z)
+        skips = []
+        x = img
+        for lvl in range(1, self.num_levels + 1):
+            x = self.downs[lvl-1](x)
+            skips.append(x)
 
-        maps = (self.h5(s5), self.h4(s4), self.h3(s3), self.h2(s2), self.h1(s1))
-        toks = (self.t5(s5).flatten(1),
-                self.t4(s4).flatten(1),
-                self.t3(s3).flatten(1),
-                self.t2(s2).flatten(1),
-                self.t1(s1).flatten(1))
-        tokG = self.tbot(z).flatten(1)
-        return maps, toks, tokG
+        skips[-1] = self.res_skip(skips[-1])
 
+        z = self.downs[self.num_levels](skips[-1])
+        z = self.res_bot(z)
+        z = self.bot(z)
+
+        maps = []
+        toks = []
+        for lvl in range(self.num_levels, 0, -1):
+            s = skips[lvl-1]
+            h = getattr(self, f"h{lvl}")
+            t = getattr(self, f"t{lvl}")
+            maps.append(h(s))
+            toks.append(t(s).flatten(1))
+
+        tokG = self.tokG_head(z).flatten(1)
+        return tuple(maps), tuple(toks), tokG
 
 
 

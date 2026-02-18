@@ -289,6 +289,29 @@ def save_supheads_rich(sup_heads: nn.Module, out_path: Path, *, safe_write: bool
     _log(f"✓ SupHeads (rich) sauvegardé → {out_path}")
 
 
+def save_sem_backbone_rich(sem_backbone: nn.Module, out_path: Path, *, meta: Optional[Dict[str, Any]] = None,
+                           safe_write: bool = True) -> None:
+    """Sauvegarde un backbone sémantique sous forme {meta, state_dict}.
+
+    On garde un format similaire à la branche 'sem_model' de save_checkpoint, afin que le chargement
+    automatique depuis --weights_dir puisse fonctionner avec un simple torch.load.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if meta is None:
+        meta = {}
+        try:
+            meta["arch"] = str(getattr(sem_backbone, "arch", ""))
+            meta["return_layer"] = str(getattr(sem_backbone, "return_layer", ""))
+        except Exception:
+            pass
+
+    bundle = {"meta": meta, "state_dict": sem_backbone.state_dict()}
+    _atomic_save_torch(bundle, out_path, safe_write=safe_write)
+    _log(f"✓ SemBackbone (rich) sauvegardé → {out_path}")
+
+
 # ────────────────────────────────────────────────────────────────
 # 5) Helpers d’écriture atomique (torch / safetensors)
 # ────────────────────────────────────────────────────────────────

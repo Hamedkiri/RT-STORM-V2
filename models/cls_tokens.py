@@ -111,8 +111,8 @@ class MultiScaleTokenEncoder(nn.Module):
         skips = (s1, s2, s3, s4, s5) comme dans encode_content.
         On renvoie un dict { "s1": s1, ..., "s5": s5 } pour convenance.
         """
-        assert isinstance(skips, (list, tuple)) and len(skips) == 5, \
-            "encode_content doit renvoyer z, (s1, s2, s3, s4, s5)"
+        assert isinstance(skips, (list, tuple)) and len(skips) >= 5, \
+            "encode_content doit renvoyer z, (s1..sL) avec L>=5"
         return {
             "s1": skips[0],
             "s2": skips[1],

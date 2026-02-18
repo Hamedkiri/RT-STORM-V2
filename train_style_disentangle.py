@@ -64,6 +64,7 @@ from helpers import (
     train_step_phase_A,
     train_step_phase_B,
     run_sup_freeze_mode,
+    run_sup_freeze_sem_only,
     new_epoch_meters,
     get_style_lambda,  # scheduler de λ_style_A
 )
@@ -377,9 +378,30 @@ def train_alternating(opt):
     if nbatchs <= 0:
         raise RuntimeError("[data] Dataloaders vides (nbatchs=0).")
 
+    # ==================================================================================
+    #  MODE: sup_freeze + backbone sémantique uniquement
+    #   -> ne charge pas G_A/G_B/D_A/D_B. On entraîne SupHeads multi-tâches sur SemBackbone.
+    # ==================================================================================
+    sup_feat_source = str(getattr(opt, "sup_feat_source", "generator")).lower().strip()
+    sup_sem_only = int(getattr(opt, "sup_sem_only", 1)) == 1
+    if mode == "sup_freeze" and sup_feat_source == "sem_resnet50" and sup_sem_only:
+        writer = SummaryWriter(opt.save_dir) if getattr(opt, "tb", False) else None
+        run_sup_freeze_sem_only(
+            opt=opt,
+            loaders=loaders,
+            dev=dev,
+            writer=writer,
+            tb_freq_C=int(getattr(opt, "tb_freq_C", getattr(opt, "tb_freq", 50))),
+            global_step_start=0,
+        )
+        if writer:
+            writer.flush()
+            writer.close()
+        return
+
     # --- Générateurs / Discriminateurs (style)
-    G_A, D_A = UNetGenerator(token_dim=256).to(dev), PatchDiscriminator().to(dev)
-    G_B, D_B = UNetGenerator(token_dim=256).to(dev), PatchDiscriminator().to(dev)
+    G_A, D_A = UNetGenerator(token_dim=256, arch_depth_delta=int(getattr(opt,"arch_depth_delta",0)), style_token_levels=int(getattr(opt,"style_token_levels",-1))).to(dev), PatchDiscriminator().to(dev)
+    G_B, D_B = UNetGenerator(token_dim=256, arch_depth_delta=int(getattr(opt,"arch_depth_delta",0)), style_token_levels=int(getattr(opt,"style_token_levels",-1))).to(dev), PatchDiscriminator().to(dev)
 
     base_lr = float(getattr(opt, "lr", 2e-4))
     adv_lrD_mult = float(getattr(opt, "adv_lrD_mult", 0.5))

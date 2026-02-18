@@ -14,7 +14,7 @@ from torch.utils.data import Subset
 from tqdm import tqdm
 
 from models.sup_heads import SupHeads
-from training.checkpoint import save_supheads_rich, save_checkpoint, save_state_json
+from training.checkpoint import save_supheads_rich, save_sem_backbone_rich, save_checkpoint, save_state_json
 
 # Import des vraies perturbations / pertes texture (FFT + SWD)
 from training.texture_fft_swd import (
@@ -2994,3 +2994,259 @@ def run_cls_epoch(
     )
 
     return global_step, ce_meter.avg, acc_meter.avg
+
+
+# =========================================================================================
+#                       Mode sup_freeze — SEM ONLY (pas de G_A/G_B)
+# =========================================================================================
+
+def run_sup_freeze_sem_only(
+        opt,
+        loaders,
+        dev,
+        writer=None,
+        tb_freq_C: int = 50,
+        global_step_start: int = 0,
+):
+    """Entraîne uniquement des SupHeads multi-tâches sur un backbone sémantique gelé.
+
+    Objectif : reproduire le comportement de sup_freeze côté 'style', mais sans nécessiter G_A/G_B/D_A/D_B.
+    - Les labels proviennent de MultiTaskDataset (via --data_json + --classes_json).
+    - Le backbone sémantique est construit comme en détection (resnet{50,101,152} + return_layer).
+    - On peut reprendre le backbone depuis --resume_dir s'il contient SemBackbone_epoch*.pt.
+    - On sauvegarde SupHeads + SemBackbone dans save_dir/sup_freeze/fold_xx/.
+    """
+
+    from training.train_detection_transformer import _build_sem_resnet_backbone
+
+    sup_sem_imagenet_norm = int(getattr(opt, "sup_sem_imagenet_norm", 1)) == 1
+    ckpt_safe_write = bool(int(getattr(opt, "safe_write", 1)) != 0)
+
+    # Build semantic backbone
+    sem_backbone, sem_out_channels = _build_sem_resnet_backbone(
+        pretrained=bool(int(getattr(opt, "sem_pretrained", 1))),
+        arch=str(getattr(opt, "det_sem_backbone", "resnet50")),
+        return_layer=str(getattr(opt, "det_sem_return_layer", "layer4")),
+        pretrained_path=str(getattr(opt, "sem_pretrained_path", "") or ""),
+        strict=bool(int(getattr(opt, "sem_pretrained_strict", 0))),
+        verbose=bool(int(getattr(opt, "sem_pretrained_verbose", 1))),
+    )
+    sem_backbone = sem_backbone.to(dev)
+
+    # Optional resume: load latest SemBackbone from resume_dir
+    resume_dir = getattr(opt, "resume_dir", None)
+    if resume_dir:
+        rdir = Path(resume_dir)
+        cand = sorted(list(rdir.glob("SemBackbone_epoch*.pt")), key=lambda p: p.stat().st_mtime)
+        if cand:
+            try:
+                bundle = torch.load(cand[-1], map_location=str(dev))
+                sd = bundle.get("state_dict", bundle)
+                sem_backbone.load_state_dict(sd, strict=False)
+                print(f"✓ [sup_freeze_sem_only] reprise SemBackbone depuis {cand[-1].name}")
+            except Exception as e:
+                print(f"[WARN] reprise SemBackbone impossible ({cand[-1]}): {e}")
+
+    sem_backbone.eval()
+    for p in sem_backbone.parameters():
+        p.requires_grad_(False)
+
+    # ImageNet normalization
+    _im_mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
+    _im_std = torch.tensor([0.229, 0.224, 0.225], device=dev).view(1, 3, 1, 1)
+
+    def _sem_feats(imgs: torch.Tensor) -> torch.Tensor:
+        x = imgs
+        if x.dim() != 4:
+            raise ValueError(f"sup_freeze_sem_only: expected BCHW, got {tuple(x.shape)}")
+        if x.size(1) == 1:
+            x = x.repeat(1, 3, 1, 1)
+        if sup_sem_imagenet_norm:
+            x = (x + 1.0) * 0.5
+            x = x.clamp(0.0, 1.0)
+            x = (x - _im_mean) / _im_std
+        out = sem_backbone(x)
+        if isinstance(out, dict):
+            feat = out.get("0", None)
+            if feat is None:
+                feat = next(iter(out.values()))
+        else:
+            feat = out
+        return feat.mean(dim=(2, 3))
+
+    # --- training hyperparams
+    λ_sup = float(getattr(opt, "lambda_sup", 1.0))
+    eval_every = int(getattr(opt, "sup_eval_every", 1))
+    reset_between = bool(getattr(opt, "sup_reset_between_folds", True))
+
+    k_folds = len(loaders) if len(loaders) > 0 else 1
+    folds_order = list(range(k_folds)) if k_folds >= 1 else [0]
+    global_step = int(global_step_start)
+
+    def _infer_tasks(train_loader):
+        ds = train_loader.dataset
+        ds = ds.dataset if isinstance(ds, Subset) else ds
+        if hasattr(ds, "task_classes") and isinstance(ds.task_classes, dict) and ds.task_classes:
+            return {task: len(lst) for task, lst in ds.task_classes.items()}
+        if hasattr(ds, "classes") and isinstance(ds.classes, (list, tuple)) and ds.classes:
+            return {"default": len(ds.classes)}
+        return {"default": int(getattr(opt, "sup_num_classes", 2))}
+
+    def _make_heads_and_opt(train_loader):
+        tasks = _infer_tasks(train_loader)
+        sup_heads = SupHeads(
+            tasks,
+            int(sem_out_channels),
+            num_scales=6,
+            token_mode="flat",
+            heads=int(getattr(opt, "sup_heads_nheads", 4)),
+            dropout=float(getattr(opt, "sup_heads_dropout", 0.1)),
+            mlp_mult=int(getattr(opt, "sup_heads_mlp_mult", 2)),
+        ).to(dev)
+        for p in sup_heads.parameters():
+            p.requires_grad_(True)
+        opt_Sup = torch.optim.Adam(
+            sup_heads.parameters(),
+            lr=float(getattr(opt, "sup_lr", 1e-4)),
+            betas=(0.9, 0.999),
+        )
+        return tasks, sup_heads, opt_Sup
+
+    for stage, tr_fold in enumerate(folds_order):
+        train_loader = loaders[tr_fold]
+        val_loaders = loaders
+
+        if stage == 0 or reset_between:
+            tasks, sup_heads, opt_Sup = _make_heads_and_opt(train_loader)
+        else:
+            sup_heads.train(True)
+
+        sup_dir = Path(opt.save_dir) / "sup_freeze" / f"fold_{tr_fold:02d}"
+        sup_dir.mkdir(parents=True, exist_ok=True)
+
+        best_val = float("inf")
+        best_state = None
+        best_epoch = -1
+
+        if writer:
+            writer.add_text(
+                "C/run",
+                f"sup_freeze_sem_only — stage {stage} — train on fold {tr_fold} (in_dim={int(sem_out_channels)})",
+                global_step,
+            )
+
+        for epoch in range(int(getattr(opt, "epochs", 1))):
+            sup_heads.train(True)
+
+            ce_meter, acc_meter = AvgMeter(), AvgMeter()
+            pbar = tqdm(train_loader, desc=f"C[sup_freeze_sem]-fold{tr_fold} ep{epoch+1}/{opt.epochs}", ncols=160, leave=False)
+            for batch in pbar:
+                if len(batch) == 3:
+                    imgs, raw, _paths = batch
+                elif len(batch) >= 2:
+                    imgs, raw = batch[0], batch[1]
+                else:
+                    imgs, raw = batch
+                imgs = imgs.to(dev)
+
+                feats = _sem_feats(imgs)
+                logits, attn = sup_heads(feats, return_attn=True)
+
+                if not isinstance(logits, dict):
+                    logits = {"default": logits}
+                if not isinstance(raw, dict):
+                    raw = {"default": raw}
+
+                loss = 0.0
+                used = 0
+                for t, out in logits.items():
+                    if t not in raw:
+                        continue
+                    y = torch.as_tensor(raw[t], device=dev, dtype=torch.long)
+                    mask = (y >= 0) & (y < out.size(1))
+                    if mask.any():
+                        loss_t = F.cross_entropy(out[mask], y[mask])
+                        loss = loss + loss_t
+                        used += 1
+
+                if used == 0:
+                    continue
+
+                loss = loss / float(used)
+                loss = λ_sup * loss
+                opt_Sup.zero_grad(set_to_none=True)
+                loss.backward()
+                opt_Sup.step()
+
+                # simple accuracy on first task present
+                with torch.no_grad():
+                    t0 = next(iter(logits.keys()))
+                    out0 = logits[t0]
+                    y0 = torch.as_tensor(raw.get(t0, []), device=dev, dtype=torch.long)
+                    if y0.numel() == out0.size(0):
+                        acc = float((out0.argmax(1) == y0).float().mean().item())
+                    else:
+                        acc = 0.0
+
+                ce_meter.add(float(loss.item()), c=imgs.size(0))
+                acc_meter.add(float(acc), c=imgs.size(0))
+
+                if writer and (global_step % max(1, tb_freq_C) == 0):
+                    writer.add_scalar("C_sem/train_CE", float(loss.item()), global_step)
+                    writer.add_scalar("C_sem/train_acc", float(acc), global_step)
+
+                pbar.set_postfix(CE=f"{ce_meter.avg:.4f}", acc=f"{acc_meter.avg*100:.2f}%")
+                global_step += 1
+
+            # eval
+            if (epoch + 1) % max(1, eval_every) == 0:
+                sup_heads.eval()
+                val_ce = 0.0
+                val_n = 0
+                with torch.no_grad():
+                    for vloader in val_loaders:
+                        for batch in vloader:
+                            if len(batch) >= 2:
+                                imgs, raw = batch[0], batch[1]
+                            else:
+                                imgs, raw = batch
+                            imgs = imgs.to(dev)
+                            feats = _sem_feats(imgs)
+                            logits, _ = sup_heads(feats, return_attn=False)
+                            if not isinstance(logits, dict):
+                                logits = {"default": logits}
+                            if not isinstance(raw, dict):
+                                raw = {"default": raw}
+                            for t, out in logits.items():
+                                if t not in raw:
+                                    continue
+                                y = torch.as_tensor(raw[t], device=dev, dtype=torch.long)
+                                mask = (y >= 0) & (y < out.size(1))
+                                if mask.any():
+                                    ce = F.cross_entropy(out[mask], y[mask]).item()
+                                    n = int(mask.sum().item())
+                                    val_ce += ce * n
+                                    val_n += n
+                val_ce = val_ce / max(1, val_n)
+                if writer:
+                    writer.add_scalar("C_sem/val_CE", float(val_ce), global_step)
+
+                if val_ce < best_val:
+                    best_val = float(val_ce)
+                    best_state = {k: v.detach().cpu() for k, v in sup_heads.state_dict().items()}
+                    best_epoch = int(epoch)
+
+            # save last every epoch
+            save_supheads_rich(sup_heads, sup_dir / f"SupHeads_last_epoch{epoch}.pt", safe_write=ckpt_safe_write)
+            save_sem_backbone_rich(sem_backbone, sup_dir / f"SemBackbone_epoch{epoch}.pt", safe_write=ckpt_safe_write)
+
+        # save best
+        if best_state is not None:
+            torch.save({"meta": {"best_epoch": best_epoch, "best_val": best_val}, "state_dict": best_state},
+                       sup_dir / "SupHeads_best.pt")
+            save_sem_backbone_rich(sem_backbone, sup_dir / f"SemBackbone_best_epoch{best_epoch}.pt", safe_write=ckpt_safe_write)
+
+    if writer:
+        writer.flush()
+
+    return

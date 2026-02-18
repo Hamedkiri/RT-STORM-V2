@@ -59,6 +59,14 @@ def get_opts():
     p.add_argument("--crop_size", type=int, default=256, help="Taille d'entrée (si utilisée dans transforms).")
 
     # =========================================================================
+    # 1bis) Architecture scaling (UNet + style tokens)
+    # =========================================================================
+    p.add_argument("--arch_depth_delta", type=int, default=0,
+                   help="Ajoute N niveaux (down+up) au UNet et à la pyramide du style-encoder. 0 = arch actuelle.")
+    p.add_argument("--style_token_levels", type=int, default=-1,
+                   help="Override du nombre de niveaux de tokens de style (hors tokG). -1 = auto (base + arch_depth_delta).")
+
+    # =========================================================================
     # 2) Mode d'entraînement
     # =========================================================================
     p.add_argument(
@@ -251,6 +259,12 @@ def get_opts():
         default="generator",
         choices=["generator", "sem_resnet50"],
         help="Source des features pour SupHeads: generator (G.sup_features) ou sem_resnet50 (backbone ResNet sémantique + GAP).",
+    )
+    p.add_argument(
+        "--sup_sem_only",
+        type=int,
+        default=1,
+        help="(0/1) Si mode=sup_freeze et sup_feat_source=sem_resnet50: n'initialise pas G_A/G_B/D_A/D_B et entraîne uniquement SupHeads sur le backbone sémantique gelé.",
     )
     p.add_argument(
         "--sup_sem_imagenet_norm",
