@@ -610,9 +610,18 @@ def run_sup_freeze_mode(
             try:
                 save_freq_int = int(save_freq)
             except Exception:
-                save_freq_int = opt.epochs
+                save_freq_int = int(getattr(opt, "epochs", 1))
 
-            if ((epoch + 1) % save_freq_int == 0) or ((epoch + 1) == opt.epochs):
+            # Extra periodic ckpt control (epoch_ckpt_interval) — useful to snapshot earlier than end.
+            try:
+                epoch_ckpt_interval = int(getattr(opt, "epoch_ckpt_interval", 0) or 0)
+            except Exception:
+                epoch_ckpt_interval = 0
+
+            do_save_epoch = ((epoch + 1) % max(1, save_freq_int) == 0) or ((epoch + 1) == int(getattr(opt, "epochs", 1)))
+            do_save_extra = (epoch_ckpt_interval > 0) and ((epoch + 1) % epoch_ckpt_interval == 0)
+
+            if do_save_epoch or do_save_extra:
                 save_checkpoint(
                     epoch,
                     G_A,
@@ -2272,7 +2281,13 @@ def nce_feats_dict(net, X, *, normalize=True, no_grad=False):
     """
     ctx = torch.no_grad() if no_grad else torch.enable_grad()
     with ctx:
-        z, (s1, s2, s3, s4, s5) = net.encode_content(X)
+        z, skips = net.encode_content(X)
+        # skips is (s1..sL). Keep backward-compatible naming for first 5 levels when available.
+        s1 = skips[0] if len(skips) > 0 else None
+        s2 = skips[1] if len(skips) > 1 else s1
+        s3 = skips[2] if len(skips) > 2 else s2
+        s4 = skips[3] if len(skips) > 3 else s3
+        s5 = skips[4] if len(skips) > 4 else s4
         feats = {
             "bot": z,
             "skip64": s2,
@@ -3018,9 +3033,53 @@ def run_sup_freeze_sem_only(
     """
 
     from training.train_detection_transformer import _build_sem_resnet_backbone
+    from training.checkpoint import should_save_ckpt
 
     sup_sem_imagenet_norm = int(getattr(opt, "sup_sem_imagenet_norm", 1)) == 1
     ckpt_safe_write = bool(int(getattr(opt, "safe_write", 1)) != 0)
+
+    # --- checkpoint frequency (align with train loop behaviour)
+    def _parse_save_freq_local(save_freq_value):
+        """Parse save_freq in a user-friendly way.
+
+        Accepted:
+          - None / 'none'
+          - 'epoch' / 'epoch:N'
+          - 'step'  / 'step:N'
+          - integer or digit-string -> epoch:N (more intuitive for training runs)
+        """
+        if save_freq_value is None:
+            return "none", None
+        # allow int
+        if isinstance(save_freq_value, (int, float)) and not isinstance(save_freq_value, bool):
+            n = int(save_freq_value)
+            return ("epoch", max(1, n)) if n > 0 else ("none", None)
+        sf = str(save_freq_value).strip().lower()
+        if sf in {"", "none"}:
+            return "none", None
+        if sf.startswith("epoch"):
+            parts = sf.split(":", 1)
+            if len(parts) == 2 and parts[1].strip().isdigit():
+                return "epoch", max(1, int(parts[1].strip()))
+            return "epoch", 1
+        if sf.startswith("step"):
+            parts = sf.split(":", 1)
+            if len(parts) == 2 and parts[1].strip().isdigit():
+                return "step", max(1, int(parts[1].strip()))
+            return "step", 1
+        if sf.isdigit():
+            # by default, numeric means "every N epochs" (safer than step)
+            return "epoch", max(1, int(sf))
+        return "epoch", 1
+
+    save_freq_mode, save_freq_interval = _parse_save_freq_local(getattr(opt, "save_freq", None))
+    epoch_ckpt_interval = getattr(opt, "epoch_ckpt_interval", None)
+    try:
+        epoch_ckpt_interval = int(epoch_ckpt_interval) if epoch_ckpt_interval is not None else None
+        if epoch_ckpt_interval is not None and epoch_ckpt_interval <= 0:
+            epoch_ckpt_interval = None
+    except Exception:
+        epoch_ckpt_interval = None
 
     # Build semantic backbone
     sem_backbone, sem_out_channels = _build_sem_resnet_backbone(
@@ -3196,6 +3255,23 @@ def run_sup_freeze_sem_only(
                     writer.add_scalar("C_sem/train_acc", float(acc), global_step)
 
                 pbar.set_postfix(CE=f"{ce_meter.avg:.4f}", acc=f"{acc_meter.avg*100:.2f}%")
+
+                # ---- periodic ckpt during sup_freeze_sem_only
+                if save_freq_mode == "step":
+                    do_save, reason = should_save_ckpt(
+                        save_mode=save_freq_mode,
+                        interval=save_freq_interval,
+                        step=global_step,
+                        epoch=epoch,
+                        epochs_total=int(getattr(opt, "epochs", 1)),
+                        final_save=False,
+                    )
+                    if do_save:
+                        save_supheads_rich(sup_heads, sup_dir / f"SupHeads_step{global_step}.pt", safe_write=ckpt_safe_write)
+                        save_sem_backbone_rich(sem_backbone, sup_dir / f"SemBackbone_step{global_step}.pt", safe_write=ckpt_safe_write)
+                        if writer:
+                            writer.add_text("C_sem/ckpt", f"saved({reason}) step={global_step} epoch={epoch}", global_step)
+
                 global_step += 1
 
             # eval
@@ -3212,7 +3288,8 @@ def run_sup_freeze_sem_only(
                                 imgs, raw = batch
                             imgs = imgs.to(dev)
                             feats = _sem_feats(imgs)
-                            logits, _ = sup_heads(feats, return_attn=False)
+                            _out = sup_heads(feats, return_attn=False)
+                            logits = _out[0] if isinstance(_out, tuple) else _out
                             if not isinstance(logits, dict):
                                 logits = {"default": logits}
                             if not isinstance(raw, dict):
@@ -3236,9 +3313,34 @@ def run_sup_freeze_sem_only(
                     best_state = {k: v.detach().cpu() for k, v in sup_heads.state_dict().items()}
                     best_epoch = int(epoch)
 
-            # save last every epoch
-            save_supheads_rich(sup_heads, sup_dir / f"SupHeads_last_epoch{epoch}.pt", safe_write=ckpt_safe_write)
-            save_sem_backbone_rich(sem_backbone, sup_dir / f"SemBackbone_epoch{epoch}.pt", safe_write=ckpt_safe_write)
+            # ---- epoch-based ckpt frequency
+            if save_freq_mode != "step":
+                do_save, reason = should_save_ckpt(
+                    save_mode=save_freq_mode,
+                    interval=save_freq_interval,
+                    step=global_step,
+                    epoch=epoch,
+                    epochs_total=int(getattr(opt, "epochs", 1)),
+                    final_save=False,
+                )
+                if do_save:
+                    save_supheads_rich(sup_heads, sup_dir / f"SupHeads_last_epoch{epoch}.pt", safe_write=ckpt_safe_write)
+                    save_sem_backbone_rich(sem_backbone, sup_dir / f"SemBackbone_epoch{epoch}.pt", safe_write=ckpt_safe_write)
+
+            # ---- optional richer bundle ckpt (epoch_ckpt_interval)
+            if epoch_ckpt_interval is not None and (epoch + 1) % int(epoch_ckpt_interval) == 0:
+                try:
+                    torch.save(
+                        {
+                            "meta": {"epoch": int(epoch), "global_step": int(global_step)},
+                            "sup_heads": {k: v.detach().cpu() for k, v in sup_heads.state_dict().items()},
+                            "sem_backbone": {k: v.detach().cpu() for k, v in sem_backbone.state_dict().items()},
+                            "opt_sup": opt_Sup.state_dict(),
+                        },
+                        sup_dir / f"Ckpt_semSup_epoch{epoch}.pt",
+                    )
+                except Exception:
+                    pass
 
         # save best
         if best_state is not None:

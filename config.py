@@ -40,6 +40,7 @@ def get_opts():
     # Robustesse
     p.add_argument("--print_trace_on_error", action="store_true", help="Traceback complet en cas d'exception.")
     p.add_argument("--debug", action="store_true", help="Mode debug (si implémenté).")
+    p.add_argument("--debug_shapes", action="store_true", help="Trace les shapes (UNet/style) au début du run.")
 
     # =========================================================================
     # 1) Données, IO & run
@@ -57,6 +58,12 @@ def get_opts():
     p.add_argument("--k_folds", type=int, default=2, help="Nombre de folds pour alternance A/B (>=2).")
     p.add_argument("--epochs", type=int, default=25, help="Nb époques (auto/hybrid/sup_freeze/cls_tokens).")
     p.add_argument("--crop_size", type=int, default=256, help="Taille d'entrée (si utilisée dans transforms).")
+
+    # When deepening the UNet / style pyramid, repeated stride=2 downs can lead to 1x1 feature maps,
+    # which breaks InstanceNorm during training. We keep depth but automatically stop downsampling
+    # once spatial size reaches this threshold.
+    p.add_argument("--unet_min_spatial", type=int, default=2,
+                   help="Minimum spatial size (H/W) before downsampling switches to stride=1 (prevents 1x1).")
 
     # =========================================================================
     # 1bis) Architecture scaling (UNet + style tokens)

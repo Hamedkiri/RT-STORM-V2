@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Union, List
 
-from models.backbone import Down, ResBlock, ConvBlock, StylePyramidEncoder, SPADEUp
+from models.backbone import Down, ResBlock, ConvBlock, StylePyramidEncoder, SPADEUp, _downsample_plan
 from models.cls_tokens import MultiScaleTokenEncoder, TokenFeatureAggregator
 
 
@@ -47,6 +47,8 @@ class UNetGenerator(nn.Module):
         *,
         arch_depth_delta: int = 0,
         style_token_levels: int = -1,
+        img_size: int = 256,
+        unet_min_spatial: int = 2,
     ):
         super().__init__()
         self.ngf = int(ngf)
@@ -60,6 +62,18 @@ class UNetGenerator(nn.Module):
         L = max(1, L)
         self.style_levels = L               # nb tokens locaux (tL..t1)
         self.unet_levels = L                # nb niveaux de skip (s1..sL)
+
+        # schedule strides to avoid 1x1 (InstanceNorm crash) when deepening
+        # downs count = unet_levels + 1 (extra bottleneck down)
+        # En profondeur >0, on stoppe le downsampling dès 4x4 (règle)
+        _stop_at = int(unet_min_spatial)
+        if depth_delta > 0:
+            _stop_at = max(_stop_at, 4)
+        else:
+            # comportement historique
+            _stop_at = 2
+        down_plan = _downsample_plan(num_downs=self.unet_levels + 1, img_size=int(img_size), stop_down_at=_stop_at)
+        self._down_plan = down_plan  # keep for decoder upsample schedule
 
         def ch_for_level(lvl: int) -> int:
             # lvl: 1..L (+ bottleneck L+1)
@@ -77,7 +91,8 @@ class UNetGenerator(nn.Module):
         in_ch = self.nc
         for lvl in range(1, self.unet_levels + 2):
             out_ch = ch_for_level(lvl)
-            m = Down(in_ch, out_ch)
+            stride, dil = down_plan[lvl-1]
+            m = Down(in_ch, out_ch, stride=stride, dilation=dil)
             setattr(self, f"d{lvl}", m)
             self.downs.append(m)
             in_ch = out_ch
@@ -88,17 +103,28 @@ class UNetGenerator(nn.Module):
         self.bot = ConvBlock(ch_for_level(self.unet_levels + 1), ch_for_level(self.unet_levels + 1))
 
         # ------------------ encodeur style / SPADE (scales variables) ------------------
-        self.style_enc = StylePyramidEncoder(style_nc, self.ngf, spade_ch, token_dim, num_levels=self.style_levels)
+        self.style_enc = StylePyramidEncoder(
+            style_nc,
+            self.ngf,
+            spade_ch,
+            token_dim,
+            num_levels=self.style_levels,
+            img_size=int(img_size),
+            min_spatial=_stop_at,
+        )
 
         # ------------------------ décodeur (variable) --------------------------
         # On crée u1..uL comme attributs (compat state_dict), et on garde une liste `ups`.
         self.ups = []  # list[SPADEUp] pour itération
         c_up = ch_for_level(self.unet_levels + 1)  # bottleneck
         idx = 1
+        # Upsample factors mirror encoder strides: first matches bottleneck extra down, then each down from level L..2
+        up_factors = [down_plan[self.unet_levels][0]] + [down_plan[lvl-1][0] for lvl in range(self.unet_levels, 1, -1)]
         for lvl in range(self.unet_levels, 0, -1):
             c_skip = ch_for_level(lvl)
             c_out  = ch_for_level(lvl)
-            m = SPADEUp(c_up=c_up, c_skip=c_skip, c_out=c_out, s_ch=spade_ch, token_dim=token_dim)
+            sf = int(up_factors[idx-1])
+            m = SPADEUp(c_up=c_up, c_skip=c_skip, c_out=c_out, s_ch=spade_ch, token_dim=token_dim, scale_factor=sf)
             setattr(self, f"u{idx}", m)
             self.ups.append(m)
             c_up = c_out
@@ -107,7 +133,7 @@ class UNetGenerator(nn.Module):
         self.final = nn.Sequential(
             nn.Conv2d(ch_for_level(1), ch_for_level(1), 3, 1, 1),
             nn.ReLU(True),
-            nn.Upsample(scale_factor=2, mode="nearest"),
+            (nn.Upsample(scale_factor=int(down_plan[0][0]), mode="nearest") if int(down_plan[0][0]) == 2 else nn.Identity()),
             nn.Conv2d(ch_for_level(1), self.nc, 3, 1, 1),
             nn.Tanh(),
         )
@@ -138,6 +164,10 @@ class UNetGenerator(nn.Module):
         # heads pour tok+delta (lazy init)
         self._delta_heads: Optional[nn.ModuleList] = None
 
+        # debug shapes
+        self.debug_shapes: bool = False
+        self._dbg_shapes_done: bool = False
+
     # --------------------------- helpers ---------------------------
 
     @staticmethod
@@ -157,6 +187,16 @@ class UNetGenerator(nn.Module):
     @torch.no_grad()
     def _gap(self, x: torch.Tensor) -> torch.Tensor:
         return F.adaptive_avg_pool2d(x, 1).flatten(1)
+
+    @staticmethod
+    def _trace_shape(enabled: bool, name: str, t: torch.Tensor) -> None:
+        if not enabled:
+            return
+        try:
+            print(f"[shapes] {name}: {tuple(t.shape)}", flush=True)
+        except Exception:
+            pass
+
 
     def _parse_delta_weights(self, w, n: int) -> List[float]:
         if isinstance(w, (list, tuple)):
@@ -241,6 +281,8 @@ class UNetGenerator(nn.Module):
         # levels 1..L
         for lvl in range(1, self.unet_levels + 1):
             h = self.downs[lvl-1](h)
+            if self.debug_shapes and not self._dbg_shapes_done:
+                self._trace_shape(True, f'G/enc/s{lvl}', h)
             skips.append(h)
         # resblock on deepest skip
         skips[-1] = self.res_skip(skips[-1])
@@ -248,6 +290,8 @@ class UNetGenerator(nn.Module):
         z = self.downs[self.unet_levels](skips[-1])
         z = self.res_bot(z)
         z = self.bot(z)
+        if self.debug_shapes and not self._dbg_shapes_done:
+            self._trace_shape(True, 'G/enc/z', z)
         return z, tuple(skips)
 
     @torch.no_grad()
@@ -297,13 +341,28 @@ class UNetGenerator(nn.Module):
             else:
                 toks_ds = toks_ds[: self.style_levels]
 
+        if self.debug_shapes and not self._dbg_shapes_done:
+            if tokG is not None:
+                self._trace_shape(True, 'G/style/tokG', tokG)
+            try:
+                if isinstance(toks_ds, (list, tuple)) and len(toks_ds):
+                    t0 = toks_ds[0][0] if (isinstance(toks_ds[0], (tuple, list)) and len(toks_ds[0])==2) else toks_ds[0]
+                    if hasattr(t0, 'shape'):
+                        self._trace_shape(True, 'G/style/tok_local0', t0)
+            except Exception:
+                pass
+
         # 4) décodeur conditionné
         h = z
         for up, s, m, t in zip(self.ups, skips_ds, maps_ds, toks_ds):
             h = up(h, s, m, t)
 
         # 5) sortie
-        return self.final(h)
+        out = self.final(h)
+        if self.debug_shapes and not self._dbg_shapes_done:
+            self._trace_shape(True, "G/out", out)
+            self._dbg_shapes_done = True
+        return out
 
 
     # ------------------- intégration SupHeads ----------------------

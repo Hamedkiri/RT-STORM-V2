@@ -230,7 +230,7 @@ def _parse_save_freq(save_freq_str):
       - 'epoch:5'    -> ('epoch', 5)
       - 'step'       -> ('step', 1)
       - 'step:1000'  -> ('step', 1000)
-      - '1000'       -> ('step', 1000)
+      - '1000'       -> ('epoch', 1000)  (use 'step:1000' for step-based)
     """
     if save_freq_str is None:
         return "none", None
@@ -258,9 +258,11 @@ def _parse_save_freq(save_freq_str):
                 pass
         return "step", 1
 
+    # Fallback: numeric means "every N epochs" (more intuitive).
+    # Use explicit 'step:N' for step-based checkpointing.
     try:
         n = int(sf)
-        return "step", max(1, n)
+        return "epoch", max(1, n)
     except ValueError:
         return "none", None
 
@@ -400,8 +402,34 @@ def train_alternating(opt):
         return
 
     # --- Générateurs / Discriminateurs (style)
-    G_A, D_A = UNetGenerator(token_dim=256, arch_depth_delta=int(getattr(opt,"arch_depth_delta",0)), style_token_levels=int(getattr(opt,"style_token_levels",-1))).to(dev), PatchDiscriminator().to(dev)
-    G_B, D_B = UNetGenerator(token_dim=256, arch_depth_delta=int(getattr(opt,"arch_depth_delta",0)), style_token_levels=int(getattr(opt,"style_token_levels",-1))).to(dev), PatchDiscriminator().to(dev)
+    _arch_dd = int(getattr(opt, "arch_depth_delta", 0))
+    _sty_lv = int(getattr(opt, "style_token_levels", -1))
+    _img_sz = int(getattr(opt, "crop_size", 256))
+    _min_sp = int(getattr(opt, "unet_min_spatial", 2))
+
+    G_A, D_A = UNetGenerator(
+        token_dim=256,
+        arch_depth_delta=_arch_dd,
+        style_token_levels=_sty_lv,
+        img_size=_img_sz,
+        unet_min_spatial=_min_sp,
+    ).to(dev), PatchDiscriminator().to(dev)
+    G_B, D_B = UNetGenerator(
+        token_dim=256,
+        arch_depth_delta=_arch_dd,
+        style_token_levels=_sty_lv,
+        img_size=_img_sz,
+        unet_min_spatial=_min_sp,
+    ).to(dev), PatchDiscriminator().to(dev)
+
+    if bool(getattr(opt, 'debug_shapes', False)):
+        for _g in (G_A, G_B):
+            try:
+                _g.debug_shapes = True
+                _g.style_enc.debug_shapes = True
+            except Exception:
+                pass
+        print('[debug_shapes] enabled (will trace shapes once).', flush=True)
 
     base_lr = float(getattr(opt, "lr", 2e-4))
     adv_lrD_mult = float(getattr(opt, "adv_lrD_mult", 0.5))

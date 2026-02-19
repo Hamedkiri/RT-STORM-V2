@@ -1,6 +1,8 @@
 # models/discriminator.py
 import torch
 import torch.nn as nn
+
+from .safe_norm import SafeInstanceNorm2d
 import torch.nn.functional as F
 from typing import Optional
 # ──────────────────────────────────────────────────────────────
@@ -31,7 +33,7 @@ class PatchDiscriminator(nn.Module):
         for _ in range(1, n_layers):
             out_f = min(in_f * 2, ndf * 8)
             layers += [sn(nn.Conv2d(in_f, out_f, 4, 2, 1)),
-                       nn.InstanceNorm2d(out_f, affine=True),
+                       SafeInstanceNorm2d(out_f, affine=True),
                        nn.LeakyReLU(0.2, inplace=True)]
             in_f = out_f
         self.body = nn.Sequential(*layers)

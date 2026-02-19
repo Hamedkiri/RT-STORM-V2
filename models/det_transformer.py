@@ -88,7 +88,12 @@ class MultiScaleTokenEncoder(nn.Module):
 
     def _get_content_feats(self, x):
         # encode_content(x) doit renvoyer z, (s1..s5)
-        z, (s1, s2, s3, s4, s5) = self.generator.encode_content(x)
+        z, skips = self.generator.encode_content(x)  # z, (s1..sL)
+        s1 = skips[0] if len(skips) > 0 else None
+        s2 = skips[1] if len(skips) > 1 else s1
+        s3 = skips[2] if len(skips) > 2 else s2
+        s4 = skips[3] if len(skips) > 3 else s3
+        s5 = skips[4] if len(skips) > 4 else s4
         feat_map = {1: s1, 2: s2, 3: s3, 4: s4, 5: s5}
         return z, feat_map
 
