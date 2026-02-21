@@ -401,21 +401,81 @@ def train_alternating(opt):
             writer.close()
         return
 
+    # ==================================================================================
+    #  Reprise: aligner automatiquement l'architecture du générateur sur le run résumé
+    #  (sinon: size mismatch même en strict=False).
+    # ==================================================================================
+    def _autoload_resume_arch(opt):
+        rdir = getattr(opt, "resume_dir", None)
+        if not rdir:
+            return
+        try:
+            rdir = Path(rdir)
+        except Exception:
+            return
+        cfg_path = rdir / "train_cfg.json"
+        if not cfg_path.exists():
+            return
+        try:
+            j = json.loads(cfg_path.read_text())
+        except Exception:
+            return
+        hp = j.get("static_hparams", j)
+
+        # These keys affect UNetGenerator state_dict shapes.
+        keys = [
+            ("arch_depth_delta", 0),
+            ("style_token_levels", -1),
+            ("unet_min_spatial", 2),
+            ("crop_size", 256),
+        ]
+        changed = []
+        for k, default in keys:
+            if k in hp:
+                old = getattr(opt, k, default)
+                new = hp.get(k, default)
+                try:
+                    old_i = int(old)
+                    new_i = int(new)
+                    if old_i != new_i:
+                        setattr(opt, k, new_i)
+                        changed.append((k, old_i, new_i))
+                except Exception:
+                    if old != new:
+                        setattr(opt, k, new)
+                        changed.append((k, old, new))
+
+        # token_dim may impact conditioning shapes; follow checkpoint if present.
+        if "token_dim" in hp:
+            try:
+                opt.token_dim = int(hp["token_dim"])
+            except Exception:
+                opt.token_dim = 256
+        else:
+            opt.token_dim = int(getattr(opt, "token_dim", 256) or 256)
+
+        if changed:
+            msg = ", ".join([f"{k}:{a}->{b}" for k, a, b in changed])
+            print(f"[RESUME][ARCH] Override depuis {cfg_path}: {msg}", flush=True)
+
+    _autoload_resume_arch(opt)
+
     # --- Générateurs / Discriminateurs (style)
     _arch_dd = int(getattr(opt, "arch_depth_delta", 0))
     _sty_lv = int(getattr(opt, "style_token_levels", -1))
     _img_sz = int(getattr(opt, "crop_size", 256))
     _min_sp = int(getattr(opt, "unet_min_spatial", 2))
+    _tokdim = int(getattr(opt, "token_dim", 256))
 
     G_A, D_A = UNetGenerator(
-        token_dim=256,
+        token_dim=_tokdim,
         arch_depth_delta=_arch_dd,
         style_token_levels=_sty_lv,
         img_size=_img_sz,
         unet_min_spatial=_min_sp,
     ).to(dev), PatchDiscriminator().to(dev)
     G_B, D_B = UNetGenerator(
-        token_dim=256,
+        token_dim=_tokdim,
         arch_depth_delta=_arch_dd,
         style_token_levels=_sty_lv,
         img_size=_img_sz,
@@ -458,7 +518,7 @@ def train_alternating(opt):
                 G_A, D_A, G_B, D_B,
                 opt_GA, opt_DA, opt_GB, opt_DB,
                 device=str(dev),
-                strict=False,
+                strict=True,
             )
             resume_epoch = int(e)
             print(f"✓ reprise depuis epoch {e}")
