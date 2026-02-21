@@ -58,3 +58,48 @@ class SafeInstanceNorm2d(nn.Module):
             if h * w <= 1:
                 return self.gnorm(x)
         return self.inorm(x)
+
+
+class LegacySafeInstanceNorm2d(nn.Module):
+    """Backward-compatible safe norm for legacy checkpoints.
+
+    Legacy checkpoints used nn.InstanceNorm2d directly in Sequential blocks and
+    therefore store parameters as "...net.1.weight" / "...net.1.bias".
+
+    Newer SafeInstanceNorm2d introduces submodules (inorm/gnorm), changing keys to
+    "...net.1.inorm.weight", etc., which breaks strict loading.
+
+    This layer keeps legacy keys (weight/bias on this module) while providing a
+    1x1-safe fallback using GroupNorm.
+    """
+
+    def __init__(self, num_features: int, *, affine: bool = True, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.eps = float(eps)
+        # InstanceNorm without affine; we expose affine params ourselves.
+        self._inorm = nn.InstanceNorm2d(int(num_features), affine=False, eps=self.eps)
+
+        if affine:
+            self.weight = nn.Parameter(torch.ones(int(num_features)))
+            self.bias = nn.Parameter(torch.zeros(int(num_features)))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+        self._gn_groups = int(_pick_gn_groups(int(num_features)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training and x.dim() == 4:
+            h, w = int(x.shape[-2]), int(x.shape[-1])
+            if h * w <= 1:
+                return torch.nn.functional.group_norm(
+                    x,
+                    self._gn_groups,
+                    weight=self.weight,
+                    bias=self.bias,
+                    eps=self.eps,
+                )
+        y = self._inorm(x)
+        if self.weight is not None:
+            y = y * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
+        return y

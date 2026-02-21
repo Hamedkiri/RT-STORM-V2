@@ -74,6 +74,19 @@ def get_opts():
                    help="Override du nombre de niveaux de tokens de style (hors tokG). -1 = auto (base + arch_depth_delta).")
 
     # =========================================================================
+    # 1ter) Normalisation (compat anciens checkpoints)
+    # =========================================================================
+    p.add_argument(
+        "--safe_norm",
+        action="store_true",
+        help=(
+            "Active le mode de normalisation 'safe' (SafeInstanceNorm2d avec fallback GroupNorm). "
+            "Par défaut (flag absent), on reste en mode legacy compatible avec les anciens checkpoints "
+            "(LegacySafeInstanceNorm2d, mêmes clés state_dict)."
+        ),
+    )
+
+    # =========================================================================
     # 2) Mode d'entraînement
     # =========================================================================
     p.add_argument(

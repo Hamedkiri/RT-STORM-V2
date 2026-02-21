@@ -49,6 +49,10 @@ class UNetGenerator(nn.Module):
         style_token_levels: int = -1,
         img_size: int = 256,
         unet_min_spatial: int = 2,
+        norm_variant: str = "legacy",
+        extra_bot_resblocks: int = 0,
+        use_res_skip_bot: bool = False,
+        style_tokg_head_variant: str = "tokG_head",
     ):
         super().__init__()
         self.ngf = int(ngf)
@@ -62,6 +66,9 @@ class UNetGenerator(nn.Module):
         L = max(1, L)
         self.style_levels = L               # nb tokens locaux (tL..t1)
         self.unet_levels = L                # nb niveaux de skip (s1..sL)
+
+        self.use_res_skip_bot = bool(use_res_skip_bot)
+        self.style_tokg_head_variant = str(style_tokg_head_variant or "tokG_head")
 
         # schedule strides to avoid 1x1 (InstanceNorm crash) when deepening
         # downs count = unet_levels + 1 (extra bottleneck down)
@@ -92,15 +99,24 @@ class UNetGenerator(nn.Module):
         for lvl in range(1, self.unet_levels + 2):
             out_ch = ch_for_level(lvl)
             stride, dil = down_plan[lvl-1]
-            m = Down(in_ch, out_ch, stride=stride, dilation=dil)
+            m = Down(in_ch, out_ch, stride=stride, dilation=dil, norm_variant=norm_variant)
             setattr(self, f"d{lvl}", m)
             self.downs.append(m)
             in_ch = out_ch
 
-        # resblocks near bottom + bottleneck conv
-        self.res_skip = ResBlock(ch_for_level(self.unet_levels))
-        self.res_bot  = ResBlock(ch_for_level(self.unet_levels + 1))
-        self.bot = ConvBlock(ch_for_level(self.unet_levels + 1), ch_for_level(self.unet_levels + 1))
+        # resblocks near bottom + bottleneck conv (optional for legacy checkpoints)
+        if self.use_res_skip_bot:
+            self.res_skip = ResBlock(ch_for_level(self.unet_levels), norm_variant=norm_variant)
+            self.res_bot  = ResBlock(ch_for_level(self.unet_levels + 1), norm_variant=norm_variant)
+        else:
+            self.res_skip = None
+            self.res_bot  = None
+        self.bot = ConvBlock(ch_for_level(self.unet_levels + 1), ch_for_level(self.unet_levels + 1), norm_variant=norm_variant)
+
+        # Optional extra bottleneck ResBlocks for strict loading of legacy checkpoints
+        self.extra_bot_resblocks = int(extra_bot_resblocks)
+        for i in range(self.extra_bot_resblocks):
+            setattr(self, f"res{5+i}", ResBlock(ch_for_level(self.unet_levels + 1), norm_variant=norm_variant))
 
         # ------------------ encodeur style / SPADE (scales variables) ------------------
         self.style_enc = StylePyramidEncoder(
@@ -111,6 +127,10 @@ class UNetGenerator(nn.Module):
             num_levels=self.style_levels,
             img_size=int(img_size),
             min_spatial=_stop_at,
+            norm_variant=norm_variant,
+            extra_bot_resblocks=int(extra_bot_resblocks),
+            use_res_skip_bot=bool(use_res_skip_bot),
+            tokg_head_variant=self.style_tokg_head_variant,
         )
 
         # ------------------------ décodeur (variable) --------------------------
@@ -124,7 +144,7 @@ class UNetGenerator(nn.Module):
             c_skip = ch_for_level(lvl)
             c_out  = ch_for_level(lvl)
             sf = int(up_factors[idx-1])
-            m = SPADEUp(c_up=c_up, c_skip=c_skip, c_out=c_out, s_ch=spade_ch, token_dim=token_dim, scale_factor=sf)
+            m = SPADEUp(c_up=c_up, c_skip=c_skip, c_out=c_out, s_ch=spade_ch, token_dim=token_dim, scale_factor=sf, norm_variant=norm_variant)
             setattr(self, f"u{idx}", m)
             self.ups.append(m)
             c_up = c_out
@@ -284,12 +304,16 @@ class UNetGenerator(nn.Module):
             if self.debug_shapes and not self._dbg_shapes_done:
                 self._trace_shape(True, f'G/enc/s{lvl}', h)
             skips.append(h)
-        # resblock on deepest skip
-        skips[-1] = self.res_skip(skips[-1])
+        # resblock on deepest skip (optional for legacy ckpts)
+        if getattr(self, 'res_skip', None) is not None:
+            skips[-1] = self.res_skip(skips[-1])
         # bottleneck extra down
         z = self.downs[self.unet_levels](skips[-1])
-        z = self.res_bot(z)
+        if getattr(self, 'res_bot', None) is not None:
+            z = self.res_bot(z)
         z = self.bot(z)
+        for i in range(self.extra_bot_resblocks):
+            z = getattr(self, f"res{5+i}")(z)
         if self.debug_shapes and not self._dbg_shapes_done:
             self._trace_shape(True, 'G/enc/z', z)
         return z, tuple(skips)

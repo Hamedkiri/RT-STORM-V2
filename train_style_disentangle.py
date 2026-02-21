@@ -460,6 +460,75 @@ def train_alternating(opt):
 
     _autoload_resume_arch(opt)
 
+    # ---------------------------------------------------------------------
+    # Norm variant (legacy vs safe) + optional extra bottleneck resblocks
+    # ---------------------------------------------------------------------
+    # Default: legacy (backward compatible). If --safe_norm: force safe.
+    if bool(getattr(opt, "safe_norm", False)):
+        opt.norm_variant = "safe"
+    else:
+        opt.norm_variant = str(getattr(opt, "norm_variant", "legacy") or "legacy")
+    opt.extra_bot_resblocks = int(getattr(opt, "extra_bot_resblocks", 0) or 0)
+    opt.use_res_skip_bot = bool(getattr(opt, "use_res_skip_bot", False))
+    opt.style_tokg_head_variant = str(getattr(opt, "style_tokg_head_variant", "tokG_head") or "tokG_head")
+
+    def _infer_ckpt_compat_from_state(sd: dict) -> tuple[str, int, bool, str]:
+        keys = list(sd.keys())
+        is_safe = any(".inorm." in k or ".gnorm." in k for k in keys)
+        norm_v = "safe" if is_safe else "legacy"
+        extra = 0
+        if any(k.startswith("res5.") for k in keys):
+            extra = max(extra, 1)
+        if any(k.startswith("res6.") for k in keys):
+            extra = max(extra, 2)
+
+        use_res_skip_bot = any(k.startswith("res_skip.") or k.startswith("res_bot.") for k in keys)
+
+        if any(k.startswith("style_enc.tbot.") for k in keys):
+            tokg_head_variant = "tbot"
+        else:
+            tokg_head_variant = "tokG_head"
+        return norm_v, extra, use_res_skip_bot, tokg_head_variant
+
+    # If resuming and user did not force safe_norm, try to infer from checkpoint if not stored.
+    if (not bool(getattr(opt, "safe_norm", False))) and getattr(opt, "resume_dir", None):
+        rdir = Path(getattr(opt, "resume_dir"))
+        cfg_path = rdir / "train_cfg.json"
+        hp = {}
+        try:
+            if cfg_path.exists():
+                hp = json.loads(cfg_path.read_text()).get("static_hparams", {})
+        except Exception:
+            hp = {}
+        if "norm_variant" in hp:
+            opt.norm_variant = str(hp.get("norm_variant") or opt.norm_variant)
+        if "extra_bot_resblocks" in hp:
+            try:
+                opt.extra_bot_resblocks = int(hp.get("extra_bot_resblocks") or 0)
+            except Exception:
+                pass
+        if "use_res_skip_bot" in hp:
+            opt.use_res_skip_bot = bool(hp.get("use_res_skip_bot"))
+        if "style_tokg_head_variant" in hp:
+            opt.style_tokg_head_variant = str(hp.get("style_tokg_head_variant") or opt.style_tokg_head_variant)
+
+        # Always infer from last generator checkpoint (source of truth) unless user forced safe_norm.
+        import glob
+        cand = sorted(glob.glob(str(rdir / "**" / "G_A_epoch*.pt"), recursive=True))
+        if cand:
+            try:
+                ck = torch.load(cand[-1], map_location="cpu")
+                gen_sd = ck.get("model", ck) if isinstance(ck, dict) else ck
+                nv, extra, use_rs, thv = _infer_ckpt_compat_from_state(gen_sd)
+                if nv != opt.norm_variant:
+                    print(f"[RESUME][NORM] Override norm_variant {opt.norm_variant} -> {nv} (from checkpoint)", flush=True)
+                opt.norm_variant = nv
+                opt.extra_bot_resblocks = max(opt.extra_bot_resblocks, extra)
+                opt.use_res_skip_bot = bool(use_rs)
+                opt.style_tokg_head_variant = str(thv)
+            except Exception:
+                pass
+
     # --- Générateurs / Discriminateurs (style)
     _arch_dd = int(getattr(opt, "arch_depth_delta", 0))
     _sty_lv = int(getattr(opt, "style_token_levels", -1))
@@ -473,14 +542,22 @@ def train_alternating(opt):
         style_token_levels=_sty_lv,
         img_size=_img_sz,
         unet_min_spatial=_min_sp,
-    ).to(dev), PatchDiscriminator().to(dev)
+        norm_variant=str(getattr(opt, "norm_variant", "legacy") or "legacy"),
+        extra_bot_resblocks=int(getattr(opt, "extra_bot_resblocks", 0) or 0),
+        use_res_skip_bot=bool(getattr(opt, "use_res_skip_bot", False)),
+        style_tokg_head_variant=str(getattr(opt, "style_tokg_head_variant", "tokG_head") or "tokG_head"),
+    ).to(dev), PatchDiscriminator(norm_variant=str(getattr(opt, "norm_variant", "legacy") or "legacy")).to(dev)
     G_B, D_B = UNetGenerator(
         token_dim=_tokdim,
         arch_depth_delta=_arch_dd,
         style_token_levels=_sty_lv,
         img_size=_img_sz,
         unet_min_spatial=_min_sp,
-    ).to(dev), PatchDiscriminator().to(dev)
+        norm_variant=str(getattr(opt, "norm_variant", "legacy") or "legacy"),
+        extra_bot_resblocks=int(getattr(opt, "extra_bot_resblocks", 0) or 0),
+        use_res_skip_bot=bool(getattr(opt, "use_res_skip_bot", False)),
+        style_tokg_head_variant=str(getattr(opt, "style_tokg_head_variant", "tokG_head") or "tokG_head"),
+    ).to(dev), PatchDiscriminator(norm_variant=str(getattr(opt, "norm_variant", "legacy") or "legacy")).to(dev)
 
     if bool(getattr(opt, 'debug_shapes', False)):
         for _g in (G_A, G_B):

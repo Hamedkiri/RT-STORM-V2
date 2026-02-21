@@ -1554,6 +1554,8 @@ def _infer_gen_kwargs(wdir: PPath, cfg: dict, token_dim: int) -> Dict[str, Any]:
     style_token_levels = int(hp.get("style_token_levels", cfg.get("model", {}).get("style_token_levels", -1) or -1))
     unet_min_spatial = int(hp.get("unet_min_spatial", cfg.get("model", {}).get("unet_min_spatial", 2) or 2))
     img_size = int(hp.get("img_size", _infer_img_size(hp)))
+    norm_variant = str(hp.get("norm_variant", "legacy") or "legacy")
+    extra_bot_resblocks = int(hp.get("extra_bot_resblocks", 0) or 0)
     # allow overriding token_dim if saved
     td = hp.get("token_dim", hp.get("hid_dim", None))
     if isinstance(td, int) and td > 0:
@@ -1565,6 +1567,8 @@ def _infer_gen_kwargs(wdir: PPath, cfg: dict, token_dim: int) -> Dict[str, Any]:
         style_token_levels=int(style_token_levels),
         img_size=int(img_size),
         unet_min_spatial=int(unet_min_spatial),
+        norm_variant=norm_variant,
+        extra_bot_resblocks=int(extra_bot_resblocks),
     )
 
     # ---------- helpers local ----------
@@ -3534,12 +3538,19 @@ def _infer_gen_kwargs(weights_dir: PPath, cfg: dict) -> _Dict[str, _Any]:
 
     img_size = int(hp.get("img_size", _infer_img_size(hp, cfg)))
 
+    norm_variant = str(hp.get("norm_variant", "legacy") or "legacy")
+    extra_bot_resblocks = int(hp.get("extra_bot_resblocks", 0) or 0)
+
     return dict(
         token_dim=token_dim,
         arch_depth_delta=arch_depth_delta,
         style_token_levels=style_token_levels,
         img_size=img_size,
         unet_min_spatial=unet_min_spatial,
+        norm_variant=norm_variant,
+        extra_bot_resblocks=extra_bot_resblocks,
+        use_res_skip_bot=bool(hp.get("use_res_skip_bot", False)),
+        style_tokg_head_variant=str(hp.get("style_tokg_head_variant", "tokG_head") or "tokG_head"),
     )
 
 
@@ -3627,10 +3638,7 @@ def load_models(
 
     gen_kwargs = _infer_gen_kwargs(weights_dir, cfg)
 
-    # build generator
-    G = UNetGenerator(**gen_kwargs).to(device)
-
-    # read checkpoint
+    # read checkpoint first (to possibly infer norm variant / extra blocks)
     full_sd = _read_state_any(ckpt_gen_p, device)
     try:
         full_sd = _remap_keys(full_sd)
@@ -3638,6 +3646,28 @@ def load_models(
         pass
 
     gen_sd, sup_sd_from_gen = _split_sup_from_ckpt(full_sd)
+
+    # Infer compatibility if not stored in train_cfg.json
+    keys = list(gen_sd.keys())
+    if str(gen_kwargs.get("norm_variant", "legacy") or "legacy") == "legacy":
+        if any(".inorm." in k or ".gnorm." in k for k in keys):
+            gen_kwargs["norm_variant"] = "safe"
+    extra = int(gen_kwargs.get("extra_bot_resblocks", 0) or 0)
+    if any(k.startswith("res5.") for k in keys):
+        extra = max(extra, 1)
+    if any(k.startswith("res6.") for k in keys):
+        extra = max(extra, 2)
+    gen_kwargs["extra_bot_resblocks"] = extra
+
+    # Infer legacy optional blocks (res_skip/res_bot) and style tokG head variant
+    gen_kwargs["use_res_skip_bot"] = any(k.startswith("res_skip.") or k.startswith("res_bot.") for k in keys)
+    if any(k.startswith("style_enc.tbot.") for k in keys):
+        gen_kwargs["style_tokg_head_variant"] = "tbot"
+    else:
+        gen_kwargs["style_tokg_head_variant"] = "tokG_head"
+
+    # build generator with final kwargs
+    G = UNetGenerator(**gen_kwargs).to(device)
     gen_sd = _align_dp_prefix(gen_sd, G)
 
     # load generator

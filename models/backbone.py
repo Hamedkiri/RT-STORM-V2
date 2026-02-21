@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from .safe_norm import SafeInstanceNorm2d
+from .safe_norm import SafeInstanceNorm2d, LegacySafeInstanceNorm2d
 import torch.nn.functional as F
 import math
 
@@ -11,12 +11,16 @@ import math
 # ──────────────────────────────────────────────────────────────
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_c, out_c, ks=3, stride=1, pad=1, norm=True, *, dilation: int = 1):
+    def __init__(self, in_c, out_c, ks=3, stride=1, pad=1, norm=True, *, dilation: int = 1, norm_variant: str = "legacy"):
         super().__init__()
         dilation = int(dilation)
         layers = [nn.Conv2d(in_c, out_c, ks, stride, pad, dilation=dilation)]
         if norm:
-            layers.append(SafeInstanceNorm2d(out_c, affine=True))
+            nv = str(norm_variant or "legacy")
+            if nv == "safe":
+                layers.append(SafeInstanceNorm2d(out_c, affine=True))
+            else:
+                layers.append(LegacySafeInstanceNorm2d(out_c, affine=True))
         layers.append(nn.ReLU(inplace=True))
         self.net = nn.Sequential(*layers)
 
@@ -35,7 +39,7 @@ class Down(nn.Module):
     reach 1x1, triggering InstanceNorm errors.
     """
 
-    def __init__(self, in_c, out_c, *, stride: int = 2, dilation: int = 1):
+    def __init__(self, in_c, out_c, *, stride: int = 2, dilation: int = 1, norm_variant: str = "legacy"):
         super().__init__()
         stride = int(stride)
         dilation = int(dilation)
@@ -44,21 +48,22 @@ class Down(nn.Module):
 
         if stride == 2:
             # historical downsample
-            self.conv = ConvBlock(in_c, out_c, ks=4, stride=2, pad=1, dilation=1)
+            self.conv = ConvBlock(in_c, out_c, ks=4, stride=2, pad=1, dilation=1, norm_variant=norm_variant)
         else:
             # keep size: output H,W same as input if pad=dilation
-            self.conv = ConvBlock(in_c, out_c, ks=3, stride=1, pad=dilation, dilation=dilation)
+            self.conv = ConvBlock(in_c, out_c, ks=3, stride=1, pad=dilation, dilation=dilation, norm_variant=norm_variant)
 
     def forward(self, x):
         return self.conv(x)
 
 class ResBlock(nn.Module):
-    def __init__(self, c):
+    def __init__(self, c, *, norm_variant: str = "legacy"):
         super().__init__()
         self.c1 = nn.Conv2d(c, c, 3, 1, 1)
-        self.n1 = SafeInstanceNorm2d(c, affine=True)
+        nv = str(norm_variant or "legacy")
+        self.n1 = SafeInstanceNorm2d(c, affine=True) if nv == "safe" else LegacySafeInstanceNorm2d(c, affine=True)
         self.c2 = nn.Conv2d(c, c, 3, 1, 1)
-        self.n2 = SafeInstanceNorm2d(c, affine=True)
+        self.n2 = SafeInstanceNorm2d(c, affine=True) if nv == "safe" else LegacySafeInstanceNorm2d(c, affine=True)
 
     def forward(self, x):
         y = F.relu(self.n1(self.c1(x)), inplace=True)
@@ -76,24 +81,40 @@ def _inv_softplus(y: float) -> float:
     return math.log(max(math.exp(y) - 1.0, 1e-8))
 
 class SPADELayer(nn.Module):
-    def __init__(self, c, s_ch, token_dim, hidden=128,
-                 # gains plus élevés côté cartes (et tokens équilibrés)
-                 init_wg_gamma=1.0, init_ws_gamma=1.0,
-                 init_wg_beta=1.0,  init_ws_beta=1.0):
+    def __init__(
+        self,
+        c,
+        s_ch,
+        token_dim,
+        hidden=128,
+        # gains plus élevés côté cartes (et tokens équilibrés)
+        init_wg_gamma=1.0,
+        init_ws_gamma=1.0,
+        init_wg_beta=1.0,
+        init_ws_beta=1.0,
+        *,
+        norm_variant: str = "legacy",
+    ):
         super().__init__()
-        self.norm = SafeInstanceNorm2d(c, affine=False, eps=1e-5)
+        nv = str(norm_variant or "legacy")
+        # affine=False here (historical): no weight/bias stored for norm
+        self.norm = SafeInstanceNorm2d(c, affine=False, eps=1e-5) if nv == "safe" else LegacySafeInstanceNorm2d(c, affine=False, eps=1e-5)
 
         self.s_conv = nn.Sequential(
-            nn.Conv2d(s_ch, hidden, 3, 1, 1), nn.SiLU(inplace=True),
-            nn.Conv2d(hidden, 2 * c, 3, 1, 1)
+            nn.Conv2d(s_ch, hidden, 3, 1, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, 2 * c, 3, 1, 1),
         )
         self.g_mlp = nn.Sequential(
-            nn.Linear(token_dim, hidden), nn.SiLU(inplace=True),
-            nn.Linear(hidden, 2 * c)
+            nn.Linear(token_dim, hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden, 2 * c),
         )
 
         self._sp = nn.Softplus()
-        def _inv_sp(y): return math.log(max(math.exp(float(y)) - 1.0, 1e-8))
+        def _inv_sp(y):
+            return math.log(max(math.exp(float(y)) - 1.0, 1e-8))
+
         self._p_ws_gamma = nn.Parameter(torch.tensor(_inv_sp(init_ws_gamma)))
         self._p_wg_gamma = nn.Parameter(torch.tensor(_inv_sp(init_wg_gamma)))
         self._p_ws_beta  = nn.Parameter(torch.tensor(_inv_sp(init_ws_beta)))
@@ -103,11 +124,13 @@ class SPADELayer(nn.Module):
         for m in self.s_conv.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                if m.bias is not None: nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         for m in self.g_mlp.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight, gain=2.0)
-                if m.bias is not None: nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         # ⚠️ on NE bride plus la dernière conv des cartes (plus de *.mul_(0.3))
 
     def forward(self, x, style_map, style_token):
@@ -140,11 +163,11 @@ class SPADELayer(nn.Module):
         return x_n * gam + bet
 
 class SPADEResBlock(nn.Module):
-    def __init__(self, c_in: int, c_out: int, s_ch: int, token_dim: int):
+    def __init__(self, c_in: int, c_out: int, s_ch: int, token_dim: int, *, norm_variant: str = "legacy"):
         super().__init__()
-        self.spade1 = SPADELayer(c_in,  s_ch, token_dim)
+        self.spade1 = SPADELayer(c_in,  s_ch, token_dim, norm_variant=norm_variant)
         self.conv1  = nn.Conv2d(c_in,   c_out, 3, 1, 1)
-        self.spade2 = SPADELayer(c_out, s_ch, token_dim)
+        self.spade2 = SPADELayer(c_out, s_ch, token_dim, norm_variant=norm_variant)
         self.conv2  = nn.Conv2d(c_out,  c_out, 3, 1, 1)
         self.skip = None
         if c_in != c_out:
@@ -160,12 +183,11 @@ class SPADEResBlock(nn.Module):
 
 class SPADEUp(nn.Module):
     """ Upsample ×2 → concat skip → SPADEResBlock """
-    def __init__(self, c_up: int, c_skip: int, c_out: int, s_ch: int, token_dim: int, *, scale_factor: int = 2):
-        super().__init__()
+    def __init__(self, c_up: int, c_skip: int, c_out: int, s_ch: int, token_dim: int, *, scale_factor: int = 2, norm_variant: str = "legacy"):
         super().__init__()
         self.scale_factor = int(scale_factor)
         self.up  = (nn.Upsample(scale_factor=2, mode="nearest") if self.scale_factor == 2 else nn.Identity())
-        self.res = SPADEResBlock(c_up + c_skip, c_out, s_ch, token_dim)
+        self.res = SPADEResBlock(c_up + c_skip, c_out, s_ch, token_dim, norm_variant=norm_variant)
 
     def forward(self, x, skip, style_map, style_token):
         x = self.up(x)
@@ -233,6 +255,10 @@ class StylePyramidEncoder(nn.Module):
         num_levels: int = 5,
         img_size: int = 256,
         min_spatial: int = 2,
+        norm_variant: str = "legacy",
+        extra_bot_resblocks: int = 0,
+        use_res_skip_bot: bool = False,
+        tokg_head_variant: str = "tokG_head",
     ):
         super().__init__()
         self.debug_shapes: bool = False
@@ -241,6 +267,9 @@ class StylePyramidEncoder(nn.Module):
         ngf = int(base)
         self.num_levels = int(num_levels)
         assert self.num_levels >= 1
+
+        self.use_res_skip_bot = bool(use_res_skip_bot)
+        self.tokg_head_variant = str(tokg_head_variant or "tokG_head")
 
         def ch_for_level(lvl: int) -> int:
             if lvl == 1: return ngf
@@ -256,14 +285,24 @@ class StylePyramidEncoder(nn.Module):
         for lvl in range(1, self.num_levels + 2):
             out_ch = ch_for_level(lvl)
             stride, dil = plan[lvl-1]
-            m = Down(in_ch, out_ch, stride=stride, dilation=dil)
+            m = Down(in_ch, out_ch, stride=stride, dilation=dil, norm_variant=norm_variant)
             setattr(self, f"d{lvl}", m)
             self.downs.append(m)
             in_ch = out_ch
 
-        self.res_skip = ResBlock(ch_for_level(self.num_levels))
-        self.res_bot = ResBlock(ch_for_level(self.num_levels + 1))
-        self.bot = ConvBlock(ch_for_level(self.num_levels + 1), ch_for_level(self.num_levels + 1))
+        if self.use_res_skip_bot:
+            self.res_skip = ResBlock(ch_for_level(self.num_levels), norm_variant=norm_variant)
+            self.res_bot  = ResBlock(ch_for_level(self.num_levels + 1), norm_variant=norm_variant)
+        else:
+            self.res_skip = None
+            self.res_bot  = None
+        self.bot = ConvBlock(ch_for_level(self.num_levels + 1), ch_for_level(self.num_levels + 1), norm_variant=norm_variant)
+
+        # Optional extra bottleneck ResBlocks for strict loading of legacy checkpoints
+        self.extra_bot_resblocks = int(extra_bot_resblocks)
+        for i in range(self.extra_bot_resblocks):
+            # legacy keys are res5/res6 in many runs
+            setattr(self, f"res{5+i}", ResBlock(ch_for_level(self.num_levels + 1), norm_variant=norm_variant))
 
         # heads per skip level (registered only once)
         self._h_list = []
@@ -276,7 +315,12 @@ class StylePyramidEncoder(nn.Module):
             self._h_list.append(h)
             self._t_list.append(t)
 
-        self.tokG_head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(ch_for_level(self.num_levels + 1), token_dim, 1))
+        if self.tokg_head_variant == "tbot":
+            self.tbot = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(ch_for_level(self.num_levels + 1), token_dim, 1))
+            self.tokG_head = None
+        else:
+            self.tokG_head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(ch_for_level(self.num_levels + 1), token_dim, 1))
+            self.tbot = None
 
     def forward(self, img: torch.Tensor):
         skips = []
@@ -290,11 +334,16 @@ class StylePyramidEncoder(nn.Module):
                     pass
             skips.append(x)
 
-        skips[-1] = self.res_skip(skips[-1])
+        if self.res_skip is not None:
+            skips[-1] = self.res_skip(skips[-1])
 
         z = self.downs[self.num_levels](skips[-1])
-        z = self.res_bot(z)
+        if self.res_bot is not None:
+            z = self.res_bot(z)
         z = self.bot(z)
+
+        for i in range(self.extra_bot_resblocks):
+            z = getattr(self, f"res{5+i}")(z)
 
         maps = []
         toks = []
@@ -305,7 +354,10 @@ class StylePyramidEncoder(nn.Module):
             maps.append(h(s))
             toks.append(t(s).flatten(1))
 
-        tokG = self.tokG_head(z).flatten(1)
+        if self.tbot is not None:
+            tokG = self.tbot(z).flatten(1)
+        else:
+            tokG = self.tokG_head(z).flatten(1)
         return tuple(maps), tuple(toks), tokG
 
 

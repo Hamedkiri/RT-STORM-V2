@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 
-from .safe_norm import SafeInstanceNorm2d
+from .safe_norm import SafeInstanceNorm2d, LegacySafeInstanceNorm2d
 import torch.nn.functional as F
 from typing import Optional
 # ──────────────────────────────────────────────────────────────
@@ -20,7 +20,9 @@ class PatchDiscriminator(nn.Module):
                  ndf: int = 64,
                  n_layers: int = 4,
                  use_spectral_norm: bool = True,
-                 cond_dim: int = 0):
+                 cond_dim: int = 0,
+                 *,
+                 norm_variant: str = "legacy"):
         super().__init__()
 
         def sn(m): return nn.utils.spectral_norm(m) if use_spectral_norm else m
@@ -32,8 +34,10 @@ class PatchDiscriminator(nn.Module):
         in_f = ndf
         for _ in range(1, n_layers):
             out_f = min(in_f * 2, ndf * 8)
+            nv = str(norm_variant or "legacy")
+            Norm = SafeInstanceNorm2d if nv == "safe" else LegacySafeInstanceNorm2d
             layers += [sn(nn.Conv2d(in_f, out_f, 4, 2, 1)),
-                       SafeInstanceNorm2d(out_f, affine=True),
+                       Norm(out_f, affine=True),
                        nn.LeakyReLU(0.2, inplace=True)]
             in_f = out_f
         self.body = nn.Sequential(*layers)
