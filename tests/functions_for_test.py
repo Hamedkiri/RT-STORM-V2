@@ -24,11 +24,11 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import os, json, numpy as np
 import matplotlib
-from typing import Optional
+from typing import Optional, Any
+
 from pathlib import Path as PPath           # ← alias sûr
 
-from typing import Optional, Sequence, Tuple, Dict, List
-
+from typing import Optional, Any, Sequence, Tuple, Dict, List
 from torchvision import transforms, datasets
 from data import MultiTaskDataset
 
@@ -1524,6 +1524,49 @@ def load_models(
     from models.sup_heads import SupHeads
     import torch, json
 
+# --------- NEW: infer generator architecture from saved run config ----------
+def _load_train_cfg_hparams(wdir: PPath) -> Dict[str, Any]:
+    """Load train_cfg.json (or hyperparameters.json/hparams.json) if present."""
+    for name in ("train_cfg.json", "hyperparameters.json", "hparams.json"):
+        p = PPath(wdir) / name
+        if p.exists():
+            try:
+                obj = json.loads(p.read_text())
+                if isinstance(obj, dict) and "static_hparams" in obj and isinstance(obj["static_hparams"], dict):
+                    return obj["static_hparams"]
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+    return {}
+
+def _infer_img_size(hp: Dict[str, Any]) -> int:
+    for k in ("img_size", "crop_size", "load_size", "resize", "image_size"):
+        v = hp.get(k, None)
+        if isinstance(v, int) and v > 0:
+            return int(v)
+    return 256
+
+def _infer_gen_kwargs(wdir: PPath, cfg: dict, token_dim: int) -> Dict[str, Any]:
+    hp = _load_train_cfg_hparams(wdir)
+    # default to current behavior if not found
+    arch_depth_delta = int(hp.get("arch_depth_delta", cfg.get("model", {}).get("arch_depth_delta", 0) or 0))
+    style_token_levels = int(hp.get("style_token_levels", cfg.get("model", {}).get("style_token_levels", -1) or -1))
+    unet_min_spatial = int(hp.get("unet_min_spatial", cfg.get("model", {}).get("unet_min_spatial", 2) or 2))
+    img_size = int(hp.get("img_size", _infer_img_size(hp)))
+    # allow overriding token_dim if saved
+    td = hp.get("token_dim", hp.get("hid_dim", None))
+    if isinstance(td, int) and td > 0:
+        token_dim = int(td)
+
+    return dict(
+        token_dim=int(token_dim),
+        arch_depth_delta=int(arch_depth_delta),
+        style_token_levels=int(style_token_levels),
+        img_size=int(img_size),
+        unet_min_spatial=int(unet_min_spatial),
+    )
+
     # ---------- helpers local ----------
     def _read_state_any(path: PPath, dev: torch.device):
         path = PPath(path)
@@ -1555,8 +1598,8 @@ def load_models(
 
     # petit chargeur générique pour un générateur complet depuis un ckpt séparé
     def _load_generator_from_ckpt(ckpt: PPath, device: torch.device,
-                                  token_dim: int, *, strict: bool = True) -> torch.nn.Module:
-        Gx = UNetGenerator(token_dim=token_dim).to(device)
+                                  gen_kwargs: Dict[str, Any], *, strict: bool = True) -> torch.nn.Module:
+        Gx = UNetGenerator(**gen_kwargs).to(device)
         sd = _read_state_any(ckpt, device)
         sd = _maybe_remap(sd)
         sd = _align_dp_prefix(sd, Gx)
@@ -1580,7 +1623,8 @@ def load_models(
         raise FileNotFoundError(f"G introuvable : {ckpt_gen}")
 
     token_dim_cfg = int(cfg.get("model", {}).get("token_dim", 256))
-    G = UNetGenerator(token_dim=token_dim_cfg).to(device)
+    gen_kwargs = _infer_gen_kwargs(weights_dir, cfg, token_dim_cfg)
+    G = UNetGenerator(**gen_kwargs).to(device)
 
     full_sd = _read_state_any(ckpt_gen, device)
     full_sd = _maybe_remap(full_sd)
@@ -1608,14 +1652,14 @@ def load_models(
         ckpt_GA_p = PPath(ckpt_GA)
         if not ckpt_GA_p.exists():
             raise FileNotFoundError(f"G_A introuvable : {ckpt_GA_p}")
-        GA = _load_generator_from_ckpt(ckpt_GA_p, device, token_dim_cfg, strict=strict_gen)
+        GA = _load_generator_from_ckpt(ckpt_GA_p, device, gen_kwargs, strict=strict_gen)
         print(f"✓ G_A loaded – {ckpt_GA_p.name}")
 
     if ckpt_GB:
         ckpt_GB_p = PPath(ckpt_GB)
         if not ckpt_GB_p.exists():
             raise FileNotFoundError(f"G_B introuvable : {ckpt_GB_p}")
-        GB = _load_generator_from_ckpt(ckpt_GB_p, device, token_dim_cfg, strict=strict_gen)
+        GB = _load_generator_from_ckpt(ckpt_GB_p, device, gen_kwargs, strict=strict_gen)
         print(f"✓ G_B loaded – {ckpt_GB_p.name}")
 
     # On attache GA/GB sur G pour compat descendante (retour inchangé).
@@ -1846,7 +1890,12 @@ def extract_style_signature(
         pass
 
     # ---------- NOUVEAUX MODES centrés tokens ----------
-    if embed_type in ("tokG", "style_tok", "tok6", "tok6_mean", "tok6_w"):
+    # tok6* sont conservés pour compat; si L != 5, tok6 se comporte comme tokL.
+    if embed_type in (
+        "tokG", "style_tok",
+        "tok6", "tok6_mean", "tok6_w",
+        "tokL", "tokL_mean", "tokL_w",
+    ):
         # fallback : si aucun token dispo, utilise le bottleneck
         if tokG is None and toks is None:
             return gap(z).squeeze(0)
@@ -1857,23 +1906,27 @@ def extract_style_signature(
 
         seq = [tokG] + (list(toks) if toks is not None else [])
         seq = [_l2(t) for t in seq]  # (B,D) chacun
+        n = len(seq)                 # = (L+1)
 
         if embed_type in ("tokG", "style_tok"):
-            return seq[0].squeeze(0)                       # (D,)
+            return seq[0].squeeze(0)  # (D,)
 
-        if embed_type == "tok6":
-            return torch.cat(seq, dim=1).squeeze(0)       # (6D,)
+        # concat tous les tokens : [tokG] + locaux (L variable)
+        if embed_type in ("tok6", "tokL"):
+            return torch.cat(seq, dim=1).squeeze(0)  # ((L+1)D,)
 
-        if embed_type == "tok6_mean":
+        # moyenne uniforme
+        if embed_type in ("tok6_mean", "tokL_mean"):
             return torch.stack(seq, dim=1).mean(1).squeeze(0)  # (D,)
 
-        if embed_type == "tok6_w":
-            w6 = torch.as_tensor(_parse_weights_any(delta_weights, 6), device=seq[0].device, dtype=seq[0].dtype)
-            W  = (w6 / (w6.sum() + 1e-8)).view(1, -1, 1)       # (1,6,1)
-            S  = torch.stack(seq, dim=1)                        # (B,6,D)
-            return (S * W).sum(1).squeeze(0)                    # (D,)
+        # moyenne pondérée : accepte n poids (si moins → pad, si plus → trim)
+        if embed_type in ("tok6_w", "tokL_w"):
+            w = torch.as_tensor(_parse_weights_any(delta_weights, n), device=seq[0].device, dtype=seq[0].dtype)
+            W = (w / (w.sum() + 1e-8)).view(1, -1, 1)  # (1,n,1)
+            S = torch.stack(seq, dim=1)                # (B,n,D)
+            return (S * W).sum(1).squeeze(0)           # (D,)
 
-    # ---------- MODES HISTORIQUES (compat) ----------
+# ---------- MODES HISTORIQUES (compat) ----------
     # maps requis pour mgap / tok+delta / mgap+tok ; sinon on retombe sur bot / bot+tok
     if token_pool == "max":
         pool = lambda m: F.adaptive_max_pool2d(m, 1).flatten(1)
@@ -2277,7 +2330,7 @@ def compute_embeddings_with_paths(
                 target = m.weight.shape[1]; break
         if target is None:
             return None
-        candidates = ["tok+delta", "bot+tok", "style_tok", "tok6", "tok6_mean"]
+        candidates = ["tok+delta", "bot+tok", "style_tok", "tokL", "tokL_mean", "tok6", "tok6_mean"]
         try: dev_local = next(G.parameters()).device
         except Exception: dev_local = device
         x = torch.zeros(1, 3, 256, 256, device=dev_local)
@@ -2517,18 +2570,32 @@ def compute_gradcam_supheads(
         return w
 
     # ---------- 2) features EXACTEMENT comme en sup ----------
-    if ft in ("tok6", "tok6_mean", "tok6_w", "style_tok", "tokg"):
+    if ft in ("tok6", "tok6_mean", "tok6_w", "tokL", "tokL_mean", "tokL_w", "style_tok", "tokg"):
         if ft in ("style_tok", "tokg"):
             feats = tlist[0]
         elif ft == "tok6":
-            feats = torch.cat(tlist, dim=1)
+            # compat: tokG + 5 locaux (si dispo)
+            seq = tlist[:6] if len(tlist) >= 6 else (tlist + [tlist[-1]] * (6 - len(tlist)))
+            feats = torch.cat(seq, dim=1)
         elif ft == "tok6_mean":
-            feats = torch.stack(tlist, dim=1).mean(1)
-        else:  # tok6_w
+            seq = tlist[:6] if len(tlist) >= 6 else (tlist + [tlist[-1]] * (6 - len(tlist)))
+            feats = torch.stack(seq, dim=1).mean(1)
+        elif ft == "tok6_w":
+            seq = tlist[:6] if len(tlist) >= 6 else (tlist + [tlist[-1]] * (6 - len(tlist)))
             w = _parse_weights(delta_weights, 6, x1.device).view(1, -1, 1)
             w = w / (w.sum() + 1e-8)
-            S = torch.stack(tlist, dim=1)     # Bx6xD
-            feats = (S * w).sum(1)            # BxD
+            S = torch.stack(seq, dim=1)     # Bx6xD
+            feats = (S * w).sum(1)          # BxD
+        elif ft == "tokL":
+            feats = torch.cat(tlist, dim=1)
+        elif ft == "tokL_mean":
+            feats = torch.stack(tlist, dim=1).mean(1)
+        else:  # tokL_w
+            n = len(tlist)
+            w = _parse_weights(delta_weights, n, x1.device).view(1, -1, 1)
+            w = w / (w.sum() + 1e-8)
+            S = torch.stack(tlist, dim=1)   # BxNxD
+            feats = (S * w).sum(1)          # BxD
     elif ft == "bot":
         feats = bot
     elif ft == "bot+tok":
@@ -3410,3 +3477,270 @@ def run_detection_on_camera(
     finally:
         cap.release()
         cv2.destroyAllWindows()
+
+# =========================================================
+#  FIXED: robust autoload of generator architecture + tokL support
+#  (This definition overrides any earlier broken load_models.)
+# =========================================================
+
+from typing import Any as _Any, Dict as _Dict, Optional as _Optional, Tuple as _Tuple
+
+
+def _load_train_cfg_hparams(wdir: PPath) -> _Dict[str, _Any]:
+    """Load train_cfg.json (or hyperparameters.json/hparams.json) if present in weights_dir."""
+    for name in ("train_cfg.json", "hyperparameters.json", "hparams.json"):
+        p = PPath(wdir) / name
+        if p.exists():
+            try:
+                obj = json.loads(p.read_text())
+                # some runs store hparams under static_hparams
+                if isinstance(obj, dict) and isinstance(obj.get("static_hparams"), dict):
+                    return obj["static_hparams"]
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+    return {}
+
+
+def _infer_img_size(hp: _Dict[str, _Any], cfg: dict) -> int:
+    for k in ("img_size", "crop_size", "load_size", "resize", "image_size"):
+        v = hp.get(k, None)
+        if isinstance(v, int) and v > 0:
+            return int(v)
+    # fallback to cfg
+    for k in ("img_size", "crop_size", "load_size"):
+        v = cfg.get(k, None) if isinstance(cfg, dict) else None
+        if isinstance(v, int) and v > 0:
+            return int(v)
+    return 256
+
+
+def _infer_gen_kwargs(weights_dir: PPath, cfg: dict) -> _Dict[str, _Any]:
+    hp = _load_train_cfg_hparams(weights_dir)
+
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+
+    # token_dim
+    token_dim = hp.get("token_dim", hp.get("hid_dim", model_cfg.get("token_dim", 256)))
+    token_dim = int(token_dim) if isinstance(token_dim, int) and token_dim > 0 else 256
+
+    arch_depth_delta = int(hp.get("arch_depth_delta", model_cfg.get("arch_depth_delta", 0) or 0))
+    style_token_levels = int(hp.get("style_token_levels", model_cfg.get("style_token_levels", -1) or -1))
+    unet_min_spatial = int(hp.get("unet_min_spatial", model_cfg.get("unet_min_spatial", 2) or 2))
+    # NOTE: older experimental configs may contain "stop_down_at".
+    # The current UNetGenerator API uses `unet_min_spatial` and an internal rule
+    # (stop at >=4 when deepening). We intentionally ignore "stop_down_at" here.
+
+    img_size = int(hp.get("img_size", _infer_img_size(hp, cfg)))
+
+    return dict(
+        token_dim=token_dim,
+        arch_depth_delta=arch_depth_delta,
+        style_token_levels=style_token_levels,
+        img_size=img_size,
+        unet_min_spatial=unet_min_spatial,
+    )
+
+
+def _read_state_any(path: PPath, dev: torch.device) -> _Dict[str, torch.Tensor]:
+    path = PPath(path)
+    if path.suffix.lower() == ".safetensors":
+        from safetensors.torch import load_file
+        return load_file(str(path), device=str(dev))
+    obj = torch.load(path, map_location=dev)
+    if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
+        return obj["state_dict"]
+    if isinstance(obj, dict):
+        # sometimes it's already a flat state dict but with extra keys
+        if all(isinstance(k, str) for k in obj.keys()) and any(isinstance(v, torch.Tensor) for v in obj.values()):
+            return obj  # type: ignore
+    return obj  # type: ignore
+
+
+def _align_dp_prefix(sd: _Dict[str, torch.Tensor], model: torch.nn.Module) -> _Dict[str, torch.Tensor]:
+    if not sd:
+        return sd
+    m_keys = list(model.state_dict().keys())
+    model_has_mod = any(k.startswith("module.") for k in m_keys)
+    ckpt_has_mod = any(k.startswith("module.") for k in sd.keys())
+    if ckpt_has_mod and (not model_has_mod):
+        return { (k[7:] if k.startswith("module.") else k): v for k, v in sd.items() }
+    if (not ckpt_has_mod) and model_has_mod:
+        return { (f"module.{k}" if not k.startswith("module.") else k): v for k, v in sd.items() }
+    return sd
+
+
+def _split_sup_from_ckpt(sd: _Dict[str, torch.Tensor]) -> _Tuple[_Dict[str, torch.Tensor], _Dict[str, torch.Tensor]]:
+    """Split generator keys vs sup_heads keys if ckpt is a combined bundle."""
+    gen_sd: _Dict[str, torch.Tensor] = {}
+    sup_sd: _Dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        if k.startswith("sup_heads."):
+            sup_sd[k.replace("sup_heads.", "", 1)] = v
+        else:
+            gen_sd[k] = v
+    return gen_sd, sup_sd
+
+
+def load_models(
+    weights_dir: PPath,
+    device: torch.device,
+    cfg: dict,
+    ckpt_gen: _Optional[str] = None,
+    sup_ckpt: _Optional[str] = None,
+    classes_json: _Optional[str] = None,
+    sup_in_dim: _Optional[int] = None,
+    *,
+    strict_gen: bool = True,
+    strict_sup: bool = True,
+    ckpt_GA: _Optional[str] = None,
+    ckpt_GB: _Optional[str] = None,
+) -> _Tuple[torch.nn.Module, _Optional[torch.nn.Module], _Optional[dict]]:
+    """Robust loader used by test.py.
+
+    - Autoload generator architecture (arch_depth_delta/style_token_levels/img_size/etc.) from weights_dir config.
+    - Supports separate GA/GB ckpts.
+    - Loads SupHeads if provided or present inside generator ckpt.
+
+    Returns: (G, SupHeads_or_None, task_classes_or_None)
+    """
+    from models.generator import UNetGenerator
+    from models.sup_heads import SupHeads
+
+    weights_dir = PPath(weights_dir)
+
+    # choose generator ckpt
+    if ckpt_gen is None:
+        # try cfg hints
+        ckpt_name = None
+        if isinstance(cfg, dict):
+            ckpt_name = (cfg.get("model", {}) or {}).get("gen_ckpt_best") or (cfg.get("model", {}) or {}).get("gen_ckpt_last")
+        if ckpt_name:
+            ckpt_gen = str(weights_dir / ckpt_name)
+        else:
+            ckpt_gen = str(find_latest_ckpt(weights_dir))
+
+    ckpt_gen_p = PPath(ckpt_gen)
+    if not ckpt_gen_p.exists():
+        raise FileNotFoundError(f"Generator ckpt not found: {ckpt_gen_p}")
+
+    gen_kwargs = _infer_gen_kwargs(weights_dir, cfg)
+
+    # build generator
+    G = UNetGenerator(**gen_kwargs).to(device)
+
+    # read checkpoint
+    full_sd = _read_state_any(ckpt_gen_p, device)
+    try:
+        full_sd = _remap_keys(full_sd)
+    except Exception:
+        pass
+
+    gen_sd, sup_sd_from_gen = _split_sup_from_ckpt(full_sd)
+    gen_sd = _align_dp_prefix(gen_sd, G)
+
+    # load generator
+    try:
+        G.load_state_dict(gen_sd, strict=strict_gen)
+    except RuntimeError as e:
+        if strict_gen:
+            raise RuntimeError(f"[STRICT] Generator load failed for {ckpt_gen_p.name}:\n{e}")
+        G.load_state_dict(gen_sd, strict=False)
+
+    G.eval()
+
+    # optional separate GA/GB
+    def _load_one_gen(pth: str) -> torch.nn.Module:
+        p = PPath(pth)
+        if not p.exists():
+            raise FileNotFoundError(f"Generator ckpt not found: {p}")
+        Gx = UNetGenerator(**gen_kwargs).to(device)
+        sd = _read_state_any(p, device)
+        try:
+            sd = _remap_keys(sd)
+        except Exception:
+            pass
+        gen_sd2, _ = _split_sup_from_ckpt(sd)
+        gen_sd2 = _align_dp_prefix(gen_sd2, Gx)
+        try:
+            Gx.load_state_dict(gen_sd2, strict=strict_gen)
+        except RuntimeError as e:
+            if strict_gen:
+                raise RuntimeError(f"[STRICT] Generator load failed for {p.name}:\n{e}")
+            Gx.load_state_dict(gen_sd2, strict=False)
+        Gx.eval()
+        return Gx
+
+    if ckpt_GA:
+        G.GA = _load_one_gen(ckpt_GA)
+    if ckpt_GB:
+        G.GB = _load_one_gen(ckpt_GB)
+
+    # task classes
+    task_classes = None
+    if classes_json:
+        try:
+            task_classes = json.loads(PPath(classes_json).read_text())
+        except Exception:
+            task_classes = None
+
+    # load SupHeads if requested
+    Sup = None
+    if sup_ckpt or sup_sd_from_gen:
+        # infer tasks from cfg if possible
+        tasks = None
+        if isinstance(cfg, dict):
+            tasks = cfg.get("tasks") or (cfg.get("model", {}) or {}).get("tasks")
+        if task_classes and isinstance(task_classes, dict):
+            tasks = list(task_classes.keys())
+
+        # infer in_dim
+        if sup_in_dim is None:
+            # try feat_type from cfg/hparams
+            hp = _load_train_cfg_hparams(weights_dir)
+            feat_type = hp.get("sup_feat_type", (cfg.get("model", {}) or {}).get("sup_feat_type", None))
+            if isinstance(feat_type, str) and hasattr(G, "sup_in_dim_for"):
+                try:
+                    sup_in_dim = int(G.sup_in_dim_for(feat_type))
+                except Exception:
+                    sup_in_dim = None
+        if sup_in_dim is None:
+            # safe fallback
+            sup_in_dim = int(gen_kwargs.get("token_dim", 256))
+
+        Sup = SupHeads(in_dim=int(sup_in_dim), tasks=tasks, task_classes=task_classes).to(device)
+
+        # load state
+        if sup_ckpt:
+            sup_p = PPath(sup_ckpt)
+            if sup_p.is_dir():
+                sup_p = find_latest_ckpt(sup_p)
+            sd = _read_state_any(sup_p, device)
+            # bundles may store under sup_heads
+            if isinstance(sd, dict) and "sup_heads" in sd and isinstance(sd["sup_heads"], dict):
+                sd = sd["sup_heads"]
+            if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+                sd = sd["state_dict"]
+            if isinstance(sd, dict) and any(k.startswith("sup_heads.") for k in sd.keys()):
+                # strip prefix
+                sd = {k.replace("sup_heads.", "", 1): v for k, v in sd.items()}
+            sd = _align_dp_prefix(sd, Sup)
+            try:
+                Sup.load_state_dict(sd, strict=strict_sup)
+            except RuntimeError as e:
+                if strict_sup:
+                    raise RuntimeError(f"[STRICT] SupHeads load failed for {sup_p.name}:\n{e}")
+                Sup.load_state_dict(sd, strict=False)
+        else:
+            sd = _align_dp_prefix(sup_sd_from_gen, Sup)
+            try:
+                Sup.load_state_dict(sd, strict=strict_sup)
+            except RuntimeError as e:
+                if strict_sup:
+                    raise RuntimeError(f"[STRICT] SupHeads load failed from generator ckpt:\n{e}")
+                Sup.load_state_dict(sd, strict=False)
+
+        Sup.eval()
+
+    return G, Sup, task_classes

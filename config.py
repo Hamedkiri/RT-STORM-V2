@@ -249,14 +249,14 @@ def get_opts():
     p.add_argument(
         "--sup_feat_type",
         choices=[
-            "tokG", "tok6", "tok6_mean", "tok6_w",
+            "tokG", "tok6", "tok6_mean", "tok6_w", "tokL", "tokL_mean", "tokL_w",
             "cont_tok", "cont_tok_vit",
             "style_tok", "bot", "bot+tok", "tok+delta", "mgap", "mgap+tok",
         ],
         default="tok6",
         help="Type de features vers SupHeads.",
     )
-    p.add_argument("--delta_weights", type=str, default="1,1,1,1,1", help="Poids échelles pour 'tok+delta'.")
+    p.add_argument("--delta_weights", type=str, default="1,1,1,1,1", help="Poids échelles. Pour tokL_w: (L+1) poids 'wG,wL,...,w1'. Pour tok+delta/mgap: 5 poids 'w5..w1'.")
     p.add_argument("--sup_tasks_json", type=str, default=None, help="JSON tâches: {task: n_classes ou [names]}")
 
     # Source des features pour SupHeads (utile en sup_freeze/hybrid)

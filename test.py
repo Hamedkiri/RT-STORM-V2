@@ -177,6 +177,7 @@ def main() -> None:
         choices=[
             "tokG",
             "tok6", "tok6_mean", "tok6_w",
+            "tokL", "tokL_mean", "tokL_w",
             "style_tok",
             "bot", "bot+tok",
             "tok+delta",
@@ -193,7 +194,7 @@ def main() -> None:
         default="1,1,1,1,1",
         help=(
             "Poids par échelle. "
-            "Pour 'tok6_w' : 6 poids 'wG,w5,w4,w3,w2,w1'. "
+            "Pour 'tok6_w' : 6 poids 'wG,w5,w4,w3,w2,w1' (compat). Pour 'tokL_w' : (L+1) poids 'wG,wL,...,w1'. "
             "Pour 'tok+delta' / 'mgap' / 'mgap+tok' : 5 poids 'w5,w4,w3,w2,w1'."
         ),
     )
