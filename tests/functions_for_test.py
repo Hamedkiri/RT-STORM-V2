@@ -3677,23 +3677,68 @@ def load_models(
     if ckpt_GB:
         G.GB = _load_one_gen(ckpt_GB)
 
-    # task classes
-    task_classes = None
+    # task classes (optional metadata: task -> list of class names or {classes:[...]})
+    task_classes: dict | None = None
     if classes_json:
         try:
             task_classes = json.loads(PPath(classes_json).read_text())
         except Exception:
             task_classes = None
 
+    def _tasks_from_task_classes(tc: dict) -> dict[str, int] | None:
+        """Convert task_classes json to {task: num_classes}."""
+        if not isinstance(tc, dict):
+            return None
+        out: dict[str, int] = {}
+        for t, v in tc.items():
+            if isinstance(v, int):
+                out[str(t)] = int(v)
+            elif isinstance(v, list):
+                out[str(t)] = len(v)
+            elif isinstance(v, dict):
+                if "classes" in v and isinstance(v["classes"], list):
+                    out[str(t)] = len(v["classes"])
+                elif "num_classes" in v:
+                    try:
+                        out[str(t)] = int(v["num_classes"])
+                    except Exception:
+                        pass
+        return out or None
+
+    def _tasks_from_sup_state(sd: dict) -> dict[str, int] | None:
+        """Infer {task:num_classes} from SupHeads state_dict keys."""
+        if not isinstance(sd, dict):
+            return None
+        out: dict[str, int] = {}
+        # expected key: classifiers.<task>.4.weight where last Linear is index 4
+        for k, v in sd.items():
+            if not isinstance(k, str):
+                continue
+            if not k.startswith("classifiers."):
+                continue
+            parts = k.split(".")
+            if len(parts) < 4:
+                continue
+            task = parts[1]
+            layer_idx = parts[2]
+            param = parts[3]
+            if layer_idx != "4" or param != "weight":
+                continue
+            if hasattr(v, "shape") and len(v.shape) >= 1:
+                out[task] = int(v.shape[0])
+        return out or None
+
     # load SupHeads if requested
     Sup = None
     if sup_ckpt or sup_sd_from_gen:
-        # infer tasks from cfg if possible
-        tasks = None
+        # infer tasks from (1) cfg (2) classes_json (3) sup checkpoint/state_dict
+        tasks_dict: dict[str, int] | None = None
         if isinstance(cfg, dict):
-            tasks = cfg.get("tasks") or (cfg.get("model", {}) or {}).get("tasks")
-        if task_classes and isinstance(task_classes, dict):
-            tasks = list(task_classes.keys())
+            tcfg = cfg.get("tasks") or (cfg.get("model", {}) or {}).get("tasks")
+            if isinstance(tcfg, dict) and all(isinstance(v, int) for v in tcfg.values()):
+                tasks_dict = {str(k): int(v) for k, v in tcfg.items()}
+        if tasks_dict is None and task_classes is not None:
+            tasks_dict = _tasks_from_task_classes(task_classes)
 
         # infer in_dim
         if sup_in_dim is None:
@@ -3709,7 +3754,31 @@ def load_models(
             # safe fallback
             sup_in_dim = int(gen_kwargs.get("token_dim", 256))
 
-        Sup = SupHeads(in_dim=int(sup_in_dim), tasks=tasks, task_classes=task_classes).to(device)
+        # If still unknown, infer tasks from sup weights before instantiation
+        if tasks_dict is None:
+            if sup_ckpt:
+                sup_p0 = PPath(sup_ckpt)
+                if sup_p0.is_dir():
+                    sup_p0 = find_latest_ckpt(sup_p0)
+                sd0 = _read_state_any(sup_p0, device)
+                if isinstance(sd0, dict) and "sup_heads" in sd0 and isinstance(sd0["sup_heads"], dict):
+                    sd0 = sd0["sup_heads"]
+                if isinstance(sd0, dict) and "state_dict" in sd0 and isinstance(sd0["state_dict"], dict):
+                    sd0 = sd0["state_dict"]
+                if isinstance(sd0, dict) and any(k.startswith("sup_heads.") for k in sd0.keys()):
+                    sd0 = {k.replace("sup_heads.", "", 1): v for k, v in sd0.items()}
+                tasks_dict = _tasks_from_sup_state(sd0)
+            else:
+                tasks_dict = _tasks_from_sup_state(sup_sd_from_gen)
+
+        if tasks_dict is None:
+            raise RuntimeError(
+                "SupHeads requested (tsne_use_supheads/per_task/sup_predict) but tasks could not be inferred. "
+                "Provide --classes_json (task->classes) or ensure cfg contains tasks mapping."
+            )
+
+        # Instantiate SupHeads with correct signature: SupHeads(tasks, in_dim, ...)
+        Sup = SupHeads(tasks_dict, int(sup_in_dim)).to(device)
 
         # load state
         if sup_ckpt:
