@@ -210,6 +210,8 @@ def get_opts():
     p.add_argument("--spade_gate_margin", type=float, default=0.75, help="Marge régul SPADE.")
 
     p.add_argument("--token_ablate_eval_every", type=int, default=400, help="Steps entre évaluations ablation.")
+    p.add_argument("--token_dim", type=int, default=256, help="Dim token/proj pour style")
+
 
     # =========================================================================
     # 9) JEPA

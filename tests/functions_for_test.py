@@ -3758,9 +3758,39 @@ def load_models(
                 out[task] = int(v.shape[0])
         return out or None
 
+    def _infer_in_dim_from_sup_state(sd: dict) -> int | None:
+        """Infer SupHeads input dim from state_dict.
+
+        We expect a LayerNorm at classifiers.<task>.0 with weight shape (in_dim,).
+        """
+        if not isinstance(sd, dict):
+            return None
+        for k, v in sd.items():
+            if not isinstance(k, str) or not k.startswith("classifiers."):
+                continue
+            if k.endswith(".0.weight") and hasattr(v, "shape") and len(getattr(v, "shape", ())) == 1:
+                return int(v.shape[0])
+        return None
+
     # load SupHeads if requested
     Sup = None
     if sup_ckpt or sup_sd_from_gen:
+        # Pre-load SupHeads state dict once (helps infer tasks and in_dim robustly)
+        sup_sd_pre: dict | None = None
+        if sup_ckpt:
+            sup_p0 = PPath(sup_ckpt)
+            if sup_p0.is_dir():
+                sup_p0 = find_latest_ckpt(sup_p0)
+            sup_sd_pre = _read_state_any(sup_p0, device)
+            if isinstance(sup_sd_pre, dict) and "sup_heads" in sup_sd_pre and isinstance(sup_sd_pre["sup_heads"], dict):
+                sup_sd_pre = sup_sd_pre["sup_heads"]
+            if isinstance(sup_sd_pre, dict) and "state_dict" in sup_sd_pre and isinstance(sup_sd_pre["state_dict"], dict):
+                sup_sd_pre = sup_sd_pre["state_dict"]
+            if isinstance(sup_sd_pre, dict) and any(k.startswith("sup_heads.") for k in sup_sd_pre.keys()):
+                sup_sd_pre = {k.replace("sup_heads.", "", 1): v for k, v in sup_sd_pre.items()}
+        else:
+            sup_sd_pre = sup_sd_from_gen
+
         # infer tasks from (1) cfg (2) classes_json (3) sup checkpoint/state_dict
         tasks_dict: dict[str, int] | None = None
         if isinstance(cfg, dict):
@@ -3770,7 +3800,10 @@ def load_models(
         if tasks_dict is None and task_classes is not None:
             tasks_dict = _tasks_from_task_classes(task_classes)
 
-        # infer in_dim
+        # infer in_dim (priority: from SupHeads weights themselves)
+        if sup_in_dim is None and sup_sd_pre is not None:
+            sup_in_dim = _infer_in_dim_from_sup_state(sup_sd_pre)
+
         if sup_in_dim is None:
             # try feat_type from cfg/hparams
             hp = _load_train_cfg_hparams(weights_dir)
@@ -3781,25 +3814,12 @@ def load_models(
                 except Exception:
                     sup_in_dim = None
         if sup_in_dim is None:
-            # safe fallback
+            # fallback: token_dim
             sup_in_dim = int(gen_kwargs.get("token_dim", 256))
 
-        # If still unknown, infer tasks from sup weights before instantiation
+        # If still unknown, infer tasks from SupHeads weights before instantiation
         if tasks_dict is None:
-            if sup_ckpt:
-                sup_p0 = PPath(sup_ckpt)
-                if sup_p0.is_dir():
-                    sup_p0 = find_latest_ckpt(sup_p0)
-                sd0 = _read_state_any(sup_p0, device)
-                if isinstance(sd0, dict) and "sup_heads" in sd0 and isinstance(sd0["sup_heads"], dict):
-                    sd0 = sd0["sup_heads"]
-                if isinstance(sd0, dict) and "state_dict" in sd0 and isinstance(sd0["state_dict"], dict):
-                    sd0 = sd0["state_dict"]
-                if isinstance(sd0, dict) and any(k.startswith("sup_heads.") for k in sd0.keys()):
-                    sd0 = {k.replace("sup_heads.", "", 1): v for k, v in sd0.items()}
-                tasks_dict = _tasks_from_sup_state(sd0)
-            else:
-                tasks_dict = _tasks_from_sup_state(sup_sd_from_gen)
+            tasks_dict = _tasks_from_sup_state(sup_sd_pre) if sup_sd_pre is not None else None
 
         if tasks_dict is None:
             raise RuntimeError(
