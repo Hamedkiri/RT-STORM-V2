@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 import torchvision.transforms as T
 from torchvision.datasets import CocoDetection
 
-from tests.detection_utils import (
+from testsFile.detectionUtils import (
     build_detector_from_checkpoint,
     evaluate_coco_map,
     infer_batch,

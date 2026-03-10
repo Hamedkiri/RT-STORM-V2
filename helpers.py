@@ -3032,6 +3032,8 @@ def run_sup_freeze_sem_only(
     - On sauvegarde SupHeads + SemBackbone dans save_dir/sup_freeze/fold_xx/.
     """
 
+    import shutil
+
     from training.train_detection_transformer import _build_sem_resnet_backbone
     from training.checkpoint import should_save_ckpt
 
@@ -3096,6 +3098,26 @@ def run_sup_freeze_sem_only(
     resume_dir = getattr(opt, "resume_dir", None)
     if resume_dir:
         rdir = Path(resume_dir)
+
+        # Copy frozen GAN weights (and other useful run files) to current save_dir so that
+        # the run directory remains self-contained for later testing.
+        # This is important because sup_freeze_sem_only trains ONLY SupHeads, but users
+        # often expect the save_dir to also contain G/D weights used for feature extraction.
+        try:
+            out_root = Path(opt.save_dir)
+            out_root.mkdir(parents=True, exist_ok=True)
+            patterns = [
+                "G_A_epoch*.pt", "G_B_epoch*.pt", "D_A_epoch*.pt", "D_B_epoch*.pt",
+                "trainer_epoch*.pth", "state.json", "train_cfg.json"
+            ]
+            for pat in patterns:
+                for src in sorted(rdir.glob(pat), key=lambda p: p.stat().st_mtime):
+                    dst = out_root / src.name
+                    if not dst.exists():
+                        shutil.copy2(src, dst)
+        except Exception as e:
+            print(f"[WARN] sup_freeze_sem_only: copy frozen weights from resume_dir failed: {e}")
+
         cand = sorted(list(rdir.glob("SemBackbone_epoch*.pt")), key=lambda p: p.stat().st_mtime)
         if cand:
             try:

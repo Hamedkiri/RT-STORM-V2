@@ -213,6 +213,355 @@ class UnsupervisedJsonDataset(Dataset):
 
 
 # -----------------------------
+# ImageNet-like dataset (train via ImageFolder, val via annotations)
+# -----------------------------
+class ImageNetCLSLDataset(Dataset):
+    """ILSVRC 2012 CLS-LOC style dataset (classification, optional bbox).
+
+    Supports:
+      - train: Data/CLS-LOC/train/<synset>/*.JPEG (labels from folder)
+      - val:   Data/CLS-LOC/val/*.JPEG (labels from XML or LOC_val_solution.csv)
+      - test:  Data/CLS-LOC/test/*.JPEG (no labels)
+
+    If imagesets_root is provided, it uses ImageSets/CLS-LOC/{split}.txt to select ids.
+    Synset->idx mapping is stable: prefers LOC_synset_mapping.txt order if provided.
+    """
+
+    def __init__(
+        self,
+        images_root: str,
+        split: str,
+        ann_root: str | None = None,
+        imagesets_root: str | None = None,
+        synset_mapping_file: str | None = None,
+        val_solution_csv: str | None = None,
+        transform=None,
+        label_base: int = 1,
+        num_classes: int = 1000,
+        return_bbox: bool = False,
+    ):
+        self.images_root = str(images_root)
+        self.split = str(split).lower()
+        self.ann_root = str(ann_root) if ann_root else None
+        self.imagesets_root = str(imagesets_root) if imagesets_root else None
+        self.synset_mapping_file = str(synset_mapping_file) if synset_mapping_file else None
+        self.val_solution_csv = str(val_solution_csv) if val_solution_csv else None
+        self.transform = transform
+        self.label_base = int(label_base)
+        self.num_classes = int(num_classes)
+        self.return_bbox = bool(return_bbox)
+
+        rp = Path(self.images_root)
+        if not rp.exists():
+            raise FileNotFoundError(f"[ImageNetCLSLDataset] images_root not found: {self.images_root}")
+
+        self.synset_to_idx, self._synset_names = self._build_synset_to_idx(rp)
+
+        # Expose ImageFolder-like attrs
+        syn_by_idx = [None] * (max(self.synset_to_idx.values()) + 1 if self.synset_to_idx else 0)
+        for syn, idx in self.synset_to_idx.items():
+            if 0 <= idx < len(syn_by_idx):
+                syn_by_idx[idx] = syn
+        self.classes = [s for s in syn_by_idx if s is not None]
+        self.class_to_idx = dict(self.synset_to_idx)
+        self.class_names = [self._synset_names.get(s, s) for s in self.classes]
+
+        # Read ids list from ImageSets if available
+        ids = None
+        if self.imagesets_root:
+            f = Path(self.imagesets_root) / f"{self.split}.txt"
+            if f.exists():
+                ids = []
+                for ln in f.read_text(encoding='utf-8').splitlines():
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    ids.append(ln.split()[0])
+
+        self._val_csv_map = None
+        if self.split == 'val' and self.val_solution_csv:
+            self._val_csv_map = self._parse_val_solution_csv(self.val_solution_csv)
+
+        self.samples: list[dict] = []
+        if self.split == 'train':
+            self._build_train_samples(rp, ids)
+        elif self.split == 'val':
+            self._build_val_samples(rp, ids)
+        elif self.split == 'test':
+            self._build_test_samples(rp, ids)
+        else:
+            raise ValueError(f"[ImageNetCLSLDataset] split must be train|val|test, got {self.split}")
+
+        if len(self.samples) == 0:
+            raise RuntimeError(f"[ImageNetCLSLDataset] no samples found: root={self.images_root} split={self.split}")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        img = Image.open(s['path']).convert('RGB')
+        if self.transform is not None:
+            img = self.transform(img)
+
+        y = s.get('y', None)
+        if not self.return_bbox:
+            # for test split, y can be None; return -1 to keep collate simple
+            return img, (-1 if y is None else int(y))
+
+        out = {"default": (-1 if y is None else int(y)), "bbox": s.get("bbox", None)}
+        return img, out
+
+    # -------------------- mapping helpers --------------------
+    def _build_synset_to_idx(self, rp: Path) -> tuple[Dict[str, int], Dict[str, str]]:
+        names: Dict[str, str] = {}
+        if self.synset_mapping_file and Path(self.synset_mapping_file).exists():
+            synsets = []
+            for ln in Path(self.synset_mapping_file).read_text(encoding='utf-8').splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                parts = ln.split()
+                syn = parts[0]
+                if not syn.startswith('n'):
+                    continue
+                synsets.append(syn)
+                if len(parts) > 1:
+                    names[syn] = " ".join(parts[1:])
+            synsets = synsets[: self.num_classes] if self.num_classes else synsets
+            return {s: i for i, s in enumerate(synsets)}, names
+
+        # fallback from train folders
+        train_root = (rp / 'train') if (rp / 'train').exists() else rp
+        subdirs = [d for d in train_root.iterdir() if d.is_dir() and d.name.startswith('n')]
+        synsets = sorted([d.name for d in subdirs])
+        synsets = synsets[: self.num_classes] if self.num_classes else synsets
+        return {s: i for i, s in enumerate(synsets)}, names
+
+    def _parse_val_solution_csv(self, csv_path: str) -> Dict[str, str]:
+        import csv
+        mp = {}
+        with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                img_id = row.get('ImageId') or row.get('image_id') or row.get('ImageID')
+                ps = row.get('PredictionString') or row.get('predictionstring')
+                if not img_id or not ps:
+                    continue
+                parts = ps.strip().split()
+                if parts:
+                    mp[img_id] = parts[0]
+        return mp
+
+    def _xml_to_label_bbox(self, xml_path: Path) -> tuple[str | None, list[int] | None]:
+        import xml.etree.ElementTree as ET
+        if not xml_path.exists():
+            return None, None
+        try:
+            root = ET.parse(str(xml_path)).getroot()
+            obj = root.find('object')
+            if obj is None:
+                return None, None
+            name = obj.findtext('name')
+            bbox_el = obj.find('bndbox')
+            bbox = None
+            if bbox_el is not None:
+                def _get(tag):
+                    v = bbox_el.findtext(tag)
+                    return int(float(v)) if v is not None else None
+                xmin, ymin, xmax, ymax = _get('xmin'), _get('ymin'), _get('xmax'), _get('ymax')
+                if None not in (xmin, ymin, xmax, ymax):
+                    bbox = [xmin, ymin, xmax, ymax]
+            return name, bbox
+        except Exception:
+            return None, None
+
+    # -------------------- sample builders --------------------
+    def _build_train_samples(self, rp: Path, ids: list[str] | None):
+        train_root = (rp / 'train') if (rp / 'train').exists() else rp
+        ann_root = Path(self.ann_root) / 'train' if self.ann_root else None
+
+        for syn_dir in sorted([d for d in train_root.iterdir() if d.is_dir() and d.name.startswith('n')]):
+            syn = syn_dir.name
+            if syn not in self.synset_to_idx:
+                continue
+            y = self.synset_to_idx[syn]
+            paths = [p for p in syn_dir.rglob('*') if p.is_file() and is_image_path(p)]
+            for p in sorted(paths):
+                rel_id = f"{syn}/{p.stem}"
+                if ids is not None and rel_id not in ids and p.stem not in ids:
+                    continue
+                bbox = None
+                if self.return_bbox and ann_root is not None:
+                    xml_path = ann_root / syn / f"{p.stem}.xml"
+                    _, bbox = self._xml_to_label_bbox(xml_path)
+                self.samples.append({"path": str(p), "y": y, "bbox": bbox})
+
+    def _build_val_samples(self, rp: Path, ids: list[str] | None):
+        val_root = (rp / 'val') if (rp / 'val').exists() else rp
+        ann_root = (Path(self.ann_root) / 'val') if self.ann_root else None
+
+        # determine candidate image files
+        img_files = sorted([p for p in val_root.iterdir() if p.is_file() and is_image_path(p)])
+        for p in img_files:
+            img_id = p.stem
+            if ids is not None and img_id not in ids and p.name not in ids:
+                continue
+            syn = None
+            bbox = None
+            if ann_root is not None:
+                xml_path = ann_root / f"{img_id}.xml"
+                syn, bbox = self._xml_to_label_bbox(xml_path)
+            if syn is None and self._val_csv_map is not None:
+                syn = self._val_csv_map.get(img_id)
+            y = self.synset_to_idx.get(syn, None) if syn else None
+            self.samples.append({"path": str(p), "y": y, "bbox": bbox})
+
+    def _build_test_samples(self, rp: Path, ids: list[str] | None):
+        test_root = (rp / 'test') if (rp / 'test').exists() else rp
+        img_files = sorted([p for p in test_root.iterdir() if p.is_file() and is_image_path(p)])
+        for p in img_files:
+            img_id = p.stem
+            if ids is not None and img_id not in ids and p.name not in ids:
+                continue
+            self.samples.append({"path": str(p), "y": None, "bbox": None})
+
+
+def _print_dataset_classes_once(ds, *, title: str, max_show: int = 20):
+    """Pretty-print dataset class information."""
+    if not hasattr(ds, "classes") or not ds.classes:
+        return
+    classes = list(ds.classes)
+    names = list(getattr(ds, "class_names", []))
+    print("=" * 88)
+    print(f"[DATA] {title}")
+    print(f"[DATA] num_classes={len(classes)}")
+    show = min(max_show, len(classes))
+    for i in range(show):
+        syn = classes[i]
+        nm = names[i] if (i < len(names) and names[i]) else ""
+        extra = f" — {nm}" if nm and nm != syn else ""
+        print(f"  {i:4d}: {syn}{extra}")
+    if len(classes) > show:
+        print(f"  ... ({len(classes)-show} more)")
+    print("=" * 88)
+
+    def _parse_val_solution_csv(self, csv_path: str) -> Dict[str, str]:
+        import csv
+        mp = {}
+        with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            # expected columns: ImageId, PredictionString
+            for row in reader:
+                img_id = row.get('ImageId') or row.get('image_id') or row.get('ImageID')
+                ps = row.get('PredictionString') or row.get('predictionstring')
+                if not img_id or not ps:
+                    continue
+                # PredictionString starts with synset then bbox coords (possibly multiple boxes)
+                parts = ps.strip().split()
+                if len(parts) >= 1:
+                    mp[img_id] = parts[0]
+        return mp
+
+    def _xml_to_label_bbox(self, xml_path: Path) -> tuple[str | None, list[int] | None]:
+        import xml.etree.ElementTree as ET
+        if not xml_path.exists():
+            return None, None
+        try:
+            tree = ET.parse(str(xml_path))
+            root = tree.getroot()
+            obj = root.find('object')
+            if obj is None:
+                return None, None
+            name = obj.findtext('name')
+            bbox_el = obj.find('bndbox')
+            bbox = None
+            if bbox_el is not None:
+                def _get(tag):
+                    v = bbox_el.findtext(tag)
+                    return int(float(v)) if v is not None else None
+                xmin, ymin, xmax, ymax = _get('xmin'), _get('ymin'), _get('xmax'), _get('ymax')
+                if None not in (xmin, ymin, xmax, ymax):
+                    bbox = [xmin, ymin, xmax, ymax]
+            return name, bbox
+        except Exception:
+            return None, None
+
+    # -------------------- sample builders --------------------
+    def _build_train_samples(self, rp: Path, ids: list[str] | None):
+        # images are in train/<synset>/*
+        train_root = rp / 'train' if (rp / 'train').exists() else rp
+        ann_root = Path(self.ann_root) / 'train' if self.ann_root else None
+
+        for syn_dir in sorted([d for d in train_root.iterdir() if d.is_dir() and d.name.startswith('n')]):
+            syn = syn_dir.name
+            if syn not in self.synset_to_idx:
+                continue
+            y = self.synset_to_idx[syn]
+            # list images
+            paths = [p for p in syn_dir.rglob('*') if p.is_file() and is_image_path(p)]
+            for p in sorted(paths):
+                rel_id = f"{syn}/{p.stem}"  # used in imagesets
+                if ids is not None and rel_id not in ids and p.stem not in ids:
+                    continue
+                bbox = None
+                if self.return_bbox and ann_root is not None:
+                    xmlp = ann_root / syn / f"{p.stem}.xml"
+                    _, bbox = self._xml_to_label_bbox(xmlp)
+                self.samples.append({'path': str(p), 'y': int(y), 'bbox': bbox})
+
+    def _build_val_samples(self, rp: Path, ids: list[str] | None):
+        val_root = rp / 'val' if (rp / 'val').exists() else rp
+        ann_root = Path(self.ann_root) / 'val' if self.ann_root else None
+
+        # list images
+        paths = [p for p in val_root.glob('*') if p.is_file() and is_image_path(p)]
+        paths = sorted(paths)
+        for p in paths:
+            img_id = p.stem
+            if ids is not None and img_id not in ids:
+                continue
+
+            syn = None
+            bbox = None
+            if ann_root is not None:
+                xmlp = ann_root / f"{img_id}.xml"
+                syn, bbox = self._xml_to_label_bbox(xmlp)
+            if syn is None and self._val_csv_map is not None:
+                syn = self._val_csv_map.get(img_id)
+
+            if syn is None:
+                # no label -> skip (test-like)
+                continue
+            if syn not in self.synset_to_idx:
+                # unknown synset -> skip
+                continue
+            y = self.synset_to_idx[syn]
+            self.samples.append({'path': str(p), 'y': int(y), 'bbox': bbox if self.return_bbox else None})
+
+    def _build_test_samples(self, rp: Path, ids: list[str] | None):
+        test_root = rp / 'test' if (rp / 'test').exists() else rp
+        paths = [p for p in test_root.glob('*') if p.is_file() and is_image_path(p)]
+        paths = sorted(paths)
+        for p in paths:
+            img_id = p.stem
+            if ids is not None and img_id not in ids:
+                continue
+            self.samples.append({'path': str(p), 'y': 0, 'bbox': None})
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        img = Image.open(s['path']).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        if not self.return_bbox:
+            return img, int(s['y'])
+        # multitask-like dict
+        return img, {'default': int(s['y']), 'bbox': s.get('bbox')}
+# -----------------------------
 # ImageFolder structure detection
 # -----------------------------
 def _has_class_subfolders(root: str) -> bool:
@@ -259,9 +608,11 @@ def build_dataloader(opt):
     # ------------------------------------------------------------------
     # 2) Transforms (comme avant)
     # ------------------------------------------------------------------
+    crop = int(getattr(opt, "crop_size", 256))
+    resize = int(round(crop * 286 / 256))
     tf = transforms.Compose([
-        transforms.Resize(286, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.RandomCrop(256),
+        transforms.Resize(resize, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomCrop(crop),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize([0.5] * 3, [0.5] * 3),
@@ -270,6 +621,9 @@ def build_dataloader(opt):
     data_json    = getattr(opt, "data_json", None)
     classes_json = getattr(opt, "classes_json", None)
     data_root    = getattr(opt, "data", None)
+    imagenet_ann = getattr(opt, "imagenet_ann", None)
+    imagenet_label_base = int(getattr(opt, "imagenet_label_base", 1))
+    imagenet_num_classes = int(getattr(opt, "imagenet_num_classes", 1000))
 
     # ------------------------------------------------------------------
     # 3) Construction dataset
@@ -300,10 +654,48 @@ def build_dataloader(opt):
                 "et le mode n'est pas 'detect_*'. Impossible de construire le dataset."
             )
 
-        # ✅ Fix principal : si pas de folders classes → dataset unlabeled
-        if _has_class_subfolders(data_root):
+        # ✅ ImageNet (ILSVRC 2012 CLS-LOC) supervised finetuning support
+        # If root has class subfolders -> ImageNet train layout.
+        # If root is flat -> ImageNet val/test layout (needs XML annotations for labels).
+        imagenet_split = str(getattr(opt, "imagenet_split", "auto")).lower()
+        imagenet_ann_dir = getattr(opt, "imagenet_ann_dir", None)
+        imagenet_imagesets_dir = getattr(opt, "imagenet_imagesets_dir", None)
+        imagenet_synset_mapping = getattr(opt, "imagenet_synset_mapping", None)
+        imagenet_val_solution_csv = getattr(opt, "imagenet_val_solution_csv", None)
+        imagenet_label_base = int(getattr(opt, "imagenet_label_base", 1))
+        imagenet_num_classes = int(getattr(opt, "imagenet_num_classes", 1000))
+        imagenet_return_bbox = bool(getattr(opt, "imagenet_return_bbox", False))
+
+        has_sub = _has_class_subfolders(data_root)
+        if imagenet_split == "auto":
+            if has_sub:
+                imagenet_split = "train"
+            else:
+                # try guess from folder name
+                bn = Path(data_root).name.lower()
+                imagenet_split = "test" if "test" in bn else "val"
+
+        use_imagenet = (imagenet_ann_dir is not None) or (imagenet_imagesets_dir is not None) or (imagenet_synset_mapping is not None) or (imagenet_val_solution_csv is not None)
+
+        if imagenet_split == "train" and has_sub and not use_imagenet:
+            # simplest: ImageFolder
             full_ds = datasets.ImageFolder(root=data_root, transform=tf)
+        elif imagenet_split in ("train","val","test"):
+            # robust ILSVRC loader (train folder or flat val/test)
+            full_ds = ImageNetCLSLDataset(
+                images_root=data_root,
+                split=imagenet_split,
+                ann_root=imagenet_ann_dir,
+                imagesets_root=imagenet_imagesets_dir,
+                synset_mapping_file=imagenet_synset_mapping,
+                val_solution_csv=imagenet_val_solution_csv,
+                transform=tf,
+                label_base=imagenet_label_base,
+                num_classes=imagenet_num_classes,
+                return_bbox=imagenet_return_bbox,
+            )
         else:
+            full_ds = UnlabeledImageDataset(root=data_root, transform=tf, recursive=True)
             # Auto-supervisé / style: on accepte un dossier flat
             # (et même en hybrid/sup_freeze on avertit)
             if mode in ("hybrid", "sup_freeze"):
@@ -312,6 +704,18 @@ def build_dataloader(opt):
                     "La phase C risque de ne pas fonctionner. Utilise --data_json/--classes_json ou un ImageFolder."
                 )
             full_ds = UnlabeledImageDataset(root=data_root, transform=tf, recursive=True)
+
+    # ------------------------------------------------------------------
+    # 3b) Print class info once (useful for supervised finetuning)
+    # ------------------------------------------------------------------
+    try:
+        # Only print when supervision is used (sup_freeze / hybrid) or when ImageNet loader is active
+        if mode in ("sup_freeze", "hybrid") or isinstance(full_ds, ImageNetCLSLDataset):
+            if not hasattr(opt, "_printed_classes"):
+                setattr(opt, "_printed_classes", True)
+                _print_dataset_classes_once(full_ds, title=f"dataset={type(full_ds).__name__} | mode={mode}")
+    except Exception:
+        pass
 
     # ------------------------------------------------------------------
     # 4) k-fold split
@@ -363,6 +767,10 @@ def infer_tasks_from_dataset(loader, opt):
     # ImageFolder -> .classes: list
     if hasattr(ds, "classes") and isinstance(ds.classes, (list, tuple)) and len(ds.classes) > 0:
         return {"default": len(ds.classes)}
+
+    # ImageNetCLSLDataset (ILSVRC)
+    if isinstance(ds, ImageNetCLSLDataset):
+        return {"default": int(getattr(opt, "imagenet_num_classes", 1000))}
 
     # UnlabeledImageDataset / UnsupervisedJsonDataset -> fallback
     return {"default": int(getattr(opt, "sup_num_classes", 2))}
@@ -786,3 +1194,108 @@ def build_detection_dataloader(opt):
         print(f"[DET][DATA] fixed det_size = {det_h}x{det_w}")
 
     return train_loader, val_loader, num_classes
+
+
+# ======================================================================
+# ImageNetCLSLDataset fallback method definitions (robust packaging)
+# Some environments may load an older data.py variant where these methods
+# are not bound to the class due to packaging/indentation issues.
+# This guard ensures the class always has the required builders.
+# ======================================================================
+try:
+    ImageNetCLSLDataset
+except NameError:
+    ImageNetCLSLDataset = None
+
+if ImageNetCLSLDataset is not None:
+    from pathlib import Path as _PPath
+    import os as _os
+    import xml.etree.ElementTree as _ET
+
+    def _in_val_ids(_ids, img_id):
+        return True if _ids is None else (img_id in _ids or f"val/{img_id}" in _ids)
+
+    def _parse_xml_label_bbox(self, xml_path: _PPath):
+        try:
+            root = _ET.parse(str(xml_path)).getroot()
+        except Exception:
+            return None, None
+        # label via <object><name>
+        syn = None
+        bbox = None
+        obj = root.find("object")
+        if obj is not None:
+            name = obj.findtext("name")
+            if name:
+                syn = name.strip()
+            b = obj.find("bndbox")
+            if b is not None:
+                try:
+                    xmin = int(float(b.findtext("xmin")))
+                    ymin = int(float(b.findtext("ymin")))
+                    xmax = int(float(b.findtext("xmax")))
+                    ymax = int(float(b.findtext("ymax")))
+                    bbox = (xmin, ymin, xmax, ymax)
+                except Exception:
+                    bbox = None
+        return syn, bbox
+
+    def _fallback_build_train_samples(self, rp: _PPath, ids):
+        train_root = rp / "train" if (rp / "train").exists() else rp
+        ann_root = _PPath(self.ann_root) / "train" if self.ann_root else None
+        samples = []
+        for syn in sorted([d.name for d in train_root.iterdir() if d.is_dir()]):
+            if syn not in self.synset_to_idx:
+                continue
+            y = int(self.synset_to_idx[syn])
+            for imgp in sorted((train_root / syn).glob("*.JPEG")):
+                img_id = imgp.stem
+                if ids is not None and not (img_id in ids or f"{syn}/{img_id}" in ids):
+                    continue
+                bbox = None
+                if ann_root is not None:
+                    xmlp = ann_root / syn / f"{img_id}.xml"
+                    if xmlp.exists():
+                        _, bbox = _parse_xml_label_bbox(self, xmlp)
+                samples.append({"path": str(imgp), "y": y, "bbox": bbox})
+        self.samples = samples
+
+    def _fallback_build_val_samples(self, rp: _PPath, ids):
+        val_root = rp / "val" if (rp / "val").exists() else rp
+        ann_root = _PPath(self.ann_root) / "val" if self.ann_root else None
+        samples=[]
+        for imgp in sorted(val_root.glob("*.JPEG")):
+            img_id = imgp.stem
+            if ids is not None and not _in_val_ids(ids, img_id):
+                continue
+            syn=None; bbox=None
+            if ann_root is not None:
+                xmlp = ann_root / f"{img_id}.xml"
+                if xmlp.exists():
+                    syn, bbox = _parse_xml_label_bbox(self, xmlp)
+            if syn is None and getattr(self, "_val_csv_map", None) is not None:
+                syn = self._val_csv_map.get(img_id)
+            if syn is None:
+                continue
+            if syn not in self.synset_to_idx:
+                continue
+            y=int(self.synset_to_idx[syn])
+            samples.append({"path": str(imgp), "y": y, "bbox": bbox})
+        self.samples=samples
+
+    def _fallback_build_test_samples(self, rp: _PPath, ids):
+        test_root = rp / "test" if (rp / "test").exists() else rp
+        samples=[]
+        for imgp in sorted(test_root.glob("*.JPEG")):
+            img_id=imgp.stem
+            if ids is not None and not (img_id in ids or f"test/{img_id}" in ids):
+                continue
+            samples.append({"path": str(imgp), "y": -1, "bbox": None})
+        self.samples=samples
+
+    if not hasattr(ImageNetCLSLDataset, "_build_train_samples"):
+        ImageNetCLSLDataset._build_train_samples = _fallback_build_train_samples
+    if not hasattr(ImageNetCLSLDataset, "_build_val_samples"):
+        ImageNetCLSLDataset._build_val_samples = _fallback_build_val_samples
+    if not hasattr(ImageNetCLSLDataset, "_build_test_samples"):
+        ImageNetCLSLDataset._build_test_samples = _fallback_build_test_samples

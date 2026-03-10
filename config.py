@@ -46,6 +46,29 @@ def get_opts():
     # 1) Données, IO & run
     # =========================================================================
     p.add_argument("--data", type=str, default=None, help="Dossier images (ImageFolder) pour auto/hybrid/cls_tokens.")
+
+    # ImageNet (ILSVRC 2012 CLS-LOC) support for supervised finetuning (sup_freeze / hybrid)
+    # - Keep using --data for images root.
+    #   * train layout: --data .../ILSVRC/Data/CLS-LOC/train  (subfolders = synsets)
+    #   * val layout  : --data .../ILSVRC/Data/CLS-LOC/val    (flat images)
+    # - Provide annotation roots for val (XML) and optional metadata.
+    p.add_argument("--imagenet_split", type=str, default="auto",
+                   choices=["auto","train","val","test"],
+                   help="Which ImageNet split is under --data. auto detects train if class subfolders exist, else val/test.")
+    p.add_argument("--imagenet_ann_dir", type=str, default=None,
+                   help="Path to ILSVRC/Annotations/CLS-LOC (contains train/ and val/). Needed for val classification via XML.")
+    p.add_argument("--imagenet_imagesets_dir", type=str, default=None,
+                   help="Path to ILSVRC/ImageSets/CLS-LOC (contains train.txt/val.txt/test.txt). Optional but recommended for val.")
+    p.add_argument("--imagenet_synset_mapping", type=str, default=None,
+                   help="Path to LOC_synset_mapping.txt (synset -> human name). Used to build a stable synset->idx mapping.")
+    p.add_argument("--imagenet_val_solution_csv", type=str, default=None,
+                   help="Optional LOC_val_solution.csv as fallback to infer class if XML missing. (Kaggle OLOC format).")
+    p.add_argument("--imagenet_label_base", type=int, default=1,
+                   help="If labels in csv/txt are integers, interpret them as 1-based (default=1) or 0-based (set 0).")
+    p.add_argument("--imagenet_num_classes", type=int, default=1000,
+                   help="Number of ImageNet classes (default 1000).")
+    p.add_argument("--imagenet_return_bbox", action="store_true",
+                   help="If set and XML available, return bbox info in labels dict (does not affect SupHeads training).")
     p.add_argument("--data_json", type=str, default=None, help="Liste d'images au format JSON (optionnel).")
     p.add_argument("--classes_json", type=str, default=None, help="JSON décrivant les classes (optionnel).")
     p.add_argument("--search_folder", type=str, default=None, help="Racine où chercher les images (si data_json).")
@@ -210,8 +233,6 @@ def get_opts():
     p.add_argument("--spade_gate_margin", type=float, default=0.75, help="Marge régul SPADE.")
 
     p.add_argument("--token_ablate_eval_every", type=int, default=400, help="Steps entre évaluations ablation.")
-    p.add_argument("--token_dim", type=int, default=256, help="Dim token/proj pour style")
-
 
     # =========================================================================
     # 9) JEPA

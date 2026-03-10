@@ -31,6 +31,7 @@ from pathlib import Path as PPath           # ← alias sûr
 from typing import Optional, Any, Sequence, Tuple, Dict, List
 from torchvision import transforms, datasets
 from data import MultiTaskDataset
+from data import ImageNetCLSLDataset
 
 from torch.utils.data import DataLoader, Subset
 
@@ -148,18 +149,55 @@ def build_test_dataloader(opt, cfg) -> Tuple[DataLoader, torch.utils.data.Datase
         dataset_type = "json"
 
     elif getattr(opt, "data", None):
-        # Dossier: sous-dossiers = classes → ImageFolder
-        ds = datasets.ImageFolder(root=opt.data, transform=tf)
-        dataset_type = "folder"
+        # Dossier: soit ImageNet CLS-LOC (train/val/test), soit sous-dossiers=classes → ImageFolder
 
-        # Harmonisation d'API : exposer .task_classes comme MultiTaskDataset
-        #   • une seule tâche "__DEFAULT__" dont les classes = sous-dossiers
-        if not hasattr(ds, "task_classes"):
-            try:
+        use_imagenet = False
+        for k in ("imagenet_split", "imagenet_ann_dir", "imagenet_imagesets_dir",
+                  "imagenet_synset_mapping", "imagenet_val_solution_csv"):
+            if getattr(opt, k, None):
+                use_imagenet = True
+                break
+
+        if use_imagenet:
+            split = str(getattr(opt, "imagenet_split", "auto"))
+            ann_dir = getattr(opt, "imagenet_ann_dir", None)
+            imagesets_dir = getattr(opt, "imagenet_imagesets_dir", None)
+            syn_map = getattr(opt, "imagenet_synset_mapping", None)
+            val_csv = getattr(opt, "imagenet_val_solution_csv", None)
+            label_base = int(getattr(opt, "imagenet_label_base", 1))
+            num_classes = int(getattr(opt, "imagenet_num_classes", 1000))
+            return_bbox = bool(int(getattr(opt, "imagenet_return_bbox", 0)))
+
+            ds = ImageNetCLSLDataset(
+                images_root=opt.data,
+                split=split,
+                ann_root=ann_dir,
+                imagesets_root=imagesets_dir,
+                synset_mapping_file=syn_map,
+                val_solution_csv=val_csv,
+                label_base=label_base,
+                num_classes=num_classes,
+                return_bbox=return_bbox,
+                transform=tf,
+            )
+            dataset_type = "imagenet"
+
+            # Harmoniser API multitâche : une seule tâche "__DEFAULT__"
+            if not hasattr(ds, "task_classes"):
                 classes = list(getattr(ds, "classes", []))
-            except Exception:
-                classes = []
-            setattr(ds, "task_classes", {"__DEFAULT__": classes})
+                setattr(ds, "task_classes", {"__DEFAULT__": classes})
+
+        else:
+            ds = datasets.ImageFolder(root=opt.data, transform=tf)
+            dataset_type = "folder"
+
+            # Harmonisation d'API : exposer .task_classes comme MultiTaskDataset
+            if not hasattr(ds, "task_classes"):
+                try:
+                    classes = list(getattr(ds, "classes", []))
+                except Exception:
+                    classes = []
+                setattr(ds, "task_classes", {"__DEFAULT__": classes})
 
     else:
         # ---------- fallback : via le fichier de config ----------
@@ -3556,6 +3594,11 @@ def _infer_gen_kwargs(weights_dir: PPath, cfg: dict) -> _Dict[str, _Any]:
 
 def _read_state_any(path: PPath, dev: torch.device) -> _Dict[str, torch.Tensor]:
     path = PPath(path)
+    # Robustness: if checkpoint was saved on CUDA but current machine has no CUDA,
+    # always map storages to CPU to avoid:
+    #   RuntimeError: Attempting to deserialize object on a CUDA device but torch.cuda.is_available() is False
+    if isinstance(dev, torch.device) and dev.type == "cuda" and (not torch.cuda.is_available()):
+        dev = torch.device("cpu")
     if path.suffix.lower() == ".safetensors":
         from safetensors.torch import load_file
         return load_file(str(path), device=str(dev))
@@ -3620,6 +3663,13 @@ def load_models(
     from models.sup_heads import SupHeads
 
     weights_dir = PPath(weights_dir)
+    # CPU-only safety: never move modules to CUDA when CUDA is unavailable
+    if device is None:
+        device = torch.device("cpu")
+    dev_str = str(device)
+    if dev_str.startswith("cuda") and (not torch.cuda.is_available()):
+        print(f"[WARN] test device={device} requested but CUDA is unavailable. Using CPU.")
+        device = torch.device("cpu")
 
     # choose generator ckpt
     if ckpt_gen is None:
@@ -3758,39 +3808,9 @@ def load_models(
                 out[task] = int(v.shape[0])
         return out or None
 
-    def _infer_in_dim_from_sup_state(sd: dict) -> int | None:
-        """Infer SupHeads input dim from state_dict.
-
-        We expect a LayerNorm at classifiers.<task>.0 with weight shape (in_dim,).
-        """
-        if not isinstance(sd, dict):
-            return None
-        for k, v in sd.items():
-            if not isinstance(k, str) or not k.startswith("classifiers."):
-                continue
-            if k.endswith(".0.weight") and hasattr(v, "shape") and len(getattr(v, "shape", ())) == 1:
-                return int(v.shape[0])
-        return None
-
     # load SupHeads if requested
     Sup = None
     if sup_ckpt or sup_sd_from_gen:
-        # Pre-load SupHeads state dict once (helps infer tasks and in_dim robustly)
-        sup_sd_pre: dict | None = None
-        if sup_ckpt:
-            sup_p0 = PPath(sup_ckpt)
-            if sup_p0.is_dir():
-                sup_p0 = find_latest_ckpt(sup_p0)
-            sup_sd_pre = _read_state_any(sup_p0, device)
-            if isinstance(sup_sd_pre, dict) and "sup_heads" in sup_sd_pre and isinstance(sup_sd_pre["sup_heads"], dict):
-                sup_sd_pre = sup_sd_pre["sup_heads"]
-            if isinstance(sup_sd_pre, dict) and "state_dict" in sup_sd_pre and isinstance(sup_sd_pre["state_dict"], dict):
-                sup_sd_pre = sup_sd_pre["state_dict"]
-            if isinstance(sup_sd_pre, dict) and any(k.startswith("sup_heads.") for k in sup_sd_pre.keys()):
-                sup_sd_pre = {k.replace("sup_heads.", "", 1): v for k, v in sup_sd_pre.items()}
-        else:
-            sup_sd_pre = sup_sd_from_gen
-
         # infer tasks from (1) cfg (2) classes_json (3) sup checkpoint/state_dict
         tasks_dict: dict[str, int] | None = None
         if isinstance(cfg, dict):
@@ -3800,10 +3820,7 @@ def load_models(
         if tasks_dict is None and task_classes is not None:
             tasks_dict = _tasks_from_task_classes(task_classes)
 
-        # infer in_dim (priority: from SupHeads weights themselves)
-        if sup_in_dim is None and sup_sd_pre is not None:
-            sup_in_dim = _infer_in_dim_from_sup_state(sup_sd_pre)
-
+        # infer in_dim
         if sup_in_dim is None:
             # try feat_type from cfg/hparams
             hp = _load_train_cfg_hparams(weights_dir)
@@ -3814,12 +3831,25 @@ def load_models(
                 except Exception:
                     sup_in_dim = None
         if sup_in_dim is None:
-            # fallback: token_dim
+            # safe fallback
             sup_in_dim = int(gen_kwargs.get("token_dim", 256))
 
-        # If still unknown, infer tasks from SupHeads weights before instantiation
+        # If still unknown, infer tasks from sup weights before instantiation
         if tasks_dict is None:
-            tasks_dict = _tasks_from_sup_state(sup_sd_pre) if sup_sd_pre is not None else None
+            if sup_ckpt:
+                sup_p0 = PPath(sup_ckpt)
+                if sup_p0.is_dir():
+                    sup_p0 = find_latest_ckpt(sup_p0)
+                sd0 = _read_state_any(sup_p0, device)
+                if isinstance(sd0, dict) and "sup_heads" in sd0 and isinstance(sd0["sup_heads"], dict):
+                    sd0 = sd0["sup_heads"]
+                if isinstance(sd0, dict) and "state_dict" in sd0 and isinstance(sd0["state_dict"], dict):
+                    sd0 = sd0["state_dict"]
+                if isinstance(sd0, dict) and any(k.startswith("sup_heads.") for k in sd0.keys()):
+                    sd0 = {k.replace("sup_heads.", "", 1): v for k, v in sd0.items()}
+                tasks_dict = _tasks_from_sup_state(sd0)
+            else:
+                tasks_dict = _tasks_from_sup_state(sup_sd_from_gen)
 
         if tasks_dict is None:
             raise RuntimeError(

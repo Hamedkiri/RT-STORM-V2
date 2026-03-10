@@ -72,6 +72,24 @@ def main() -> None:
     ap.add_argument("--find_images_by_sub_folder", action="store_true")
     ap.add_argument("--data", help="Dossier racine au format ImageFolder (sous-dossiers = classes)")
 
+    # ImageNet ILSVRC CLS-LOC (optionnel) -------------------------------
+    ap.add_argument("--imagenet_split", default=None,
+                    help="ImageNet CLS-LOC split: auto|train|val|test. Si défini, --data peut pointer vers train/ ou val/.")
+    ap.add_argument("--imagenet_ann_dir", default=None,
+                    help="Chemin vers ILSVRC/Annotations/CLS-LOC (pour split=val/test).")
+    ap.add_argument("--imagenet_imagesets_dir", default=None,
+                    help="Chemin vers ILSVRC/ImageSets/CLS-LOC (pour lister val/train/test).")
+    ap.add_argument("--imagenet_synset_mapping", default=None,
+                    help="Chemin vers LOC_synset_mapping.txt.")
+    ap.add_argument("--imagenet_val_solution_csv", default=None,
+                    help="Chemin vers LOC_val_solution.csv (fallback si XML indisponibles).")
+    ap.add_argument("--imagenet_label_base", type=int, default=1,
+                    help="Base des labels val_solution (souvent 1).")
+    ap.add_argument("--imagenet_num_classes", type=int, default=1000,
+                    help="Nombre de classes ImageNet.")
+    ap.add_argument("--imagenet_return_bbox", type=int, default=0,
+                    help="1=renvoyer aussi bbox (pas nécessaire pour sup_predict/top1).")
+
     # modes principaux ------------------------------------------------------
     ap.add_argument(
         "--mode",
@@ -412,8 +430,13 @@ def main() -> None:
     )
 
     args = ap.parse_args()
-
-    device = torch.device(args.device)
+    # Robust device selection (CPU-only PyTorch builds cannot move tensors to CUDA)
+    device_str = str(args.device).lower().strip()
+    if device_str.startswith("cuda") and (not torch.cuda.is_available()):
+        print(f"[WARN] --device={args.device} requested but CUDA is unavailable. Falling back to CPU.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(device_str)
     cfg = json.load(open(args.cfg))
     wdir = Path(args.weights_dir)
 
@@ -1777,6 +1800,50 @@ def main() -> None:
     if args.per_task:
         if Sup is None:
             raise RuntimeError("--per_task requiert SupHeads (sup_ckpt).")
+
+        def _eval_top1_percent(_composite, _loader):
+            """Compute Top-1 accuracy (%) per task using SupHeads logits."""
+            if _composite.Sup is None:
+                return {}
+            top1 = {t: [0, 0] for t in _composite.tasks}  # correct, total
+            _composite.eval()
+            for batch in _loader:
+                if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                    imgs, yb = batch[0], batch[1]
+                else:
+                    continue
+                imgs = imgs.to(device, non_blocking=True)
+                feats = _composite._sup_features_from_G(imgs, feat_type=_composite.feat_type, delta_weights=_composite.delta_weights)
+                logits_d = _composite.Sup(feats)
+                # yb can be dict(task->tensor/list) or tensor/int
+                if isinstance(yb, dict):
+                    for t in _composite.tasks:
+                        if t not in logits_d:
+                            continue
+                        yt = yb.get(t, None)
+                        if yt is None:
+                            continue
+                        yt = torch.as_tensor(yt, device=device)
+                        m = yt >= 0
+                        if m.any():
+                            pred = logits_d[t].argmax(1)
+                            top1[t][0] += int((pred[m] == yt[m]).sum().item())
+                            top1[t][1] += int(m.sum().item())
+                else:
+                    # single-task default
+                    yt = torch.as_tensor(yb, device=device)
+                    m = yt >= 0
+                    if m.any() and ("__DEFAULT__" in logits_d or "default" in logits_d):
+                        key = "__DEFAULT__" if "__DEFAULT__" in logits_d else "default"
+                        pred = logits_d[key].argmax(1)
+                        top1[key][0] += int((pred[m] == yt[m]).sum().item())
+                        top1[key][1] += int(m.sum().item())
+            out = {}
+            for t, (c, n) in top1.items():
+                if n > 0:
+                    out[f"top1_{t}"] = 100.0 * (c / n)
+            return out
+
         embs_d, lbls_d, paths_d = compute_embeddings_with_paths(
             composite, loader, device, per_task=True
         )
@@ -1839,6 +1906,15 @@ def main() -> None:
             else:
                 scores = None
 
+            # Add Top-1 (%) if SupHeads is used
+            try:
+                top1_scores = _eval_top1_percent(composite, loader)
+                if top1_scores:
+                    scores = dict(scores or {})
+                    scores.update(top1_scores)
+            except Exception as _e:
+                pass
+
             plot_tsne_interactive(
                 embs_d,
                 lbls_d,
@@ -1871,6 +1947,15 @@ def main() -> None:
             pca_dim=args.pca_dim,
             l2_norm=args.l2_norm,
         )
+
+        # Add Top-1 (%) if SupHeads is used
+        try:
+            top1_scores = _eval_top1_percent(composite, loader)
+            if top1_scores:
+                scores = dict(scores or {})
+                scores.update(top1_scores)
+        except Exception:
+            pass
 
         embs_plot, lbls_plot, paths_plot, cls_plot = {}, {}, {}, {}
         start = 0
