@@ -285,6 +285,17 @@ def main() -> None:
         default=None,
         help="Dossier de sortie (par défaut: weights_dir/sup_predict)",
     )
+    ap.add_argument(
+        "--dump_param_count_json",
+        action="store_true",
+        help="Si activé, écrit un JSON avec le nombre de paramètres par partie (style / contenu sémantique) et les totaux.",
+    )
+    ap.add_argument(
+        "--param_count_json_name",
+        type=str,
+        default="model_parameter_counts.json",
+        help="Nom du fichier JSON de comptage des paramètres.",
+    )
 
     # --- Options style transfer ------------------------------------------
     ap.add_argument(
@@ -522,6 +533,7 @@ def main() -> None:
             )
             print(json.dumps(stats, indent=2))
 
+        _maybe_write_param_count_report(out_dir)
         return
 
     # ---------------------- MODE STYLE / CLS TOKENS -----------------------
@@ -1143,6 +1155,134 @@ def main() -> None:
     elif args.mode == "sup_predict":
         raise RuntimeError("Le mode 'sup_predict' requiert un SupHeads (--sup_ckpt).")
 
+    def _iter_unique_named_parameters(module: nn.Module | None):
+        if module is None or not isinstance(module, nn.Module):
+            return
+        seen = set()
+        for name, p in module.named_parameters(recurse=True):
+            if p is None:
+                continue
+            pid = id(p)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            yield name, p
+
+    def _param_stats_from_module(module: nn.Module | None):
+        stats = {
+            "trainable": 0,
+            "non_trainable": 0,
+            "total": 0,
+            "num_tensors": 0,
+            "num_trainable_tensors": 0,
+            "num_non_trainable_tensors": 0,
+        }
+        if module is None or not isinstance(module, nn.Module):
+            return stats
+        for _, p in _iter_unique_named_parameters(module):
+            n = int(p.numel())
+            stats["num_tensors"] += 1
+            stats["total"] += n
+            if bool(p.requires_grad):
+                stats["trainable"] += n
+                stats["num_trainable_tensors"] += 1
+            else:
+                stats["non_trainable"] += n
+                stats["num_non_trainable_tensors"] += 1
+        return stats
+
+    def _param_stats_from_modules(modules):
+        stats = {
+            "trainable": 0,
+            "non_trainable": 0,
+            "total": 0,
+            "num_tensors": 0,
+            "num_trainable_tensors": 0,
+            "num_non_trainable_tensors": 0,
+        }
+        seen = set()
+        for module in modules:
+            if module is None or not isinstance(module, nn.Module):
+                continue
+            for _, p in module.named_parameters(recurse=True):
+                if p is None:
+                    continue
+                pid = id(p)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                n = int(p.numel())
+                stats["num_tensors"] += 1
+                stats["total"] += n
+                if bool(p.requires_grad):
+                    stats["trainable"] += n
+                    stats["num_trainable_tensors"] += 1
+                else:
+                    stats["non_trainable"] += n
+                    stats["num_non_trainable_tensors"] += 1
+        return stats
+
+    def _build_param_count_report():
+        style_modules = []
+        semantic_modules = []
+        uncategorized_modules = []
+
+        if G is not None:
+            style_modules.append(("generator", G))
+            if G_A is not None and G_A is not G:
+                style_modules.append(("generator_A", G_A))
+            if G_B is not None and G_B is not G and G_B is not G_A:
+                style_modules.append(("generator_B", G_B))
+        if Sup is not None:
+            semantic_modules.append(("sup_heads", Sup))
+        if sem_backbone is not None:
+            semantic_modules.append(("semantic_backbone", sem_backbone))
+
+        style_stats = _param_stats_from_modules([m for _, m in style_modules])
+        semantic_stats = _param_stats_from_modules([m for _, m in semantic_modules])
+        uncategorized_stats = _param_stats_from_modules([m for _, m in uncategorized_modules])
+        total_stats = _param_stats_from_modules([m for _, m in (style_modules + semantic_modules + uncategorized_modules)])
+
+        report = {
+            "summary": {
+                "style_part": style_stats,
+                "semantic_content_part": semantic_stats,
+                "uncategorized_part": uncategorized_stats,
+                "total": total_stats,
+            },
+            "components": {
+                "style_part": {name: _param_stats_from_module(mod) for name, mod in style_modules},
+                "semantic_content_part": {name: _param_stats_from_module(mod) for name, mod in semantic_modules},
+                "uncategorized_part": {name: _param_stats_from_module(mod) for name, mod in uncategorized_modules},
+            },
+            "metadata": {
+                "mode": str(args.mode),
+                "feature_mode": str(args.feature_mode),
+                "sup_feat_source": str(args.sup_feat_source),
+                "style_components_loaded": [name for name, _ in style_modules],
+                "semantic_components_loaded": [name for name, _ in semantic_modules],
+                "uncategorized_components_loaded": [name for name, _ in uncategorized_modules],
+                "notes": {
+                    "style_part": "Modules de génération / transfert de style chargés pendant le test.",
+                    "semantic_content_part": "Backbone sémantique et/ou têtes supervisées chargés pendant le test.",
+                    "non_trainable": "Paramètres ayant requires_grad=False.",
+                },
+            },
+        }
+        return report
+
+    def _maybe_write_param_count_report(out_dir_hint: Path | None = None):
+        if not bool(getattr(args, "dump_param_count_json", False)):
+            return None
+        report = _build_param_count_report()
+        base_dir = Path(out_dir_hint) if out_dir_hint is not None else Path(args.out_dir or args.weights_dir)
+        base_dir.mkdir(parents=True, exist_ok=True)
+        out_path = base_dir / str(args.param_count_json_name)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        print(f"✓ comptage des paramètres sauvegardé → {out_path}")
+        return out_path
+
     # ========================= MODE: sup_predict ==========================
     if args.mode == "sup_predict":
         if Sup is None:
@@ -1400,58 +1540,125 @@ def main() -> None:
             times.append(time.time() - t0)
             idx_global += B
 
+        def _sample_path_at_index(ds_obj, ds_idx: int):
+            try:
+                sample = ds_obj.samples[ds_idx]
+            except Exception:
+                return None
+            if isinstance(sample, dict):
+                return sample.get("path", None)
+            if isinstance(sample, (list, tuple)) and len(sample) >= 1:
+                return sample[0]
+            return None
+
+        def _write_submission_csv(task_name: str, y_pred_arr: np.ndarray, class_names: list[str]):
+            try:
+                ds_base = loader.dataset
+                indices = None
+                if isinstance(ds_base, Subset):
+                    indices = list(getattr(ds_base, "indices", []))
+                    ds_base = ds_base.dataset
+                if not hasattr(ds_base, "samples"):
+                    return None
+
+                num_preds = int(len(y_pred_arr))
+                if indices is None:
+                    ds_indices = list(range(min(num_preds, len(ds_base.samples))))
+                else:
+                    ds_indices = indices[:num_preds]
+
+                rows = []
+                for ds_idx, pred in zip(ds_indices, y_pred_arr.tolist()[: len(ds_indices)]):
+                    img_path = _sample_path_at_index(ds_base, ds_idx)
+                    if not img_path:
+                        continue
+                    base = os.path.basename(str(img_path))
+                    syn = class_names[pred] if (0 <= int(pred) < len(class_names)) else ""
+                    rows.append((base, int(pred), syn))
+
+                if not rows:
+                    return None
+
+                sub_path = out_dir / f"submission_{task_name}.csv"
+                with open(sub_path, "w", encoding="utf-8") as f:
+                    f.write("image,pred_idx,pred_label\n")
+                    for base, pred, syn in rows:
+                        f.write(f"{base},{pred},{syn}\n")
+                return sub_path
+            except Exception as e:
+                print(f"[WARN] impossible d'écrire le CSV de soumission pour {task_name}: {e}")
+                return None
+
         metrics = {}
         for t in tasks_list:
             names = safe_task_cls_global[t]
             y_pred = np.array(all_preds[t], dtype=np.int64)
             y_true = np.array(all_trues[t], dtype=np.int64)
-            mask = y_pred != -1
-            if mask.sum() == 0:
+            mask = (y_true >= 0) & (y_pred >= 0)
+            valid_gt = int(mask.sum())
+            submission_path = None
+
+            if valid_gt == 0:
                 acc = prec = rec = f1 = 0.0
-                cm = np.zeros((len(names), len(names)), dtype=int)
+                cm = None
+                submission_path = _write_submission_csv(t, y_pred, names)
+                print(f"[{t}] no GT labels → métriques supervisées ignorées")
             else:
-                acc = float((y_pred[mask] == y_true[mask]).mean())
-                if _SK_OK:
+                yt = y_true[mask]
+                yp = y_pred[mask]
+                acc = float((yp == yt).mean()) if yt.size > 0 else 0.0
+                if _SK_OK and yt.size > 0:
                     prec = float(
                         precision_score(
-                            y_true[mask],
-                            y_pred[mask],
+                            yt,
+                            yp,
                             average="weighted",
                             zero_division=0,
                         )
                     )
                     rec = float(
                         recall_score(
-                            y_true[mask],
-                            y_pred[mask],
+                            yt,
+                            yp,
                             average="weighted",
                             zero_division=0,
                         )
                     )
                     f1 = float(
                         f1_score(
-                            y_true[mask],
-                            y_pred[mask],
+                            yt,
+                            yp,
                             average="weighted",
                             zero_division=0,
                         )
                     )
-                    cm = confusion_matrix(
-                        y_true[mask],
-                        y_pred[mask],
-                        labels=list(range(len(names))),
-                    )
+                    labels_used = np.unique(yt)
+                    labels_used = labels_used[(labels_used >= 0) & (labels_used < len(names))]
+                    if labels_used.size == 0:
+                        cm = None
+                    else:
+                        cm = confusion_matrix(yt, yp, labels=labels_used)
                 else:
                     prec = rec = f1 = 0.0
-                    cm = np.zeros((len(names), len(names)), dtype=int)
+                    cm = None
 
             metrics[t] = {
                 "accuracy": acc,
                 "precision": prec,
                 "recall": rec,
                 "f1": f1,
-                "confusion_matrix": cm.tolist(),
+                "num_predictions": int(len(y_pred)),
+                "num_valid_gt": valid_gt,
+                "supervised_metrics_available": bool(valid_gt > 0),
+                "confusion_matrix": (cm.tolist() if cm is not None else None),
             }
+            if cm is not None:
+                metrics[t]["confusion_matrix_labels"] = [
+                    names[int(i)] if 0 <= int(i) < len(names) else f"id{int(i)}"
+                    for i in labels_used.tolist()
+                ]
+            if submission_path is not None:
+                metrics[t]["submission_csv"] = str(submission_path)
             print(
                 f"[{t}] acc={acc:.4f}  prec={prec:.4f}  rec={rec:.4f}  f1={f1:.4f}"
             )
@@ -1478,6 +1685,7 @@ def main() -> None:
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
         print(f"✓ métriques sauvegardées → {metrics_path}")
+        _maybe_write_param_count_report(out_dir)
         return
 
     # ========================= MODE: style_transfer =======================
@@ -1793,6 +2001,7 @@ def main() -> None:
                         print(f"[WARN] debug grid non sauvé: {e}")
 
         print("✓ Terminé (style_transfer).")
+        _maybe_write_param_count_report(out_root)
         return
 
     # -------------- tsne / metrics / cls_tokens / style -------------------
@@ -2063,6 +2272,7 @@ def main() -> None:
             save_dir=str(wdir),
             metric_scores=scores,
         )
+        _maybe_write_param_count_report(Path(wdir))
         return
 
     metrics_req = [
@@ -2139,6 +2349,8 @@ def main() -> None:
             metric_scores=scores,
             save_dir=str(wdir),
         )
+
+    _maybe_write_param_count_report(Path(wdir))
 
 
 if __name__ == "__main__":

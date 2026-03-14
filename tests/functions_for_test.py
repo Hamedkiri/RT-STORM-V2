@@ -129,7 +129,7 @@ def build_test_dataloader(opt, cfg) -> Tuple[DataLoader, torch.utils.data.Datase
     On harmonise l'API en ajoutant .task_classes pour la voie 'folder', afin d'être
     compatible avec les chemins de code qui s'attendent à MultiTaskDataset.
 
-    Retourne: (loader, dataset, dataset_type) où dataset_type ∈ {"json","folder"}.
+    Retourne: (loader, dataset, dataset_type) où dataset_type ∈ {"json","folder","imagenet"}.
     """
     tf = transforms.Compose([
         transforms.Resize(286, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -170,10 +170,10 @@ def build_test_dataloader(opt, cfg) -> Tuple[DataLoader, torch.utils.data.Datase
 
             ds = ImageNetCLSLDataset(
                 images_root=opt.data,
-                split=split,
                 ann_root=ann_dir,
                 imagesets_root=imagesets_dir,
                 synset_mapping_file=syn_map,
+                split=split,
                 val_solution_csv=val_csv,
                 label_base=label_base,
                 num_classes=num_classes,

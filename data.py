@@ -241,8 +241,8 @@ class ImageNetCLSLDataset(Dataset):
         return_bbox: bool = False,
     ):
         self.images_root = str(images_root)
-        self.split = str(split).lower()
-        self.ann_root = str(ann_root) if ann_root else None
+        self.split = self._normalize_split(split, self.images_root)
+        self.ann_root = self._normalize_ann_root(ann_root, self.split)
         self.imagesets_root = str(imagesets_root) if imagesets_root else None
         self.synset_mapping_file = str(synset_mapping_file) if synset_mapping_file else None
         self.val_solution_csv = str(val_solution_csv) if val_solution_csv else None
@@ -313,6 +313,27 @@ class ImageNetCLSLDataset(Dataset):
         return img, out
 
     # -------------------- mapping helpers --------------------
+    def _normalize_split(self, split, images_root: str) -> str:
+        s = str(split).lower() if split is not None else 'auto'
+        if s in {'train', 'val', 'test'}:
+            return s
+        rp = Path(images_root)
+        bn = rp.name.lower()
+        if bn in {'train', 'val', 'test'}:
+            return bn
+        for cand in ('train', 'val', 'test'):
+            if (rp / cand).exists():
+                return cand if sum((rp / c).exists() for c in ('train', 'val', 'test')) == 1 else 'val'
+        return 'val'
+
+    def _normalize_ann_root(self, ann_root, split: str) -> str | None:
+        if not ann_root:
+            return None
+        ap = Path(str(ann_root))
+        if ap.name.lower() == split:
+            ap = ap.parent
+        return str(ap)
+
     def _build_synset_to_idx(self, rp: Path) -> tuple[Dict[str, int], Dict[str, str]]:
         names: Dict[str, str] = {}
         if self.synset_mapping_file and Path(self.synset_mapping_file).exists():
@@ -331,12 +352,54 @@ class ImageNetCLSLDataset(Dataset):
             synsets = synsets[: self.num_classes] if self.num_classes else synsets
             return {s: i for i, s in enumerate(synsets)}, names
 
-        # fallback from train folders
+        # fallback 1: from train folders
         train_root = (rp / 'train') if (rp / 'train').exists() else rp
         subdirs = [d for d in train_root.iterdir() if d.is_dir() and d.name.startswith('n')]
         synsets = sorted([d.name for d in subdirs])
-        synsets = synsets[: self.num_classes] if self.num_classes else synsets
-        return {s: i for i, s in enumerate(synsets)}, names
+        if synsets:
+            synsets = synsets[: self.num_classes] if self.num_classes else synsets
+            return {s: i for i, s in enumerate(synsets)}, names
+
+        # fallback 2: infer from val XML annotations when using a flat val folder
+        inferred = self._infer_synsets_from_val_annotations(rp)
+        if inferred:
+            inferred = inferred[: self.num_classes] if self.num_classes else inferred
+            return {s: i for i, s in enumerate(inferred)}, names
+
+        # fallback 3: from LOC_val_solution.csv
+        if self.val_solution_csv and Path(self.val_solution_csv).exists():
+            mp = self._parse_val_solution_csv(self.val_solution_csv)
+            synsets = sorted({v for v in mp.values() if isinstance(v, str) and v.startswith('n')})
+            synsets = synsets[: self.num_classes] if self.num_classes else synsets
+            if synsets:
+                return {s: i for i, s in enumerate(synsets)}, names
+
+        return {}, names
+
+    def _infer_synsets_from_val_annotations(self, rp: Path) -> list[str]:
+        ann_base = Path(self.ann_root) if self.ann_root else None
+        if ann_base is None:
+            return []
+        val_ann = ann_base / 'val'
+        if not val_ann.exists():
+            val_ann = ann_base
+        if not val_ann.exists():
+            return []
+        synsets: set[str] = set()
+        try:
+            import xml.etree.ElementTree as ET
+            for xml_path in sorted(val_ann.glob('*.xml')):
+                try:
+                    root = ET.parse(str(xml_path)).getroot()
+                    for obj in root.findall('object'):
+                        syn = (obj.findtext('name') or '').strip()
+                        if syn.startswith('n'):
+                            synsets.add(syn)
+                except Exception:
+                    continue
+        except Exception:
+            return []
+        return sorted(synsets)
 
     def _parse_val_solution_csv(self, csv_path: str) -> Dict[str, str]:
         import csv
