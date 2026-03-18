@@ -234,6 +234,16 @@ def get_opts():
 
     p.add_argument("--token_ablate_eval_every", type=int, default=400, help="Steps entre évaluations ablation.")
 
+    # Dimension des tokens style/contenu pour le générateur UNet
+    # Utilisée à la fois en entraînement et en test pour reconstruire correctement
+    # l'architecture du modèle de style.
+    p.add_argument(
+        "--token_dim",
+        type=int,
+        default=256,
+        help="Dimension des tokens style/contenu du générateur (train + test).",
+    )
+
     # =========================================================================
     # 9) JEPA
     # =========================================================================

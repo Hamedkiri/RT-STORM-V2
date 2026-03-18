@@ -3808,6 +3808,47 @@ def load_models(
                 out[task] = int(v.shape[0])
         return out or None
 
+    def _infer_sup_in_dim_from_state(sd: dict) -> int | None:
+        """Infer SupHeads input_dim directly from a state_dict.
+
+        Priority:
+          1) classifiers.<task>.1.weight -> shape[1] == clf_in
+          2) classifiers.<task>.0.weight -> shape[0] == clf_in (LayerNorm)
+          3) classifiers.<task>.4.weight -> shape[1] == hidden = mlp_mult * clf_in
+             with default mlp_mult=2 in this project, fallback to hidden // 2
+        """
+        if not isinstance(sd, dict):
+            return None
+        direct_candidates: list[int] = []
+        hidden_candidates: list[int] = []
+        for k, v in sd.items():
+            if not isinstance(k, str) or not hasattr(v, 'shape'):
+                continue
+            if not k.startswith('classifiers.'):
+                continue
+            parts = k.split('.')
+            if len(parts) < 4:
+                continue
+            layer_idx = parts[2]
+            param = parts[3]
+            try:
+                shape = tuple(int(x) for x in v.shape)
+            except Exception:
+                continue
+            if layer_idx == '1' and param == 'weight' and len(shape) == 2:
+                direct_candidates.append(int(shape[1]))
+            elif layer_idx == '0' and param == 'weight' and len(shape) == 1:
+                direct_candidates.append(int(shape[0]))
+            elif layer_idx == '4' and param == 'weight' and len(shape) == 2:
+                hidden_candidates.append(int(shape[1]))
+        if direct_candidates:
+            vals = sorted(set(x for x in direct_candidates if x > 0))
+            return vals[0] if vals else None
+        if hidden_candidates:
+            vals = sorted(set(x for x in hidden_candidates if x > 0))
+            return (vals[0] // 2) if vals else None
+        return None
+
     # load SupHeads if requested
     Sup = None
     if sup_ckpt or sup_sd_from_gen:
@@ -3820,36 +3861,51 @@ def load_models(
         if tasks_dict is None and task_classes is not None:
             tasks_dict = _tasks_from_task_classes(task_classes)
 
-        # infer in_dim
-        if sup_in_dim is None:
+        # infer requested in_dim from current cfg/code path
+        requested_sup_in_dim = sup_in_dim
+        if requested_sup_in_dim is None:
             # try feat_type from cfg/hparams
             hp = _load_train_cfg_hparams(weights_dir)
             feat_type = hp.get("sup_feat_type", (cfg.get("model", {}) or {}).get("sup_feat_type", None))
             if isinstance(feat_type, str) and hasattr(G, "sup_in_dim_for"):
                 try:
-                    sup_in_dim = int(G.sup_in_dim_for(feat_type))
+                    requested_sup_in_dim = int(G.sup_in_dim_for(feat_type))
                 except Exception:
-                    sup_in_dim = None
-        if sup_in_dim is None:
+                    requested_sup_in_dim = None
+        if requested_sup_in_dim is None:
             # safe fallback
-            sup_in_dim = int(gen_kwargs.get("token_dim", 256))
+            requested_sup_in_dim = int(gen_kwargs.get("token_dim", 256))
 
-        # If still unknown, infer tasks from sup weights before instantiation
-        if tasks_dict is None:
-            if sup_ckpt:
-                sup_p0 = PPath(sup_ckpt)
-                if sup_p0.is_dir():
-                    sup_p0 = find_latest_ckpt(sup_p0)
-                sd0 = _read_state_any(sup_p0, device)
-                if isinstance(sd0, dict) and "sup_heads" in sd0 and isinstance(sd0["sup_heads"], dict):
-                    sd0 = sd0["sup_heads"]
-                if isinstance(sd0, dict) and "state_dict" in sd0 and isinstance(sd0["state_dict"], dict):
-                    sd0 = sd0["state_dict"]
-                if isinstance(sd0, dict) and any(k.startswith("sup_heads.") for k in sd0.keys()):
-                    sd0 = {k.replace("sup_heads.", "", 1): v for k, v in sd0.items()}
+        # Inspect sup checkpoint/state_dict before instantiation to infer tasks and true checkpoint input_dim
+        sup_in_dim_from_ckpt = None
+        if sup_ckpt:
+            sup_p0 = PPath(sup_ckpt)
+            if sup_p0.is_dir():
+                sup_p0 = find_latest_ckpt(sup_p0)
+            sd0 = _read_state_any(sup_p0, device)
+            if isinstance(sd0, dict) and "sup_heads" in sd0 and isinstance(sd0["sup_heads"], dict):
+                sd0 = sd0["sup_heads"]
+            if isinstance(sd0, dict) and "state_dict" in sd0 and isinstance(sd0["state_dict"], dict):
+                sd0 = sd0["state_dict"]
+            if isinstance(sd0, dict) and any(k.startswith("sup_heads.") for k in sd0.keys()):
+                sd0 = {k.replace("sup_heads.", "", 1): v for k, v in sd0.items()}
+            if tasks_dict is None:
                 tasks_dict = _tasks_from_sup_state(sd0)
-            else:
+            sup_in_dim_from_ckpt = _infer_sup_in_dim_from_state(sd0)
+        else:
+            if tasks_dict is None:
                 tasks_dict = _tasks_from_sup_state(sup_sd_from_gen)
+            sup_in_dim_from_ckpt = _infer_sup_in_dim_from_state(sup_sd_from_gen)
+
+        if sup_in_dim_from_ckpt is not None:
+            if requested_sup_in_dim is not None and int(requested_sup_in_dim) != int(sup_in_dim_from_ckpt):
+                print(
+                    f"[SupHeads] input_dim mismatch detected: cfg/code requests {int(requested_sup_in_dim)} "
+                    f"but checkpoint was trained with {int(sup_in_dim_from_ckpt)}. Using checkpoint dimension."
+                )
+            sup_in_dim = int(sup_in_dim_from_ckpt)
+        else:
+            sup_in_dim = int(requested_sup_in_dim)
 
         if tasks_dict is None:
             raise RuntimeError(

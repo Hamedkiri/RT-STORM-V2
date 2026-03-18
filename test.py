@@ -61,6 +61,12 @@ def main() -> None:
     ap.add_argument("--ckpt")
     ap.add_argument("--sup_ckpt")
     ap.add_argument("--sup_in_dim", type=int)
+    ap.add_argument(
+        "--token_dim",
+        type=int,
+        default=None,
+        help="Dimension des tokens style/contenu du générateur. Si fournie, surcharge cfg['model']['token_dim'] pour le test.",
+    )
     # ckpts séparés pour GA/GB (style GAN)
     ap.add_argument("--ckpt_GA")
     ap.add_argument("--ckpt_GB")
@@ -449,6 +455,9 @@ def main() -> None:
     else:
         device = torch.device(device_str)
     cfg = json.load(open(args.cfg))
+    if args.token_dim is not None:
+        cfg.setdefault("model", {})
+        cfg["model"]["token_dim"] = int(args.token_dim)
     wdir = Path(args.weights_dir)
 
     # Si on veut explicitement travailler sur les cls_tokens,
@@ -1552,6 +1561,15 @@ def main() -> None:
             return None
 
         def _write_submission_csv(task_name: str, y_pred_arr: np.ndarray, class_names: list[str]):
+            """
+            Écrit un CSV de soumission compatible ImageNet avec les colonnes :
+              - ImageId
+              - PredictionString
+
+            Pour CLS, PredictionString contient en priorité le synset / label texte si disponible,
+            sinon l'indice de classe prédit sous forme de chaîne.
+            ImageId est écrit sans extension.
+            """
             try:
                 ds_base = loader.dataset
                 indices = None
@@ -1572,18 +1590,27 @@ def main() -> None:
                     img_path = _sample_path_at_index(ds_base, ds_idx)
                     if not img_path:
                         continue
+
                     base = os.path.basename(str(img_path))
-                    syn = class_names[pred] if (0 <= int(pred) < len(class_names)) else ""
-                    rows.append((base, int(pred), syn))
+                    image_id = os.path.splitext(base)[0]
+                    pred_i = int(pred)
+
+                    pred_str = ""
+                    if 0 <= pred_i < len(class_names):
+                        pred_str = str(class_names[pred_i]).strip()
+                    if not pred_str:
+                        pred_str = str(pred_i)
+
+                    rows.append((image_id, pred_str))
 
                 if not rows:
                     return None
 
                 sub_path = out_dir / f"submission_{task_name}.csv"
                 with open(sub_path, "w", encoding="utf-8") as f:
-                    f.write("image,pred_idx,pred_label\n")
-                    for base, pred, syn in rows:
-                        f.write(f"{base},{pred},{syn}\n")
+                    f.write("ImageId,PredictionString\n")
+                    for image_id, pred_str in rows:
+                        f.write(f"{image_id},{pred_str}\n")
                 return sub_path
             except Exception as e:
                 print(f"[WARN] impossible d'écrire le CSV de soumission pour {task_name}: {e}")
