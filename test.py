@@ -14,7 +14,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageTk
+import tkinter as tk
+
 
 import torch
 import torch.nn as nn
@@ -47,6 +49,288 @@ from tests.functions_for_test import (
 
 
 
+
+
+
+def _normalize_task_classes_for_display(raw):
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        names = []
+        if isinstance(v, list):
+            names = [str(x) for x in v]
+        elif isinstance(v, dict):
+            if isinstance(v.get("classes"), list):
+                names = [str(x) for x in v["classes"]]
+            elif isinstance(v.get("names"), list):
+                names = [str(x) for x in v["names"]]
+            elif isinstance(v.get("num_classes"), int):
+                names = [f"class {i}" for i in range(int(v["num_classes"]))]
+        elif isinstance(v, int):
+            names = [f"class {i}" for i in range(int(v))]
+        if names:
+            out[str(k)] = names
+    return out
+
+
+def _infer_imagenet_classes_from_ann_dir(ann_dir: str):
+    import xml.etree.ElementTree as ET
+    ap = Path(str(ann_dir))
+    if ap.name.lower() == 'val':
+        val_dir = ap
+    else:
+        val_dir = ap / 'val'
+        if not val_dir.exists():
+            val_dir = ap
+    synsets = set()
+    if val_dir.exists():
+        for xml_path in sorted(val_dir.glob('*.xml')):
+            try:
+                root = ET.parse(str(xml_path)).getroot()
+                for obj in root.findall('object'):
+                    syn = (obj.findtext('name') or '').strip()
+                    if syn.startswith('n'):
+                        synsets.add(syn)
+            except Exception:
+                continue
+    return sorted(synsets)
+
+
+def _load_task_classes_for_camera(args):
+    task_classes = {}
+    if getattr(args, 'classes_json', None):
+        try:
+            with open(args.classes_json, 'r', encoding='utf-8') as f:
+                task_classes = _normalize_task_classes_for_display(json.load(f))
+        except Exception as e:
+            print(f"[backbone_camera] Impossible de lire classes_json: {e}")
+    if task_classes:
+        return task_classes
+
+    synsets = []
+    syn_to_name = {}
+    syn_map = getattr(args, 'imagenet_synset_mapping', None)
+    if syn_map and Path(syn_map).exists():
+        try:
+            for ln in Path(syn_map).read_text(encoding='utf-8').splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                parts = ln.split()
+                syn = parts[0]
+                if syn.startswith('n'):
+                    synsets.append(syn)
+                    syn_to_name[syn] = ' '.join(parts[1:]).strip() if len(parts) > 1 else syn
+        except Exception as e:
+            print(f"[backbone_camera] Lecture synset_mapping échouée: {e}")
+    if not synsets and getattr(args, 'imagenet_ann_dir', None):
+        synsets = _infer_imagenet_classes_from_ann_dir(args.imagenet_ann_dir)
+    if synsets:
+        display_names = []
+        for syn in synsets:
+            nm = syn_to_name.get(syn, '').strip()
+            display_names.append(f"{syn} — {nm}" if nm and nm != syn else syn)
+        return {'__DEFAULT__': display_names}
+    return {}
+
+
+def _task_display_names(task_classes: dict, task: str, fallback_n: int | None = None):
+    names = []
+    if isinstance(task_classes, dict):
+        if task in task_classes:
+            names = list(task_classes[task])
+        elif '__DEFAULT__' in task_classes:
+            names = list(task_classes['__DEFAULT__'])
+    if not names and fallback_n is not None and fallback_n > 0:
+        names = [f"class {i}" for i in range(int(fallback_n))]
+    return names
+
+
+class _TkCameraDisplay:
+    def __init__(self, title: str = "RT-STORM backbone camera"):
+        self.root = tk.Tk()
+        self.root.title(title)
+        self.label = tk.Label(self.root)
+        self.label.pack()
+        self._closed = False
+        self._last_key = None
+        self._photo = None
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Key>", self._on_key)
+        self.root.focus_force()
+
+    def _on_close(self):
+        self._closed = True
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def _on_key(self, event):
+        self._last_key = getattr(event, "keysym", None)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def show_bgr(self, frame_bgr):
+        if self._closed:
+            return False
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        im = Image.fromarray(frame_rgb)
+        self._photo = ImageTk.PhotoImage(image=im)
+        self.label.configure(image=self._photo)
+        self.label.image = self._photo
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except tk.TclError:
+            self._closed = True
+            return False
+        if self._last_key in ("q", "Escape"):
+            self._closed = True
+            return False
+        return True
+
+    def close(self):
+        if not self._closed:
+            self._on_close()
+
+
+def run_backbone_camera(
+    model: nn.Module,
+    device: torch.device,
+    *,
+    cfg: dict,
+    feature_mode: str = 'style',
+    task_classes: dict | None = None,
+    cam_index: int = 0,
+    topk: int = 3,
+):
+    model.eval()
+    img_side = _infer_img_size_from_cfg(cfg, default=256)
+    tfm = _make_transform(img_side)
+    cap = cv2.VideoCapture(cam_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Impossible d'ouvrir la caméra index={cam_index}")
+
+    task_classes = task_classes or {}
+    last_t = time.time()
+    display_backend = 'cv2'
+    warned_no_gui = False
+    tk_display = None
+    print(
+        f"[backbone_camera] Caméra {cam_index} ouverte | feature_mode={feature_mode} | "
+        f"resize={img_side} | topk={topk}. Appuyez sur 'q' pour quitter."
+    )
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            x = tfm(Image.fromarray(frame_rgb)).unsqueeze(0).to(device)
+            with torch.no_grad():
+                raw_out = model(x)
+
+            if torch.is_tensor(raw_out):
+                logits_d = {'__DEFAULT__': raw_out}
+            elif isinstance(raw_out, dict):
+                logits_d = raw_out
+            else:
+                raise RuntimeError(f"run_backbone_camera: sortie non supportée ({type(raw_out)})")
+
+            lines = [f"mode={feature_mode}"]
+            multi_task_classes = isinstance(task_classes, dict) and any(k != '__DEFAULT__' for k in task_classes.keys())
+            for task, logits in logits_d.items():
+                if logits is None or (not torch.is_tensor(logits)) or logits.numel() == 0:
+                    continue
+                if logits.dim() == 1:
+                    logits = logits.unsqueeze(0)
+                probs = torch.softmax(logits[0], dim=0)
+                names = _task_display_names(task_classes, task, fallback_n=int(probs.numel()))
+
+                if multi_task_classes and len(logits_d) > 1:
+                    best_idx = int(torch.argmax(probs).item())
+                    best_prob = float(probs[best_idx].item())
+                    label = names[best_idx] if 0 <= best_idx < len(names) else f"class {best_idx}"
+                    lines.append(f"{task}: {label} ({100.0 * best_prob:.1f}%)")
+                else:
+                    k = max(1, min(int(topk), int(probs.numel())))
+                    vals, idxs = torch.topk(probs, k=k)
+                    if len(logits_d) > 1:
+                        lines.append(f"[{task}]")
+                    for rank, (v, idx) in enumerate(zip(vals.tolist(), idxs.tolist()), start=1):
+                        label = names[idx] if 0 <= idx < len(names) else f"class {idx}"
+                        lines.append(f"{rank}. {label} ({100.0 * float(v):.1f}%)")
+
+            now = time.time()
+            fps = 1.0 / max(now - last_t, 1e-6)
+            last_t = now
+            lines.append(f"FPS: {fps:.1f}")
+
+            y = 28
+            for line in lines[:12]:
+                cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
+                y += 24
+
+            if display_backend == 'cv2':
+                try:
+                    cv2.imshow('RT-STORM backbone camera', frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord('q'), 27):
+                        break
+                except cv2.error:
+                    try:
+                        tk_display = _TkCameraDisplay('RT-STORM backbone camera')
+                        display_backend = 'tk'
+                        print('[backbone_camera] OpenCV GUI indisponible. Bascule automatique vers une fenêtre Tkinter.')
+                        if not tk_display.show_bgr(frame):
+                            break
+                    except Exception as e:
+                        display_backend = 'console'
+                        if not warned_no_gui:
+                            warned_no_gui = True
+                            print(
+                                '[backbone_camera] Aucun backend d\'affichage disponible ' 
+                                f'(OpenCV headless / Tk indisponible: {e}). ' 
+                                'Affichage désactivé ; les prédictions continuent côté console. ' 
+                                'Interrompez avec Ctrl+C.'
+                            )
+            elif display_backend == 'tk':
+                if tk_display is None:
+                    try:
+                        tk_display = _TkCameraDisplay('RT-STORM backbone camera')
+                    except Exception as e:
+                        display_backend = 'console'
+                        if not warned_no_gui:
+                            warned_no_gui = True
+                            print(
+                                '[backbone_camera] Impossible d\'initialiser Tkinter ' 
+                                f'({e}). Affichage désactivé ; les prédictions continuent côté console. ' 
+                                'Interrompez avec Ctrl+C.'
+                            )
+                if display_backend == 'tk' and tk_display is not None:
+                    if not tk_display.show_bgr(frame):
+                        break
+            else:
+                print("\r" + " | ".join(lines[:4])[:220], end="", flush=True)
+    finally:
+        cap.release()
+        if display_backend == 'cv2':
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
+        if tk_display is not None:
+            try:
+                tk_display.close()
+            except Exception:
+                pass
+        if display_backend == 'console' and warned_no_gui:
+            print()
 
 
 def main() -> None:
@@ -100,7 +384,7 @@ def main() -> None:
     ap.add_argument(
         "--mode",
         choices=["tsne_interactive", "passe_by_metrics", "sup_predict", "style_transfer",
-                 "detect_transformer"],
+                 "detect_transformer", "backbone_camera"],
         default="tsne_interactive",
     )
 
@@ -400,6 +684,12 @@ def main() -> None:
         default=0,
         help="Index de la caméra OpenCV (0 par défaut).",
     )
+    ap.add_argument(
+        "--camera_topk",
+        type=int,
+        default=3,
+        help="Nombre de prédictions à afficher par tâche en mode backbone_camera.",
+    )
     ap.add_argument('--det_head_type', type=str, default='simple_unet',
                    help="Tête de détection: 'simple_unet' (UNet+SimpleDETRHead) ou 'detr_resnet50'")
 
@@ -635,14 +925,14 @@ def main() -> None:
     # ----------- Charger G/Sup selon le mode -----------
     G, Sup, task_cls = None, None, None
 
-    sem_only_modes = {"tsne_interactive", "passe_by_metrics", "sup_predict"}
+    sem_only_modes = {"tsne_interactive", "passe_by_metrics", "sup_predict", "backbone_camera"}
     if (args.feature_mode == "sem_resnet50") and (args.mode in sem_only_modes):
         # Pas besoin de G_A/G_B.
         # Charger SupHeads si requis (sup_predict) ou si demandé (tsne_use_supheads / per_task)
-        need_sup = (args.mode == "sup_predict") or bool(args.tsne_use_supheads) or bool(args.per_task)
+        need_sup = (args.mode in {"sup_predict", "backbone_camera"}) or bool(args.tsne_use_supheads) or bool(args.per_task)
         if need_sup:
             if not args.sup_ckpt:
-                raise RuntimeError("SupHeads requis mais --sup_ckpt manquant (utilise sup_predict/tsne_use_supheads/per_task).")
+                raise RuntimeError("SupHeads requis mais --sup_ckpt manquant (utilise sup_predict/backbone_camera/tsne_use_supheads/per_task).")
             from models.sup_heads import SupHeads
 
             sup_path = Path(args.sup_ckpt)
@@ -1161,8 +1451,8 @@ def main() -> None:
                 f"✓ composite prêt | tasks={composite.tasks} | "
                 f"feat_type={composite.feat_type} | Δw={composite.delta_weights}"
             )
-    elif args.mode == "sup_predict":
-        raise RuntimeError("Le mode 'sup_predict' requiert un SupHeads (--sup_ckpt).")
+    elif args.mode in {"sup_predict", "backbone_camera"}:
+        raise RuntimeError("Les modes 'sup_predict' et 'backbone_camera' requièrent un SupHeads (--sup_ckpt).")
 
     def _iter_unique_named_parameters(module: nn.Module | None):
         if module is None or not isinstance(module, nn.Module):
@@ -1291,6 +1581,23 @@ def main() -> None:
             json.dump(report, f, indent=2)
         print(f"✓ comptage des paramètres sauvegardé → {out_path}")
         return out_path
+
+    if args.mode == "backbone_camera":
+        if composite is None:
+            raise RuntimeError("Le mode 'backbone_camera' requiert un modèle composite (backbone + SupHeads).")
+        task_classes_cam = _load_task_classes_for_camera(args)
+        if not task_classes_cam:
+            print("[backbone_camera] Aucun mapping de classes trouvé via --classes_json / --imagenet_ann_dir / --imagenet_synset_mapping. Fallback sur des noms génériques 'class i'.")
+        run_backbone_camera(
+            composite,
+            device,
+            cfg=cfg,
+            feature_mode=args.feature_mode,
+            task_classes=task_classes_cam,
+            cam_index=args.camera_index,
+            topk=args.camera_topk,
+        )
+        return
 
     # ========================= MODE: sup_predict ==========================
     if args.mode == "sup_predict":
