@@ -122,6 +122,53 @@ def build_sem_backbone_for_eval(
                 print(f"[WARN] Auto-load sem_backbone échoué: {e}")
 
     return backbone, out_ch
+
+
+class FlatImageFolderDataset(torch.utils.data.Dataset):
+    """Dataset pour un dossier contenant directement des images, sans sous-dossiers de classes."""
+    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".jfif", ".JPG", ".JPEG", ".PNG", ".BMP", ".TIF", ".TIFF", ".WEBP", ".JFIF"}
+
+    def __init__(self, root, transform=None, task_classes=None):
+        self.root = str(root)
+        self.transform = transform
+        rp = Path(self.root)
+        self.samples = [str(x) for x in sorted(rp.iterdir()) if x.is_file() and x.suffix in self.IMG_EXTS]
+        if not self.samples:
+            raise ValueError(f"Aucune image trouvée directement dans {self.root}")
+        self.task_classes = task_classes or {"__DEFAULT__": []}
+        self.classes = list(self.task_classes.get("__DEFAULT__", []))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        p = self.samples[idx]
+        img = Image.open(p).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, -1, p
+
+
+def _read_imagenet_display_names_from_synset_mapping(synset_mapping_file):
+    names = []
+    if not synset_mapping_file:
+        return names
+    sp = Path(str(synset_mapping_file))
+    if not sp.exists():
+        return names
+    try:
+        for ln in sp.read_text(encoding='utf-8').splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            parts = ln.split()
+            syn = parts[0]
+            if syn.startswith('n'):
+                names.append(syn)
+    except Exception:
+        return []
+    return names
+
 def build_test_dataloader(opt, cfg) -> Tuple[DataLoader, torch.utils.data.Dataset, str]:
     """
     Construire DataLoader selon --data / --data_json ou config.
@@ -188,16 +235,48 @@ def build_test_dataloader(opt, cfg) -> Tuple[DataLoader, torch.utils.data.Datase
                 setattr(ds, "task_classes", {"__DEFAULT__": classes})
 
         else:
-            ds = datasets.ImageFolder(root=opt.data, transform=tf)
-            dataset_type = "folder"
+            root_p = Path(str(opt.data))
+            subdirs = [x for x in root_p.iterdir() if x.is_dir()] if root_p.exists() else []
+            if subdirs:
+                ds = datasets.ImageFolder(root=opt.data, transform=tf)
+                dataset_type = "folder"
 
-            # Harmonisation d'API : exposer .task_classes comme MultiTaskDataset
-            if not hasattr(ds, "task_classes"):
-                try:
-                    classes = list(getattr(ds, "classes", []))
-                except Exception:
-                    classes = []
-                setattr(ds, "task_classes", {"__DEFAULT__": classes})
+                # Harmonisation d'API : exposer .task_classes comme MultiTaskDataset
+                if not hasattr(ds, "task_classes"):
+                    try:
+                        classes = list(getattr(ds, "classes", []))
+                    except Exception:
+                        classes = []
+                    setattr(ds, "task_classes", {"__DEFAULT__": classes})
+            else:
+                flat_task_classes = {"__DEFAULT__": []}
+                cj = getattr(opt, "classes_json", None)
+                if cj and Path(str(cj)).exists():
+                    try:
+                        raw = json.loads(Path(str(cj)).read_text(encoding='utf-8'))
+                        if isinstance(raw, dict):
+                            if "__DEFAULT__" in raw and isinstance(raw["__DEFAULT__"], list):
+                                flat_task_classes = {"__DEFAULT__": [str(x) for x in raw["__DEFAULT__"]]}
+                            else:
+                                # On garde la structure multitâche si fournie
+                                norm = {}
+                                for k, v in raw.items():
+                                    if isinstance(v, list):
+                                        norm[str(k)] = [str(x) for x in v]
+                                    elif isinstance(v, dict):
+                                        vv = v.get("classes", v.get("names", None))
+                                        if isinstance(vv, list):
+                                            norm[str(k)] = [str(x) for x in vv]
+                                if norm:
+                                    flat_task_classes = norm
+                    except Exception:
+                        pass
+                if (not flat_task_classes.get("__DEFAULT__")) and getattr(opt, "imagenet_synset_mapping", None):
+                    im_names = _read_imagenet_display_names_from_synset_mapping(getattr(opt, "imagenet_synset_mapping", None))
+                    if im_names:
+                        flat_task_classes = {"__DEFAULT__": im_names}
+                ds = FlatImageFolderDataset(root=opt.data, transform=tf, task_classes=flat_task_classes)
+                dataset_type = "flat_folder"
 
     else:
         # ---------- fallback : via le fichier de config ----------
@@ -3626,12 +3705,23 @@ def _align_dp_prefix(sd: _Dict[str, torch.Tensor], model: torch.nn.Module) -> _D
 
 
 def _split_sup_from_ckpt(sd: _Dict[str, torch.Tensor]) -> _Tuple[_Dict[str, torch.Tensor], _Dict[str, torch.Tensor]]:
-    """Split generator keys vs sup_heads keys if ckpt is a combined bundle."""
+    """Split generator keys vs sup_heads keys if ckpt is a combined bundle.
+
+    Notes
+    -----
+    * ``sup_heads.*`` belongs to SupHeads and its prefix is stripped.
+    * ``sup_fusion.*`` belongs to FusionHead and must be ignored here because it is
+      loaded separately by the fusion-aware test path. Forwarding these keys either
+      to UNetGenerator or to SupHeads causes strict-loading failures.
+    """
     gen_sd: _Dict[str, torch.Tensor] = {}
     sup_sd: _Dict[str, torch.Tensor] = {}
     for k, v in sd.items():
         if k.startswith("sup_heads."):
             sup_sd[k.replace("sup_heads.", "", 1)] = v
+        elif k.startswith("sup_fusion."):
+            # FusionHead weights are handled separately in test.py.
+            continue
         else:
             gen_sd[k] = v
     return gen_sd, sup_sd
@@ -3931,6 +4021,7 @@ def load_models(
                 # strip prefix
                 sd = {k.replace("sup_heads.", "", 1): v for k, v in sd.items()}
             sd = _align_dp_prefix(sd, Sup)
+            sd = {k: v for k, v in sd.items() if not str(k).startswith("sup_fusion.")}
             try:
                 Sup.load_state_dict(sd, strict=strict_sup)
             except RuntimeError as e:
@@ -3939,6 +4030,7 @@ def load_models(
                 Sup.load_state_dict(sd, strict=False)
         else:
             sd = _align_dp_prefix(sup_sd_from_gen, Sup)
+            sd = {k: v for k, v in sd.items() if not str(k).startswith("sup_fusion.")}
             try:
                 Sup.load_state_dict(sd, strict=strict_sup)
             except RuntimeError as e:

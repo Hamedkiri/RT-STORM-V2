@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
+from models.fusion_head import VectorGatedFusionHead
+
 
 
 from tests.functions_for_test import (
@@ -336,7 +338,7 @@ def run_backbone_camera(
 def main() -> None:
     # ------------------------ ARGUMENTS ------------------------
     ap = argparse.ArgumentParser(
-        "Exploration : t-SNE / métriques / sup_predict / style_transfer / detect_transformer"
+        "Exploration : t-SNE / métriques / sup_predict / inference / style_transfer / detect_transformer"
     )
 
     # ckpts / modèles -------------------------------------------------------
@@ -383,7 +385,7 @@ def main() -> None:
     # modes principaux ------------------------------------------------------
     ap.add_argument(
         "--mode",
-        choices=["tsne_interactive", "passe_by_metrics", "sup_predict", "style_transfer",
+        choices=["tsne_interactive", "passe_by_metrics", "sup_predict", "inference", "style_transfer",
                  "detect_transformer", "backbone_camera"],
         default="tsne_interactive",
     )
@@ -391,19 +393,19 @@ def main() -> None:
     # source des features pour tsne / metrics / sup_predict
     ap.add_argument(
         "--feature_mode",
-        choices=["style", "cls_tokens", "sem_resnet50"],
+        choices=["style", "cls_tokens", "sem_resnet50", "fusion"],
         default="style",
         help="Source des embeddings pour tsne/metrics/sup_predict : "
-             "'style' (GAN), 'cls_tokens' (SupHeads/per_task) ou 'sem_resnet50' (backbone sémantique).",
+             "'style' (GAN), 'cls_tokens' (SupHeads/per_task), 'sem_resnet50' (backbone sémantique) ou 'fusion' (style+sémantique via FusionHead).",
     )
 
 
     # Source utilisée pour charger/entraîner SupHeads (utile pour auto-load du backbone sémantique)
     ap.add_argument(
         "--sup_feat_source",
-        choices=["generator", "sem_resnet50"],
+        choices=["generator", "sem_resnet50", "fusion"],
         default="generator",
-        help="Source des features attendues par SupHeads. Si sem_resnet50, on peut auto-charger le backbone sémantique depuis weights_dir (SemBackbone_epoch*.pt).",
+        help="Source des features attendues par SupHeads. Si sem_resnet50 ou fusion, on peut auto-charger le backbone sémantique depuis weights_dir (SemBackbone_epoch*.pt).",
     )
 
     ap.add_argument(
@@ -690,6 +692,16 @@ def main() -> None:
         default=3,
         help="Nombre de prédictions à afficher par tâche en mode backbone_camera.",
     )
+    ap.add_argument(
+        "--inference_json_name",
+        default="inference_predictions.json",
+        help="Nom du fichier JSON produit en mode inference.",
+    )
+    ap.add_argument(
+        "--inference_save_csv",
+        action="store_true",
+        help="En mode inference, écrire aussi un CSV plat des prédictions.",
+    )
     ap.add_argument('--det_head_type', type=str, default='simple_unet',
                    help="Tête de détection: 'simple_unet' (UNet+SimpleDETRHead) ou 'detr_resnet50'")
 
@@ -905,10 +917,113 @@ def main() -> None:
         pats.sort(key=lambda p: p.stat().st_mtime)
         return pats[-1]
 
+    def _find_latest_named_ckpt(weights_dir: Path, stem: str, extra_roots: list[Path] | None = None) -> Path | None:
+        def _safe_resolve(x: Path) -> Path:
+            try:
+                return x.resolve()
+            except Exception:
+                return x
+
+        def _score_ckpt_path(p: Path) -> tuple:
+            name = p.name.lower()
+            # priorité: best > last > epoch > autre ; .pth/.pt > safetensors ; puis mtime
+            kind = 0
+            if "best" in name:
+                kind = 3
+            elif "last" in name:
+                kind = 2
+            elif "epoch" in name:
+                kind = 1
+            ext = p.suffix.lower()
+            ext_score = 2 if ext in (".pth", ".pt") else 1
+            try:
+                mtime = p.stat().st_mtime
+            except Exception:
+                mtime = 0.0
+            return (kind, ext_score, mtime)
+
+        def _collect(root: Path):
+            try:
+                root = Path(root)
+            except Exception:
+                return []
+            if not str(root) or not root.exists():
+                return []
+
+            # Motifs volontairement larges et robustes:
+            # - .pth, .pt, .safetensors
+            # - best / last / epoch / n'importe quel suffixe
+            patterns = [
+                f"{stem}*.pth", f"{stem}*.pt", f"{stem}*.safetensors",
+                f"{stem.lower()}*.pth", f"{stem.lower()}*.pt", f"{stem.lower()}*.safetensors",
+            ]
+
+            pats = []
+            seen = set()
+            # D'abord dans la racine
+            for pat in patterns:
+                for cand in root.glob(pat):
+                    key = str(_safe_resolve(cand))
+                    if key not in seen:
+                        seen.add(key)
+                        pats.append(cand)
+            # Puis récursivement
+            for pat in patterns:
+                for cand in root.rglob(pat):
+                    key = str(_safe_resolve(cand))
+                    if key not in seen:
+                        seen.add(key)
+                        pats.append(cand)
+
+            # Fallback ultime: recherche par nom contenant stem, quelle que soit l'extension
+            if not pats:
+                stem_low = stem.lower()
+                for cand in root.rglob("*"):
+                    try:
+                        if cand.is_file() and stem_low in cand.name.lower() and cand.suffix.lower() in (".pth", ".pt", ".safetensors"):
+                            key = str(_safe_resolve(cand))
+                            if key not in seen:
+                                seen.add(key)
+                                pats.append(cand)
+                    except Exception:
+                        continue
+            return pats
+
+        roots = []
+        for r in [weights_dir, *(extra_roots or [])]:
+            try:
+                rp = Path(r)
+            except Exception:
+                continue
+            if not str(rp):
+                continue
+            rr = _safe_resolve(rp)
+            if rr not in roots:
+                roots.append(rr)
+            # ajoute aussi le parent si le chemin pointe vers un fichier ou un sous-dossier trop spécifique
+            par = rr.parent
+            if str(par) and par not in roots:
+                roots.append(par)
+
+        pats = []
+        for root in roots:
+            pats.extend(_collect(root))
+        if not pats:
+            searched = ", ".join(str(r) for r in roots)
+            print(f"[WARN] Aucun checkpoint '{stem}' trouvé. Dossiers inspectés: {searched}")
+            return None
+
+        uniq = {str(_safe_resolve(p)): p for p in pats}
+        pats = list(uniq.values())
+        pats.sort(key=_score_ckpt_path)
+        chosen = pats[-1]
+        print(f"[INFO] {stem} candidates found ({len(pats)}). Selected: {chosen}")
+        return chosen
+
     # ----------- Backbone sémantique (optionnel, pour tests) -----------
     sem_backbone = None
     sem_out_ch = None
-    if args.feature_mode == "sem_resnet50":
+    if (args.feature_mode == "sem_resnet50") or (str(args.sup_feat_source).lower() == "fusion"):
         sem_backbone, sem_out_ch = build_sem_backbone_for_eval(
             device=device,
             arch=args.det_sem_backbone,
@@ -917,7 +1032,7 @@ def main() -> None:
             pretrained_path=str(args.sem_pretrained_path or ""),
             strict=bool(int(args.sem_pretrained_strict)),
             verbose=bool(int(args.sem_pretrained_verbose)),
-            weights_dir=(wdir if args.sup_feat_source == "sem_resnet50" else None),
+            weights_dir=(wdir if args.sup_feat_source in ("sem_resnet50", "fusion") else None),
             sem_filename="SemBackbone",
         )
         print(f"✓ sem_backbone prêt | arch={args.det_sem_backbone} | layer={args.det_sem_return_layer} | out_ch={sem_out_ch}")
@@ -925,11 +1040,11 @@ def main() -> None:
     # ----------- Charger G/Sup selon le mode -----------
     G, Sup, task_cls = None, None, None
 
-    sem_only_modes = {"tsne_interactive", "passe_by_metrics", "sup_predict", "backbone_camera"}
-    if (args.feature_mode == "sem_resnet50") and (args.mode in sem_only_modes):
+    sem_only_modes = {"tsne_interactive", "passe_by_metrics", "sup_predict", "inference", "backbone_camera"}
+    if (args.feature_mode == "sem_resnet50") and (str(args.sup_feat_source).lower() != "fusion") and (args.mode in sem_only_modes):
         # Pas besoin de G_A/G_B.
         # Charger SupHeads si requis (sup_predict) ou si demandé (tsne_use_supheads / per_task)
-        need_sup = (args.mode in {"sup_predict", "backbone_camera"}) or bool(args.tsne_use_supheads) or bool(args.per_task)
+        need_sup = (args.mode in {"sup_predict", "inference", "backbone_camera"}) or bool(args.tsne_use_supheads) or bool(args.per_task)
         if need_sup:
             if not args.sup_ckpt:
                 raise RuntimeError("SupHeads requis mais --sup_ckpt manquant (utilise sup_predict/backbone_camera/tsne_use_supheads/per_task).")
@@ -974,12 +1089,15 @@ def main() -> None:
 
     else:
         # Chargement standard (style / cls_tokens / style_transfer)
+        # En mode fusion, on charge d'abord le générateur seul puis on reconstruit SupHeads
+        # explicitement à partir du checkpoint pour respecter la vraie input_dim.
+        fusion_mode = (str(args.sup_feat_source).lower() == "fusion")
         G, Sup, task_cls = load_models(
             weights_dir=wdir,
             device=device,
             cfg=cfg,
             ckpt_gen=args.ckpt,
-            sup_ckpt=args.sup_ckpt,
+            sup_ckpt=(None if fusion_mode else args.sup_ckpt),
             classes_json=args.classes_json,
             sup_in_dim=args.sup_in_dim,
             ckpt_GA=args.ckpt_GA,
@@ -990,9 +1108,86 @@ def main() -> None:
     if G is not None:
         G_A = getattr(G, "GA", getattr(G, "G_A", G))
         G_B = getattr(G, "GB", getattr(G, "G_B", G))
-    else:
-        G_A = None
-        G_B = None
+    fusion_head = None
+    if str(args.sup_feat_source).lower() == "fusion":
+        if G is None:
+            raise RuntimeError("sup_feat_source=fusion requiert un générateur chargé.")
+        if sem_backbone is None:
+            raise RuntimeError("sup_feat_source=fusion requiert aussi un backbone sémantique chargé.")
+        fusion_ckpt = _find_latest_named_ckpt(
+            wdir,
+            "FusionHead",
+            extra_roots=[
+                Path(getattr(args, "out_dir", "") or ""),
+                (Path(getattr(args, "sup_ckpt", "")).parent if getattr(args, "sup_ckpt", None) else wdir),
+            ],
+        )
+        if fusion_ckpt is None:
+            raise FileNotFoundError(f"Aucun checkpoint FusionHead trouvé dans {wdir}")
+        fusion_obj = _read_state_any(fusion_ckpt, device)
+        fusion_sd = fusion_obj.get("state_dict", fusion_obj) if isinstance(fusion_obj, dict) else fusion_obj
+        style_in_dim = None
+        try:
+            if hasattr(G, "sup_in_dim_for"):
+                style_in_dim = int(G.sup_in_dim_for(args.embed_type))
+        except Exception:
+            style_in_dim = None
+        if style_in_dim is None:
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, _infer_img_size_from_cfg(cfg, default=256), _infer_img_size_from_cfg(cfg, default=256), device=device)
+                if hasattr(G, "sup_features"):
+                    style_in_dim = int(G.sup_features(dummy, args.embed_type, delta_weights=args.delta_weights).shape[1])
+                else:
+                    z, _ = G.encode_content(dummy)
+                    style_in_dim = int(F.adaptive_avg_pool2d(z, 1).flatten(1).shape[1])
+        sem_in_dim = int((fusion_obj.get("sem_in_dim") if isinstance(fusion_obj, dict) else None) or sem_out_ch or 2048)
+        fusion_dim = int((fusion_obj.get("fusion_dim") if isinstance(fusion_obj, dict) else None) or args.sup_in_dim or 1024)
+        fusion_head = VectorGatedFusionHead(style_in_dim=style_in_dim, sem_in_dim=sem_in_dim, fusion_dim=fusion_dim, dropout=float(getattr(args, "fusion_dropout", 0.1))).to(device)
+        miss, unexp = fusion_head.load_state_dict(fusion_sd, strict=False)
+        if miss:
+            print(f"[WARN] FusionHead missing keys ({len(miss)})")
+        if unexp:
+            print(f"[WARN] FusionHead unexpected keys ({len(unexp)})")
+        fusion_head.eval()
+        print(f"✓ FusionHead loaded – {fusion_ckpt.name} | style_in_dim={style_in_dim} | sem_in_dim={sem_in_dim} | fusion_dim={fusion_dim}")
+
+        # Recharger SupHeads explicitement avec la vraie dimension du checkpoint.
+        if not args.sup_ckpt:
+            raise RuntimeError("sup_feat_source=fusion requiert --sup_ckpt pour charger SupHeads.")
+        from models.sup_heads import SupHeads
+        sup_path = Path(args.sup_ckpt)
+        if not sup_path.is_absolute():
+            cand = wdir / sup_path
+            if cand.exists():
+                sup_path = cand
+        if not sup_path.exists():
+            raise FileNotFoundError(f"SupHeads introuvable: {sup_path}")
+        sup_obj = _read_state_any(sup_path, device)
+        sup_sd = sup_obj.get("sup_heads", sup_obj) if isinstance(sup_obj, dict) else sup_obj
+        if isinstance(sup_sd, dict) and "state_dict" in sup_sd and isinstance(sup_sd["state_dict"], dict):
+            sup_sd = sup_sd["state_dict"]
+        if isinstance(sup_sd, dict) and any(k.startswith("sup_heads.") for k in sup_sd.keys()):
+            sup_sd = {k[len("sup_heads."):]: v for k, v in sup_sd.items()}
+        tasks_auto, in_dim_auto = _infer_tasks_and_in_dim_from_sup_state(sup_sd)
+        if (tasks_auto is None) and args.classes_json:
+            with open(args.classes_json, "r", encoding="utf-8") as f:
+                cj = json.load(f)
+            if isinstance(cj, dict) and cj:
+                tasks_auto = {str(t): len(v) for t, v in cj.items() if isinstance(v, (list, tuple))}
+        if tasks_auto is None:
+            raise RuntimeError("Impossible d'inférer les tâches depuis SupHeads en mode fusion.")
+        if in_dim_auto is None:
+            in_dim_auto = fusion_dim
+        if int(in_dim_auto) != int(fusion_dim):
+            print(f"[Fusion/SupHeads] input_dim du checkpoint={int(in_dim_auto)} différente de fusion_dim={int(fusion_dim)}. Utilisation de la dimension du checkpoint.")
+        Sup = SupHeads(tasks_auto, int(in_dim_auto), token_mode="flat").to(device)
+        missing, unexpected = Sup.load_state_dict(sup_sd, strict=False)
+        if missing:
+            print(f"[WARN] SupHeads(fusion): missing keys ({len(missing)})")
+        if unexpected:
+            print(f"[WARN] SupHeads(fusion): unexpected keys ({len(unexpected)})")
+        Sup.eval()
+        print(f"✓ SupHeads loaded (fusion) – {sup_path.name} | tasks={list(tasks_auto.keys())} | in_dim={int(in_dim_auto)}")
 
     # DataLoader de test (gère --data_json / --data et renvoie ImageFolder si --data)
     loader, dataset, dataset_type = build_test_dataloader(args, cfg)
@@ -1382,7 +1577,63 @@ def main() -> None:
 
     composite = None
     if Sup is not None:
-        if args.feature_mode == "sem_resnet50":
+        if str(args.sup_feat_source).lower() == "fusion":
+            class FusionWrap(nn.Module):
+                def __init__(self, G: nn.Module, sem_backbone: nn.Module, fusion_head: nn.Module, Sup: nn.Module, imagenet_norm: bool = True):
+                    super().__init__()
+                    self.G = G
+                    self.sem_backbone = sem_backbone
+                    self.fusion_head = fusion_head
+                    self.Sup = Sup
+                    self.tasks = list(Sup.tasks.keys()) if hasattr(Sup, "tasks") else ["__DEFAULT__"]
+                    self.feat_type = str(args.embed_type or "tok6")
+                    self.delta_weights = str(args.delta_weights or "")
+                    self.imagenet_norm = bool(imagenet_norm)
+                    self.register_buffer("_im_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
+                    self.register_buffer("_im_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
+
+                def _sem_features(self, imgs: torch.Tensor):
+                    x = imgs
+                    if x.size(1) == 1:
+                        x = x.repeat(1, 3, 1, 1)
+                    if self.imagenet_norm:
+                        x = (x + 1.0) * 0.5
+                        x = x.clamp(0.0, 1.0)
+                        x = (x - self._im_mean) / self._im_std
+                    out = self.sem_backbone(x)
+                    if isinstance(out, dict):
+                        feat = out.get("0", None)
+                        if feat is None:
+                            feat = next(iter(out.values()))
+                    else:
+                        feat = out
+                    return feat.mean(dim=(2, 3))
+
+                def sup_features(self, imgs: torch.Tensor):
+                    if hasattr(self.G, "sup_features"):
+                        style_feat = self.G.sup_features(imgs, self.feat_type, delta_weights=self.delta_weights)
+                    else:
+                        z, _ = self.G.encode_content(imgs)
+                        style_feat = F.adaptive_avg_pool2d(z, 1).flatten(1)
+                    sem_feat = self._sem_features(imgs)
+                    return self.fusion_head(style_feat, sem_feat)
+
+                def forward(self, imgs: torch.Tensor, *, return_task_embeddings: bool = False, return_embeddings: bool = False):
+                    feats = self.sup_features(imgs)
+                    if return_task_embeddings:
+                        try:
+                            _, embs = self.Sup(feats, return_task_embeddings=True)
+                        except TypeError:
+                            logits = self.Sup(feats)
+                            embs = {t: v for t, v in logits.items()} if isinstance(logits, dict) else {"__DEFAULT__": logits}
+                        return None, embs
+                    if return_embeddings:
+                        return feats
+                    return self.Sup(feats)
+
+            composite = FusionWrap(G, sem_backbone, fusion_head, Sup, imagenet_norm=bool(int(args.sem_imagenet_norm))).to(device)
+            print(f"✓ composite(fusion) prêt | tasks={composite.tasks} | feat_type={composite.feat_type} | imagenet_norm={bool(int(args.sem_imagenet_norm))}")
+        elif args.feature_mode == "sem_resnet50":
             # Wrapper léger : SupHeads consomme directement les features du backbone sémantique
             class _SemAdapter(nn.Module):
                 """Expose des features sémantiques via une API G.sup_features compatible."""
@@ -1451,8 +1702,8 @@ def main() -> None:
                 f"✓ composite prêt | tasks={composite.tasks} | "
                 f"feat_type={composite.feat_type} | Δw={composite.delta_weights}"
             )
-    elif args.mode in {"sup_predict", "backbone_camera"}:
-        raise RuntimeError("Les modes 'sup_predict' et 'backbone_camera' requièrent un SupHeads (--sup_ckpt).")
+    elif args.mode in {"sup_predict", "inference", "backbone_camera"}:
+        raise RuntimeError("Les modes 'sup_predict', 'inference' et 'backbone_camera' requièrent un SupHeads (--sup_ckpt).")
 
     def _iter_unique_named_parameters(module: nn.Module | None):
         if module is None or not isinstance(module, nn.Module):
@@ -1592,11 +1843,168 @@ def main() -> None:
             composite,
             device,
             cfg=cfg,
-            feature_mode=args.feature_mode,
+            feature_mode=("fusion" if str(args.sup_feat_source).lower()=="fusion" else args.feature_mode),
             task_classes=task_classes_cam,
             cam_index=args.camera_index,
             topk=args.camera_topk,
         )
+        return
+
+    # ========================= MODE: inference ===========================
+    if args.mode == "inference":
+        if Sup is None:
+            raise RuntimeError(
+                "Le mode 'inference' requiert un SupHeads (fournis via --sup_ckpt)."
+            )
+
+        out_dir = Path(args.out_dir or (wdir / "inference"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        tasks_list = list(Sup.tasks.keys()) if hasattr(Sup, "tasks") else ["__DEFAULT__"]
+
+        def _norm_key(s: str) -> str:
+            return str(s).lower().replace(" ", "").replace("_", "").replace("-", "")
+
+        ds_for_names = (
+            loader.dataset.dataset if isinstance(loader.dataset, Subset) else loader.dataset
+        )
+        ds_task_cls = getattr(ds_for_names, "task_classes", {}) or {}
+        nk_ds = {_norm_key(k): k for k in ds_task_cls.keys()}
+        safe_task_cls_global = {}
+        for t in tasks_list:
+            ds_key = nk_ds.get(_norm_key(t), None)
+            if ds_key is None and "__DEFAULT__" in ds_task_cls:
+                ds_key = "__DEFAULT__"
+            names = list(ds_task_cls.get(ds_key, [])) if ds_key is not None else []
+            if not names and getattr(args, "classes_json", None):
+                try:
+                    with open(args.classes_json, "r", encoding="utf-8") as f:
+                        cj = _normalize_task_classes_for_display(json.load(f))
+                    if t in cj:
+                        names = list(cj[t])
+                    elif "__DEFAULT__" in cj:
+                        names = list(cj["__DEFAULT__"])
+                except Exception:
+                    pass
+            if not names:
+                cam_tc = _load_task_classes_for_camera(args)
+                if t in cam_tc:
+                    names = list(cam_tc[t])
+                elif "__DEFAULT__" in cam_tc:
+                    names = list(cam_tc["__DEFAULT__"])
+            if not names:
+                names = [f"class {i}" for i in range(32)]
+            safe_task_cls_global[t] = names
+
+        def _sample_path_at_index(ds_obj, ds_idx: int):
+            try:
+                sample = ds_obj.samples[ds_idx]
+            except Exception:
+                return None
+            if isinstance(sample, dict):
+                return sample.get("path", None)
+            if isinstance(sample, (list, tuple)) and len(sample) >= 1:
+                return sample[0]
+            return None
+
+        records = []
+        flat_rows = []
+        idx_global = 0
+        for batch in loader:
+            if len(batch) == 3:
+                imgs, _raw, _paths = batch
+            else:
+                imgs, _raw = batch
+                _paths = None
+            imgs = imgs.to(device)
+
+            with torch.no_grad():
+                if str(args.sup_feat_source).lower() == "fusion":
+                    logits = composite(imgs)
+                else:
+                    if args.feature_mode == "sem_resnet50":
+                        feats = composite.sup_features(imgs)
+                    else:
+                        if hasattr(G, "sup_features"):
+                            feats = G.sup_features(
+                                imgs, args.embed_type, delta_weights=args.delta_weights
+                            )
+                        else:
+                            z, _ = G.encode_content(imgs)
+                            feats = F.adaptive_avg_pool2d(z, 1).flatten(1)
+                    logits = Sup(feats)
+                if not isinstance(logits, dict):
+                    logits = {"__DEFAULT__": logits}
+
+            B = imgs.size(0)
+            for i in range(B):
+                if isinstance(loader.dataset, Subset):
+                    img_index = loader.dataset.indices[idx_global + i]
+                    img_path = _sample_path_at_index(loader.dataset.dataset, img_index)
+                else:
+                    img_path = _sample_path_at_index(loader.dataset, idx_global + i)
+                if img_path is None and _paths is not None and i < len(_paths):
+                    img_path = _paths[i]
+
+                base = os.path.basename(str(img_path)) if img_path else f"sample_{idx_global + i:06d}"
+                image_id = os.path.splitext(base)[0]
+                rec = {
+                    "index": int(idx_global + i),
+                    "image": base,
+                    "image_id": image_id,
+                    "path": str(img_path) if img_path is not None else None,
+                    "predictions": {},
+                }
+                for t, out in logits.items():
+                    cur = out[i]
+                    probs = torch.softmax(cur, dim=0)
+                    pred_idx = int(torch.argmax(probs).item())
+                    pred_prob = float(probs[pred_idx].item())
+                    names = safe_task_cls_global.get(t, [])
+                    pred_label = names[pred_idx] if 0 <= pred_idx < len(names) else f"class {pred_idx}"
+                    rec["predictions"][t] = {
+                        "pred_idx": pred_idx,
+                        "pred_label": pred_label,
+                        "pred_prob": pred_prob,
+                    }
+                    flat_rows.append({
+                        "image": base,
+                        "image_id": image_id,
+                        "path": str(img_path) if img_path is not None else "",
+                        "task": t,
+                        "pred_idx": pred_idx,
+                        "pred_label": pred_label,
+                        "pred_prob": pred_prob,
+                    })
+                records.append(rec)
+            idx_global += B
+
+        report = {
+            "metadata": {
+                "mode": "inference",
+                "feature_mode": str(args.feature_mode),
+                "sup_feat_source": str(args.sup_feat_source),
+                "num_images": int(len(records)),
+                "tasks": tasks_list,
+            },
+            "predictions": records,
+        }
+
+        json_path = out_dir / str(args.inference_json_name)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        print(f"✓ prédictions sauvegardées → {json_path}")
+
+        if bool(args.inference_save_csv):
+            import csv
+            csv_path = out_dir / "inference_predictions.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["image", "image_id", "path", "task", "pred_idx", "pred_label", "pred_prob"])
+                writer.writeheader()
+                writer.writerows(flat_rows)
+            print(f"✓ CSV d'inférence sauvegardé → {csv_path}")
+
+        _maybe_write_param_count_report(out_dir)
         return
 
     # ========================= MODE: sup_predict ==========================
@@ -1671,19 +2079,22 @@ def main() -> None:
                 print("   [sup_predict] task mapping →", task_map)
 
             with torch.no_grad():
-                cam_feats_type = args.embed_type
-                if args.feature_mode == "sem_resnet50":
-                    # features sémantiques ResNet -> GAP
-                    feats = composite.sup_features(imgs)
+                if str(args.sup_feat_source).lower() == "fusion":
+                    logits = composite(imgs)
                 else:
-                    if hasattr(G, "sup_features"):
-                        feats = G.sup_features(
-                            imgs, cam_feats_type, delta_weights=args.delta_weights
-                        )
+                    cam_feats_type = args.embed_type
+                    if args.feature_mode == "sem_resnet50":
+                        # features sémantiques ResNet -> GAP
+                        feats = composite.sup_features(imgs)
                     else:
-                        z, _ = G.encode_content(imgs)
-                        feats = F.adaptive_avg_pool2d(z, 1).flatten(1)
-                logits = Sup(feats)
+                        if hasattr(G, "sup_features"):
+                            feats = G.sup_features(
+                                imgs, cam_feats_type, delta_weights=args.delta_weights
+                            )
+                        else:
+                            z, _ = G.encode_content(imgs)
+                            feats = F.adaptive_avg_pool2d(z, 1).flatten(1)
+                    logits = Sup(feats)
                 if not isinstance(logits, dict):
                     logits = {"__DEFAULT__": logits}
 

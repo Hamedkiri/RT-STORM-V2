@@ -310,7 +310,7 @@ def get_opts():
         "--sup_feat_source",
         type=str,
         default="generator",
-        choices=["generator", "sem_resnet50"],
+        choices=["generator", "sem_resnet50", "fusion"],
         help="Source des features pour SupHeads: generator (G.sup_features) ou sem_resnet50 (backbone ResNet sémantique + GAP).",
     )
     p.add_argument(
@@ -325,6 +325,10 @@ def get_opts():
         default=1,
         help="(0/1) Si sup_feat_source=sem_resnet50: convertir [-1,1]->[0,1] puis normaliser ImageNet (mean/std) avant ResNet.",
     )
+    p.add_argument("--fusion_dim", type=int, default=1024,
+                   help="Dimension commune style/sémantique avant gating vectoriel (sup_feat_source=fusion).")
+    p.add_argument("--fusion_dropout", type=float, default=0.1,
+                   help="Dropout léger de la tête de fusion style+sémantique.")
 
 
     # =========================================================================

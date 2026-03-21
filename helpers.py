@@ -14,6 +14,7 @@ from torch.utils.data import Subset
 from tqdm import tqdm
 
 from models.sup_heads import SupHeads
+from models.fusion_head import VectorGatedFusionHead
 from training.checkpoint import save_supheads_rich, save_sem_backbone_rich, save_checkpoint, save_state_json
 
 # Import des vraies perturbations / pertes texture (FFT + SWD)
@@ -242,7 +243,7 @@ def run_sup_freeze_mode(
     sem_backbone = None
     sem_out_channels = None
 
-    if sup_feat_source == "sem_resnet50":
+    if sup_feat_source in ("sem_resnet50", "fusion"):
         # Reuse the same robust builder as detection training
         from training.train_detection_transformer import _build_sem_resnet_backbone
 
@@ -286,11 +287,27 @@ def run_sup_freeze_mode(
             feat = feat.mean(dim=(2, 3))
             return feat
 
+    def _flatten_for_fusion(x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 4:
+            return x.mean(dim=(2, 3))
+        if x.dim() == 3:
+            return x.mean(dim=1)
+        return x
+
+    def _style_feats(G_sup, imgs: torch.Tensor, feat_type: str, δw_str: str | None) -> torch.Tensor:
+        return G_sup.sup_features(imgs, feat_type, delta_weights=δw_str)
+
     def _get_sup_feats(G_sup, imgs: torch.Tensor, feat_type: str, δw_str: str | None) -> torch.Tensor:
         if sup_feat_source == "sem_resnet50":
             return _sem_feats(imgs)
+        if sup_feat_source == "fusion":
+            style_feat = _flatten_for_fusion(_style_feats(G_sup, imgs, feat_type, δw_str))
+            sem_feat = _flatten_for_fusion(_sem_feats(imgs))
+            if not hasattr(G_sup, "sup_fusion") or G_sup.sup_fusion is None:
+                raise RuntimeError("sup_feat_source=fusion mais G_sup.sup_fusion n'est pas initialisé.")
+            return G_sup.sup_fusion(style_feat, sem_feat)
         # NOTE: for cont_tok/cont_tok_vit, δw_str should be None
-        return G_sup.sup_features(imgs, feat_type, delta_weights=δw_str)
+        return _style_feats(G_sup, imgs, feat_type, δw_str)
 
 
     def _parse_dw(dw: str, need: int) -> str:
@@ -328,6 +345,8 @@ def run_sup_freeze_mode(
         G_sup.eval()
         if hasattr(G_sup, "sup_heads") and G_sup.sup_heads is not None:
             G_sup.sup_heads.eval()
+        if hasattr(G_sup, "sup_fusion") and G_sup.sup_fusion is not None:
+            G_sup.sup_fusion.eval()
 
         agg = {t: {"ce": 0.0, "n": 0, "acc": 0.0, "P": 0.0, "R": 0.0, "H": 0.0} for t in tasks}
 
@@ -434,25 +453,38 @@ def run_sup_freeze_mode(
         else:
             tasks = {"default": int(getattr(opt, "sup_num_classes", 2))}
 
-        in_dim = int(sem_out_channels) if (sup_feat_source == "sem_resnet50") else G_sup.sup_in_dim_for(feat_type)
+        style_in_dim = int(G_sup.sup_in_dim_for(feat_type))
+        real_num_scales = int(1 + getattr(G_sup, "style_levels", 5))
 
-        # token_mode en fonction du type de features
         if sup_feat_source == "sem_resnet50":
+            in_dim = int(sem_out_channels)
             token_mode = "flat"
+            G_sup.sup_fusion = None
+        elif sup_feat_source == "fusion":
+            fusion_dim = int(getattr(opt, "fusion_dim", 1024))
+            in_dim = fusion_dim
+            token_mode = "flat"
+            G_sup.sup_fusion = VectorGatedFusionHead(
+                style_in_dim=style_in_dim,
+                sem_in_dim=int(sem_out_channels),
+                fusion_dim=fusion_dim,
+                dropout=float(getattr(opt, "fusion_dropout", 0.1)),
+            ).to(dev)
         else:
+            in_dim = style_in_dim
             token_mode = (
                 "multi6"
                 if feat_type in ("tok6",)
                 else "single"
                 if feat_type in ("tokG", "style_tok", "tok6_mean", "tok6_w")
-                # Pour cont_tok / cont_tok_vit, on reste en "flat" par défaut
                 else "flat"
             )
+            G_sup.sup_fusion = None
 
         G_sup.sup_heads = SupHeads(
             tasks,
             in_dim,
-            num_scales=6,
+            num_scales=real_num_scales,
             token_mode=token_mode,
             heads=int(getattr(opt, "sup_heads_nheads", 4)),
             dropout=float(getattr(opt, "sup_heads_dropout", 0.1)),
@@ -461,11 +493,20 @@ def run_sup_freeze_mode(
 
         for p in G_sup.parameters():
             p.requires_grad_(False)
+        if sem_backbone is not None:
+            for p in sem_backbone.parameters():
+                p.requires_grad_(False)
         for p in G_sup.sup_heads.parameters():
             p.requires_grad_(True)
 
+        trainable_params = list(G_sup.sup_heads.parameters())
+        if hasattr(G_sup, "sup_fusion") and G_sup.sup_fusion is not None:
+            for p in G_sup.sup_fusion.parameters():
+                p.requires_grad_(True)
+            trainable_params += list(G_sup.sup_fusion.parameters())
+
         opt_Sup = torch.optim.Adam(
-            G_sup.sup_heads.parameters(),
+            trainable_params,
             lr=float(getattr(opt, "sup_lr", 1e-4)),
             betas=(0.9, 0.999),
         )
@@ -485,17 +526,24 @@ def run_sup_freeze_mode(
         best_state = None
         best_epoch = -1
 
+        print(
+            f"✓ SupHeads (sup_freeze) prêtes | source={sup_feat_source} | feat_type={feat_type} | "
+            f"in_dim={getattr(G_sup.sup_heads, 'in_dim', None)} | token_mode={getattr(G_sup.sup_heads, 'token_mode', None)} | "
+            f"fusion_dim={getattr(getattr(G_sup, 'sup_fusion', None), 'fusion_dim', 'NA')}"
+        )
         if writer:
             writer.add_text(
                 "C/run",
                 f"sup_freeze — stage {stage} — train on fold {tr_fold} "
-                f"(feat_type={feat_type}, delta_w_str={δw_str})",
+                f"(sup_feat_source={sup_feat_source}, feat_type={feat_type}, delta_w_str={δw_str}, fusion_dim={getattr(getattr(G_sup, 'sup_fusion', None), 'fusion_dim', 'NA')})",
                 global_step,
             )
 
         for epoch in range(opt.epochs):
             epoch_meters = new_epoch_meters()
             G_sup.sup_heads.train(True)
+            if hasattr(G_sup, "sup_fusion") and G_sup.sup_fusion is not None:
+                G_sup.sup_fusion.train(True)
 
             pbar = tqdm(
                 train_loader,
@@ -584,17 +632,26 @@ def run_sup_freeze_mode(
                         sup_dir / f"SupHeads_best_fold{tr_fold}.pth",
                         safe_write=True,
                     )
+                    if hasattr(G_sup, "sup_fusion") and G_sup.sup_fusion is not None:
+                        torch.save({
+                            "state_dict": G_sup.sup_fusion.state_dict(),
+                            "style_in_dim": getattr(G_sup.sup_fusion, "style_in_dim", None),
+                            "sem_in_dim": getattr(G_sup.sup_fusion, "sem_in_dim", None),
+                            "fusion_dim": getattr(G_sup.sup_fusion, "fusion_dim", None),
+                        }, sup_dir / f"FusionHead_best_fold{tr_fold}.pth")
                     (sup_dir / "best_meta.json").write_text(
                         json.dumps(
                             {
                                 "best_epoch": best_epoch,
                                 "best_mean_CE": float(best_val),
                                 "feat_type": feat_type,
+                                "sup_feat_source": sup_feat_source,
                                 "delta_weights": δw_str,
                                 "token_mode": getattr(
                                     G_sup.sup_heads, "token_mode", "multi6"
                                 ),
                                 "in_dim": getattr(G_sup.sup_heads, "in_dim", None),
+                                "fusion_dim": getattr(getattr(G_sup, "sup_fusion", None), "fusion_dim", None),
                                 "tasks": getattr(G_sup.sup_heads, "tasks", {}),
                             },
                             indent=2,
@@ -634,9 +691,16 @@ def run_sup_freeze_mode(
                     opt_DB,
                     global_step,
                     Path(opt.save_dir),
-                    sem_model=(sem_backbone if sup_feat_source == "sem_resnet50" else None),
+                    sem_model=(sem_backbone if sup_feat_source in ("sem_resnet50", "fusion") else None),
                     sem_filename="SemBackbone",
                 )
+                if hasattr(G_sup, "sup_fusion") and G_sup.sup_fusion is not None:
+                    torch.save({
+                        "state_dict": G_sup.sup_fusion.state_dict(),
+                        "style_in_dim": getattr(G_sup.sup_fusion, "style_in_dim", None),
+                        "sem_in_dim": getattr(G_sup.sup_fusion, "sem_in_dim", None),
+                        "fusion_dim": getattr(G_sup.sup_fusion, "fusion_dim", None),
+                    }, sup_dir / f"FusionHead_last_fold{tr_fold}.pth")
                 save_state_json(epoch, global_step, opt, Path(opt.save_dir))
                 save_supheads_rich(
                     G_sup.sup_heads,
@@ -657,6 +721,13 @@ def run_sup_freeze_mode(
             safe_write=True,
         )
 
+        if hasattr(G_sup, "sup_fusion") and G_sup.sup_fusion is not None:
+            torch.save({
+                "state_dict": G_sup.sup_fusion.state_dict(),
+                "style_in_dim": getattr(G_sup.sup_fusion, "style_in_dim", None),
+                "sem_in_dim": getattr(G_sup.sup_fusion, "sem_in_dim", None),
+                "fusion_dim": getattr(G_sup.sup_fusion, "fusion_dim", None),
+            }, sup_dir / f"FusionHead_last_fold{tr_fold}.pth")
         (sup_dir / "fold_summary.json").write_text(
             json.dumps(
                 {
@@ -665,9 +736,11 @@ def run_sup_freeze_mode(
                     "best_mean_CE": float(best_val),
                     "epochs": int(opt.epochs),
                     "feat_type": feat_type,
+                    "sup_feat_source": sup_feat_source,
                     "delta_weights": δw_str,
                     "token_mode": getattr(G_sup.sup_heads, "token_mode", "multi6"),
                     "in_dim": getattr(G_sup.sup_heads, "in_dim", None),
+                    "fusion_dim": getattr(getattr(G_sup, "sup_fusion", None), "fusion_dim", None),
                     "tasks": getattr(G_sup.sup_heads, "tasks", {}),
                 },
                 indent=2,

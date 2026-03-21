@@ -243,6 +243,8 @@ class ImageNetCLSLDataset(Dataset):
         self.images_root = str(images_root)
         self.split = self._normalize_split(split, self.images_root)
         self.ann_root = self._normalize_ann_root(ann_root, self.split)
+        if self.ann_root is None:
+            self.ann_root = self._auto_detect_ann_root(self.images_root, self.split)
         self.imagesets_root = str(imagesets_root) if imagesets_root else None
         self.synset_mapping_file = str(synset_mapping_file) if synset_mapping_file else None
         self.val_solution_csv = str(val_solution_csv) if val_solution_csv else None
@@ -333,6 +335,45 @@ class ImageNetCLSLDataset(Dataset):
         if ap.name.lower() == split:
             ap = ap.parent
         return str(ap)
+
+    def _auto_detect_ann_root(self, images_root: str, split: str) -> str | None:
+        """Try to infer ILSVRC annotation root from the images_root path.
+
+        Examples:
+          .../ILSVRC/Data/CLS-LOC/val  -> .../ILSVRC/Annotations/CLS-LOC
+          .../ILSVRC/Data/CLS-LOC      -> .../ILSVRC/Annotations/CLS-LOC
+        """
+        try:
+            rp = Path(images_root).resolve()
+        except Exception:
+            rp = Path(images_root)
+
+        candidates = []
+        parts = list(rp.parts)
+        for i in range(len(parts) - 1):
+            if parts[i] == 'Data' and i + 1 < len(parts) and parts[i + 1] == 'CLS-LOC':
+                base = Path(*parts[:i])
+                candidates.append(base / 'Annotations' / 'CLS-LOC')
+
+        # direct relatives from common layouts
+        candidates.extend([
+            rp.parent.parent.parent / 'Annotations' / 'CLS-LOC',
+            rp.parent.parent / 'Annotations' / 'CLS-LOC',
+            rp.parent / 'Annotations' / 'CLS-LOC',
+            rp / 'Annotations' / 'CLS-LOC',
+        ])
+
+        seen = set()
+        for cand in candidates:
+            sc = str(cand)
+            if sc in seen:
+                continue
+            seen.add(sc)
+            if cand.exists():
+                split_dir = cand / split
+                if split_dir.exists() or any(cand.glob('*.xml')):
+                    return str(cand)
+        return None
 
     def _build_synset_to_idx(self, rp: Path) -> tuple[Dict[str, int], Dict[str, str]]:
         names: Dict[str, str] = {}
@@ -463,6 +504,8 @@ class ImageNetCLSLDataset(Dataset):
     def _build_val_samples(self, rp: Path, ids: list[str] | None):
         val_root = (rp / 'val') if (rp / 'val').exists() else rp
         ann_root = (Path(self.ann_root) / 'val') if self.ann_root else None
+        if ann_root is None:
+            print('[ImageNetCLSLDataset][WARN] No annotation root available for val split; labels may be missing (-1).')
 
         # determine candidate image files
         img_files = sorted([p for p in val_root.iterdir() if p.is_file() and is_image_path(p)])
