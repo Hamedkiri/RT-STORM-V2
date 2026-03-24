@@ -18,3 +18,4 @@ SemMoCo_epoch93.pt
 /training/__pycache__
 /runs/Cancer_Melanoma_classification_tok_6_
 /runs/Cancer_Melanoma_classification_tok_6_250
+/FineTuning_On_Imagenet

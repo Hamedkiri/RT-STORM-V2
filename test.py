@@ -2344,7 +2344,7 @@ def main() -> None:
             submission_path = None
 
             if valid_gt == 0:
-                acc = prec = rec = f1 = 0.0
+                acc = top1_acc = prec = rec = f1 = 0.0
                 cm = None
                 submission_path = _write_submission_csv(t, y_pred, names)
                 print(f"[{t}] no GT labels → métriques supervisées ignorées")
@@ -2352,6 +2352,7 @@ def main() -> None:
                 yt = y_true[mask]
                 yp = y_pred[mask]
                 acc = float((yp == yt).mean()) if yt.size > 0 else 0.0
+                top1_acc = acc
                 if _SK_OK and yt.size > 0:
                     prec = float(
                         precision_score(
@@ -2389,6 +2390,7 @@ def main() -> None:
 
             metrics[t] = {
                 "accuracy": acc,
+                "top1_accuracy": top1_acc,
                 "precision": prec,
                 "recall": rec,
                 "f1": f1,
@@ -2405,12 +2407,13 @@ def main() -> None:
             if submission_path is not None:
                 metrics[t]["submission_csv"] = str(submission_path)
             print(
-                f"[{t}] acc={acc:.4f}  prec={prec:.4f}  rec={rec:.4f}  f1={f1:.4f}"
+                f"[{t}] acc={acc:.4f}  top1={top1_acc:.4f}  prec={prec:.4f}  rec={rec:.4f}  f1={f1:.4f}"
             )
 
         vals = list(metrics.values())
         avg = {
             "accuracy": float(np.mean([v["accuracy"] for v in vals] or [0.0])),
+            "top1_accuracy": float(np.mean([v["top1_accuracy"] for v in vals] or [0.0])),
             "precision": float(np.mean([v["precision"] for v in vals] or [0.0])),
             "recall": float(np.mean([v["recall"] for v in vals] or [0.0])),
             "f1": float(np.mean([v["f1"] for v in vals] or [0.0])),
@@ -2420,7 +2423,7 @@ def main() -> None:
         }
         metrics["average"] = avg
         print(
-            f"[AVERAGE] acc={avg['accuracy']:.4f}  prec={avg['precision']:.4f}  "
+            f"[AVERAGE] acc={avg['accuracy']:.4f}  top1={avg['top1_accuracy']:.4f}  prec={avg['precision']:.4f}  "
             f"rec={avg['recall']:.4f}  f1={avg['f1']:.4f}"
         )
 
