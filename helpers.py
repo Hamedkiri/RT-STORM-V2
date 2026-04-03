@@ -221,13 +221,18 @@ def run_sup_freeze_mode(
         writer=None,
         tb_freq_C: int = 50,
         global_step_start: int = 0,
+        train_backbones: bool = False,
+        save_subdir: str = "sup_freeze",
+        mode_label: str = "sup_freeze",
 ):
     """
-    Mode 'sup_freeze' :
-      - G_A, G_B, D_A, D_B sont gelés (no grad).
-      - On entraîne uniquement des SupHeads par fold.
+    Mode supervisé de type sup_freeze :
+      - Les discriminateurs restent gelés.
+      - Les backbones (générateur utilisé et/ou backbone sémantique)
+        peuvent être gelés (sup_freeze) ou dégelés (mode intermédiaire).
+      - On entraîne SupHeads par fold, avec éventuellement FusionHead et les backbones.
       - Pour chaque fold "train", on évalue sur tous les folds, et on sauvegarde
-        des SupHeads 'best' et 'last' dans save_dir/sup_freeze/fold_xx/.
+        les checkpoints dans save_dir/<save_subdir>/fold_xx/.
 
     Gestion des sup_feat_type :
       - 'tok6', 'tok6_w' : on utilise des delta_weights de longueur 6
@@ -256,9 +261,9 @@ def run_sup_freeze_mode(
             verbose=bool(int(getattr(opt, "sem_pretrained_verbose", 1))),
         )
         sem_backbone = sem_backbone.to(dev)
-        sem_backbone.eval()
+        sem_backbone.train(bool(train_backbones))
         for p in sem_backbone.parameters():
-            p.requires_grad_(False)
+            p.requires_grad_(bool(train_backbones))
 
         # ImageNet normalization constants
         _im_mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
@@ -321,6 +326,41 @@ def run_sup_freeze_mode(
         else:
             vals = vals[:need]
         return ",".join(str(v) for v in vals)
+
+    def _save_finetuned_extractors(target_dir: Path, tag: str, epoch_num: int | None = None):
+        """Save the actual feature extractors that were optimized in supervised mode.
+        In sup_unfreeze, these are the weights that must be reused at test time.
+        """
+        target_dir.mkdir(parents=True, exist_ok=True)
+        payload_common = {
+            "mode": mode_label,
+            "sup_feat_source": sup_feat_source,
+            "epoch": epoch_num,
+            "train_backbones": bool(train_backbones),
+        }
+
+        # Semantic backbone finetuned by the supervised objective.
+        if train_backbones and sup_feat_source in ("sem_resnet50", "fusion") and sem_backbone is not None:
+            sem_name = f"SemBackbone_{tag}.pt"
+            torch.save({
+                "state_dict": sem_backbone.state_dict(),
+                **payload_common,
+            }, target_dir / sem_name)
+
+        # Style/generator branch finetuned by the supervised objective.
+        if train_backbones and sup_feat_source in ("generator", "fusion"):
+            if G_A is not None:
+                torch.save({
+                    "state_dict": G_A.state_dict(),
+                    "branch": "G_A",
+                    **payload_common,
+                }, target_dir / f"G_A_{tag}.pt")
+            if G_B is not None:
+                torch.save({
+                    "state_dict": G_B.state_dict(),
+                    "branch": "G_B",
+                    **payload_common,
+                }, target_dir / f"G_B_{tag}.pt")
 
     @torch.no_grad()
     def _sup_metrics(out, y_true, num_classes):
@@ -401,20 +441,48 @@ def run_sup_freeze_mode(
         return agg
 
     global_step = global_step_start
+    grad_debug_done = False
 
-    # G/D gelés
-    freeze(G_A)
-    freeze(G_B)
+    def _first_non_head_grad_norm(mod, skip_prefixes=("sup_heads", "sup_fusion")):
+        if mod is None:
+            return None
+        for name, p in mod.named_parameters():
+            if any(name.startswith(pref) for pref in skip_prefixes):
+                continue
+            if p.requires_grad and p.grad is not None:
+                return float(p.grad.detach().abs().mean().item())
+        return None
+
+    # Discriminateurs toujours gelés.
     freeze(D_A)
     freeze(D_B)
-    G_A.eval()
-    G_B.eval()
     D_A.eval()
     D_B.eval()
 
     # Quel générateur sert de backbone de features sup ?
     sup_from = getattr(opt, "sup_from", "GB").upper()
     G_sup = G_B if sup_from == "GB" else G_A
+    G_other = G_A if G_sup is G_B else G_B
+
+    # Mode end-to-end explicite : seuls les backbones réellement utilisés restent entraînables.
+    if train_backbones:
+        # generator branch used by style-only and fusion
+        if sup_feat_source in ("generator", "fusion"):
+            for p in G_sup.parameters():
+                p.requires_grad_(True)
+            G_sup.train()
+        else:
+            freeze(G_sup)
+            G_sup.eval()
+
+        # unused generator branch stays frozen
+        freeze(G_other)
+        G_other.eval()
+    else:
+        freeze(G_A)
+        freeze(G_B)
+        G_A.eval()
+        G_B.eval()
 
     # ------------------------------------------------------------------
     #  Gestion explicite de sup_feat_type + delta_weights
@@ -491,11 +559,31 @@ def run_sup_freeze_mode(
             mlp_mult=int(getattr(opt, "sup_heads_mlp_mult", 2)),
         ).to(dev)
 
-        for p in G_sup.parameters():
-            p.requires_grad_(False)
-        if sem_backbone is not None:
-            for p in sem_backbone.parameters():
+        if train_backbones:
+            # explicit end-to-end training only for the backbones actually used by the supervised path
+            if sup_feat_source in ("generator", "fusion"):
+                for p in G_sup.parameters():
+                    p.requires_grad_(True)
+                G_sup.train(True)
+            else:
+                for p in G_sup.parameters():
+                    p.requires_grad_(False)
+                G_sup.eval()
+
+            if sem_backbone is not None:
+                use_sem = sup_feat_source in ("sem_resnet50", "fusion")
+                for p in sem_backbone.parameters():
+                    p.requires_grad_(bool(use_sem))
+                sem_backbone.train(bool(use_sem))
+        else:
+            for p in G_sup.parameters():
                 p.requires_grad_(False)
+            G_sup.eval()
+            if sem_backbone is not None:
+                for p in sem_backbone.parameters():
+                    p.requires_grad_(False)
+                sem_backbone.eval()
+
         for p in G_sup.sup_heads.parameters():
             p.requires_grad_(True)
 
@@ -505,11 +593,55 @@ def run_sup_freeze_mode(
                 p.requires_grad_(True)
             trainable_params += list(G_sup.sup_fusion.parameters())
 
+        if train_backbones:
+            back_params = []
+            seen = set(id(p) for p in trainable_params)
+            for p in G_sup.parameters():
+                if p.requires_grad and id(p) not in seen:
+                    back_params.append(p)
+                    seen.add(id(p))
+            if sem_backbone is not None:
+                for p in sem_backbone.parameters():
+                    if p.requires_grad and id(p) not in seen:
+                        back_params.append(p)
+                        seen.add(id(p))
+            trainable_params += back_params
+
+        # --- explicit optimizer coverage report for end-to-end sup_unfreeze ---
+        def _count_params(params):
+            uniq = {}
+            for p in params:
+                uniq[id(p)] = p
+            return int(sum(p.numel() for p in uniq.values()))
+
+        def _count_mod(mod, include=True):
+            if mod is None or not include:
+                return 0
+            return int(sum(p.numel() for p in mod.parameters() if p.requires_grad))
+
         opt_Sup = torch.optim.Adam(
             trainable_params,
             lr=float(getattr(opt, "sup_lr", 1e-4)),
             betas=(0.9, 0.999),
         )
+
+        if train_backbones:
+            n_opt = _count_params(trainable_params)
+            n_sup = _count_mod(G_sup.sup_heads, True)
+            n_fus = _count_mod(getattr(G_sup, "sup_fusion", None), getattr(G_sup, "sup_fusion", None) is not None)
+            n_gen = _count_mod(G_sup, sup_feat_source in ("generator", "fusion"))
+            n_sem = _count_mod(sem_backbone, sup_feat_source in ("sem_resnet50", "fusion"))
+            print(
+                f"✓ [{mode_label}] end-to-end optimizer prêt | "
+                f"opt_params={n_opt} | sup_heads={n_sup} | fusion={n_fus} | "
+                f"generator={n_gen} | sem_backbone={n_sem}"
+            )
+            if sup_feat_source in ("generator", "fusion") and n_gen == 0:
+                raise RuntimeError(f"{mode_label}: generator backbone should be trainable but has 0 optimizer params.")
+            if sup_feat_source in ("sem_resnet50", "fusion") and n_sem == 0:
+                raise RuntimeError(f"{mode_label}: semantic backbone should be trainable but has 0 optimizer params.")
+            if n_opt <= (n_sup + n_fus):
+                print(f"[WARN] [{mode_label}] optimizer seems to include only heads/fusion. Check backbone trainability.")
         return tasks, opt_Sup
 
     for stage, tr_fold in enumerate(folds_order):
@@ -519,7 +651,7 @@ def run_sup_freeze_mode(
         train_loader = loaders[tr_fold]
         val_loaders = loaders
 
-        sup_dir = Path(opt.save_dir) / "sup_freeze" / f"fold_{tr_fold:02d}"
+        sup_dir = Path(opt.save_dir) / str(save_subdir) / f"fold_{tr_fold:02d}"
         sup_dir.mkdir(parents=True, exist_ok=True)
 
         best_val = float("inf")
@@ -527,27 +659,35 @@ def run_sup_freeze_mode(
         best_epoch = -1
 
         print(
-            f"✓ SupHeads (sup_freeze) prêtes | source={sup_feat_source} | feat_type={feat_type} | "
+            f"✓ SupHeads (supervised mode) prêtes | source={sup_feat_source} | feat_type={feat_type} | "
             f"in_dim={getattr(G_sup.sup_heads, 'in_dim', None)} | token_mode={getattr(G_sup.sup_heads, 'token_mode', None)} | "
             f"fusion_dim={getattr(getattr(G_sup, 'sup_fusion', None), 'fusion_dim', 'NA')}"
         )
         if writer:
             writer.add_text(
                 "C/run",
-                f"sup_freeze — stage {stage} — train on fold {tr_fold} "
-                f"(sup_feat_source={sup_feat_source}, feat_type={feat_type}, delta_w_str={δw_str}, fusion_dim={getattr(getattr(G_sup, 'sup_fusion', None), 'fusion_dim', 'NA')})",
+                f"{mode_label} — stage {stage} — train on fold {tr_fold} "
+                f"(sup_feat_source={sup_feat_source}, feat_type={feat_type}, delta_w_str={δw_str}, fusion_dim={getattr(getattr(G_sup, 'sup_fusion', None), 'fusion_dim', 'NA')}, train_backbones={train_backbones})",
                 global_step,
             )
 
         for epoch in range(opt.epochs):
             epoch_meters = new_epoch_meters()
             G_sup.sup_heads.train(True)
+            if train_backbones:
+                G_sup.train(True)
+                if sem_backbone is not None:
+                    sem_backbone.train(True)
+            else:
+                G_sup.eval()
+                if sem_backbone is not None:
+                    sem_backbone.eval()
             if hasattr(G_sup, "sup_fusion") and G_sup.sup_fusion is not None:
                 G_sup.sup_fusion.train(True)
 
             pbar = tqdm(
                 train_loader,
-                desc=f"C[sup_freeze]-fold{tr_fold} ep{epoch + 1}/{opt.epochs}",
+                desc=f"C[{mode_label}]-fold{tr_fold} ep{epoch + 1}/{opt.epochs}",
                 ncols=160,
                 leave=False,
             )
@@ -587,7 +727,29 @@ def run_sup_freeze_mode(
                 if terms:
                     loss = torch.stack(terms).sum()
                     opt_Sup.zero_grad(set_to_none=True)
-                    (λ_sup * loss).backward()
+                    scaled_loss = (λ_sup * loss)
+                    scaled_loss.backward()
+
+                    if train_backbones and not grad_debug_done:
+                        feat_has_grad = bool(getattr(feats, "requires_grad", False))
+                        gen_grad = _first_non_head_grad_norm(G_sup) if sup_feat_source in ("generator", "fusion") else None
+                        sem_grad = _first_non_head_grad_norm(sem_backbone, skip_prefixes=()) if sup_feat_source in ("sem_resnet50", "fusion") else None
+                        sup_grad = _first_non_head_grad_norm(G_sup.sup_heads, skip_prefixes=())
+                        fus_grad = _first_non_head_grad_norm(getattr(G_sup, "sup_fusion", None), skip_prefixes=()) if hasattr(G_sup, "sup_fusion") else None
+                        print(
+                            f"✓ [{mode_label}] gradient sanity | feats.requires_grad={feat_has_grad} | "
+                            f"gen_grad={gen_grad} | sem_grad={sem_grad} | sup_grad={sup_grad} | fusion_grad={fus_grad}"
+                        )
+                        if not feat_has_grad:
+                            raise RuntimeError(f"{mode_label}: supervised features do not require grad; end-to-end path is broken.")
+                        if sup_feat_source in ("generator", "fusion") and gen_grad is None:
+                            raise RuntimeError(f"{mode_label}: no generator backbone gradient detected on first backward.")
+                        if sup_feat_source in ("sem_resnet50", "fusion") and sem_grad is None:
+                            raise RuntimeError(f"{mode_label}: no semantic backbone gradient detected on first backward.")
+                        if sup_grad is None:
+                            raise RuntimeError(f"{mode_label}: no SupHeads gradient detected on first backward.")
+                        grad_debug_done = True
+
                     opt_Sup.step()
 
                     epoch_meters["C"]["CE"].add(float(loss.item()))
@@ -639,6 +801,7 @@ def run_sup_freeze_mode(
                             "sem_in_dim": getattr(G_sup.sup_fusion, "sem_in_dim", None),
                             "fusion_dim": getattr(G_sup.sup_fusion, "fusion_dim", None),
                         }, sup_dir / f"FusionHead_best_fold{tr_fold}.pth")
+                    _save_finetuned_extractors(sup_dir, f"best_fold{tr_fold}", epoch + 1)
                     (sup_dir / "best_meta.json").write_text(
                         json.dumps(
                             {
@@ -653,6 +816,8 @@ def run_sup_freeze_mode(
                                 "in_dim": getattr(G_sup.sup_heads, "in_dim", None),
                                 "fusion_dim": getattr(getattr(G_sup, "sup_fusion", None), "fusion_dim", None),
                                 "tasks": getattr(G_sup.sup_heads, "tasks", {}),
+                                "train_backbones": bool(train_backbones),
+                                "finetuned_extractors_saved": bool(train_backbones),
                             },
                             indent=2,
                         )
@@ -701,6 +866,8 @@ def run_sup_freeze_mode(
                         "sem_in_dim": getattr(G_sup.sup_fusion, "sem_in_dim", None),
                         "fusion_dim": getattr(G_sup.sup_fusion, "fusion_dim", None),
                     }, sup_dir / f"FusionHead_last_fold{tr_fold}.pth")
+                _save_finetuned_extractors(sup_dir, f"epoch{epoch + 1}", epoch + 1)
+                _save_finetuned_extractors(sup_dir, f"last_fold{tr_fold}", epoch + 1)
                 save_state_json(epoch, global_step, opt, Path(opt.save_dir))
                 save_supheads_rich(
                     G_sup.sup_heads,
@@ -728,6 +895,7 @@ def run_sup_freeze_mode(
                 "sem_in_dim": getattr(G_sup.sup_fusion, "sem_in_dim", None),
                 "fusion_dim": getattr(G_sup.sup_fusion, "fusion_dim", None),
             }, sup_dir / f"FusionHead_last_fold{tr_fold}.pth")
+        _save_finetuned_extractors(sup_dir, f"last_fold{tr_fold}", best_epoch if best_epoch > 0 else opt.epochs)
         (sup_dir / "fold_summary.json").write_text(
             json.dumps(
                 {
@@ -3275,7 +3443,7 @@ def run_sup_freeze_sem_only(
         else:
             sup_heads.train(True)
 
-        sup_dir = Path(opt.save_dir) / "sup_freeze" / f"fold_{tr_fold:02d}"
+        sup_dir = Path(opt.save_dir) / str(save_subdir) / f"fold_{tr_fold:02d}"
         sup_dir.mkdir(parents=True, exist_ok=True)
 
         best_val = float("inf")

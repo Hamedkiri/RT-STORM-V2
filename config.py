@@ -5,7 +5,7 @@ def get_opts():
     """
     Hyper-paramètres pour :
       - Double-GAN (G_A, D_A, G_B, D_B) + phases A/B + option C supervisée (SupHeads)
-      - modes : auto / hybrid / sup_freeze
+      - modes : auto / hybrid / sup_unfreeze / sup_freeze
       - classification tokens : cls_tokens
       - détection : detect_transformer (fasterrcnn/detr/vitdet/fastrnn)
 
@@ -47,7 +47,7 @@ def get_opts():
     # =========================================================================
     p.add_argument("--data", type=str, default=None, help="Dossier images (ImageFolder) pour auto/hybrid/cls_tokens.")
 
-    # ImageNet (ILSVRC 2012 CLS-LOC) support for supervised finetuning (sup_freeze / hybrid)
+    # ImageNet (ILSVRC 2012 CLS-LOC) support for supervised finetuning (sup_freeze / sup_unfreeze / hybrid)
     # - Keep using --data for images root.
     #   * train layout: --data .../ILSVRC/Data/CLS-LOC/train  (subfolders = synsets)
     #   * val layout  : --data .../ILSVRC/Data/CLS-LOC/val    (flat images)
@@ -79,7 +79,7 @@ def get_opts():
 
     p.add_argument("--batch_size", type=int, default=8, help="Taille de batch globale.")
     p.add_argument("--k_folds", type=int, default=2, help="Nombre de folds pour alternance A/B (>=2).")
-    p.add_argument("--epochs", type=int, default=25, help="Nb époques (auto/hybrid/sup_freeze/cls_tokens).")
+    p.add_argument("--epochs", type=int, default=25, help="Nb époques (auto/hybrid/sup_unfreeze/sup_freeze/cls_tokens).")
     p.add_argument("--crop_size", type=int, default=256, help="Taille d'entrée (si utilisée dans transforms).")
 
     # When deepening the UNet / style pyramid, repeated stride=2 downs can lead to 1x1 feature maps,
@@ -116,7 +116,7 @@ def get_opts():
         "--mode",
         type=str,
         default="auto",
-        choices=["auto", "hybrid", "sup_freeze", "cls_tokens", "detect_transformer"],
+        choices=["auto", "hybrid", "sup_unfreeze", "sup_freeze", "cls_tokens", "detect_transformer"],
         help=(
             "Mode d'entraînement :\n"
             "  - auto : A+B (self-supervised style + JEPA)\n"
@@ -305,7 +305,7 @@ def get_opts():
     p.add_argument("--delta_weights", type=str, default="1,1,1,1,1", help="Poids échelles. Pour tokL_w: (L+1) poids 'wG,wL,...,w1'. Pour tok+delta/mgap: 5 poids 'w5..w1'.")
     p.add_argument("--sup_tasks_json", type=str, default=None, help="JSON tâches: {task: n_classes ou [names]}")
 
-    # Source des features pour SupHeads (utile en sup_freeze/hybrid)
+    # Source des features pour SupHeads (utile en sup_freeze/sup_unfreeze/hybrid)
     p.add_argument(
         "--sup_feat_source",
         type=str,

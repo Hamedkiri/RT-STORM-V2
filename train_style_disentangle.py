@@ -348,6 +348,7 @@ def train_alternating(opt):
     mode_help = {
         "auto": "A+B (self-supervised: style + JEPA)",
         "sup_freeze": "C seul (supervisé), G&D gelés",
+        "sup_unfreeze": "C seul (supervisé), backbones dégelés",
         "hybrid": "A+B puis C (supervisé)",
         "cls_tokens": "Classification via tokens multi-échelles",
         "detect_transformer": "Entraînement détection (head: fasterrcnn/detr/vitdet/fastrnn)",
@@ -368,7 +369,7 @@ def train_alternating(opt):
         return train_detection_transformer(opt, dev)
 
     # =====================================================================================
-    #  MODES: auto / hybrid / sup_freeze / cls_tokens  → pipeline style + JEPA
+    #  MODES: auto / hybrid / sup_freeze / sup_unfreeze / cls_tokens  → pipeline style + JEPA
     # =====================================================================================
 
     loaders = build_dataloader(opt)
@@ -1040,6 +1041,30 @@ def train_alternating(opt):
             writer=writer,
             tb_freq_C=tb_freq_C,
             global_step_start=state["global_step"],
+            train_backbones=False,
+            save_subdir="sup_freeze",
+            mode_label="sup_freeze",
+        )
+        if writer:
+            writer.flush()
+            writer.close()
+        return
+
+    if mode == "sup_unfreeze":
+        run_sup_freeze_mode(
+            opt=opt,
+            loaders=loaders,
+            G_A=G_A, G_B=G_B,
+            D_A=D_A, D_B=D_B,
+            opt_GA=opt_GA, opt_DA=opt_DA,
+            opt_GB=opt_GB, opt_DB=opt_DB,
+            dev=dev,
+            writer=writer,
+            tb_freq_C=tb_freq_C,
+            global_step_start=state["global_step"],
+            train_backbones=True,
+            save_subdir="sup_unfreeze",
+            mode_label="sup_unfreeze",
         )
         if writer:
             writer.flush()

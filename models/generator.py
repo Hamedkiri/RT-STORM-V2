@@ -236,7 +236,9 @@ class UNetGenerator(nn.Module):
         return vals
 
     # robuste aux anciennes signatures du style-encoder
-    @torch.no_grad()
+    # IMPORTANT: do not disable grads here; sup_unfreeze relies on end-to-end
+    # backpropagation through style tokens/maps. Callers that want inference-only
+    # behaviour should wrap this method in torch.no_grad() externally.
     def _style_tokens_maps(self, img: torch.Tensor):
         maps = toks = tokG = None
         try:
