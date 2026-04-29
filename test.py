@@ -489,6 +489,7 @@ def main() -> None:
             "tok6", "tok6_mean", "tok6_w",
             "tokL", "tokL_mean", "tokL_w",
             "style_tok",
+            "mapG", "mapL", "mapL_mean", "mapL_w",
             "bot", "bot+tok",
             "tok+delta",
             "mgap", "mgap+tok",

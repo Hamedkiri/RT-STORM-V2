@@ -97,3 +97,35 @@ class TokenJEPA(nn.Module):
             "pred": P.detach(),
             "pred_raw": P
         }
+
+
+class MapJEPA(nn.Module):
+    """
+    JEPA spatial sur cartes de style m_i.
+    Entrées :
+      Ms : (B,C,H,W) carte student
+      Mt : (B,C,H,W) carte teacher
+      mask : (B,S) bool avec S=H*W, True si position masquée
+    La carte est convertie en séquence spatiale (B,S,C), puis traitée comme des tokens.
+    """
+    def __init__(self, S: int, C: int, *, hidden_mult: int = 2, heads: int = 4,
+                 use_norm: bool = True, var_lambda: float = 0.05, cov_lambda: float = 0.05):
+        super().__init__()
+        self.S = int(S)
+        self.C = int(C)
+        self.token_jepa = TokenJEPA(S=self.S, D=self.C, hidden_mult=hidden_mult, heads=heads,
+                                    use_norm=use_norm, var_lambda=var_lambda, cov_lambda=cov_lambda)
+
+    @staticmethod
+    def _map_to_seq(M: torch.Tensor) -> torch.Tensor:
+        assert M.dim() == 4
+        B, C, H, W = M.shape
+        return M.view(B, C, H * W).transpose(1, 2).contiguous()
+
+    def forward(self, Ms: torch.Tensor, Mt: torch.Tensor, mask: torch.Tensor, w: torch.Tensor | None = None):
+        Ts = self._map_to_seq(Ms)
+        Tt = self._map_to_seq(Mt)
+        loss, info = self.token_jepa(Ts, Tt, mask, w=w)
+        info["pred_map"] = info["pred"].transpose(1, 2).contiguous().view_as(Ms).detach()
+        info["pred_map_raw"] = info["pred_raw"].transpose(1, 2).contiguous().view_as(Ms)
+        return loss, info

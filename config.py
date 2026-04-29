@@ -268,6 +268,13 @@ def get_opts():
     p.add_argument("--lambda_jepa_kd", type=float, default=0.05, help="Poids distillation depuis SupHeads.")
     p.add_argument("--jepa_use_teacher", type=int, default=1, help="1: teacher EMA comme cible.")
 
+    p.add_argument("--jepa_on_style_maps", action="store_true", help="Active la prédictibilité JEPA sur les cartes de style m_i.")
+    p.add_argument("--lambda_jepa_map", type=float, default=0.25, help="Poids global JEPA sur cartes de style.")
+    p.add_argument("--jepa_map_levels", type=str, default="", help="Niveaux de cartes style à contraindre (csv, ex: '5,4,3'). Vide = tous.")
+    p.add_argument("--jepa_map_scale_weights", type=str, default="", help="Poids λ_i^map par niveau sélectionné (csv). Vide = uniformes.")
+    p.add_argument("--lambda_cross_scale", type=float, default=0.25, help="Poids global de cohérence inter-échelles sur cartes style.")
+    p.add_argument("--cross_scale_weights", type=str, default="", help="Poids μ_i de cohérence inter-échelles (csv). Vide = uniformes.")
+
     p.add_argument("--ema_update_every", type=int, default=1, help="Fréquence update T_A/T_B (itérations).")
     p.add_argument("--nce_m", type=float, default=0.999, help="Momentum EMA T_A/T_B (NCE/JEPA).")
 
@@ -297,7 +304,7 @@ def get_opts():
         choices=[
             "tokG", "tok6", "tok6_mean", "tok6_w", "tokL", "tokL_mean", "tokL_w",
             "cont_tok", "cont_tok_vit",
-            "style_tok", "bot", "bot+tok", "tok+delta", "mgap", "mgap+tok",
+            "style_tok", "mapG", "mapL", "mapL_mean", "mapL_w", "bot", "bot+tok", "tok+delta", "mgap", "mgap+tok",
         ],
         default="tok6",
         help="Type de features vers SupHeads.",

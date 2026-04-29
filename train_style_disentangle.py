@@ -945,10 +945,14 @@ def train_alternating(opt):
     cfg["sem_use_aug"] = bool(getattr(opt, "sem_use_aug", False))
     cfg["sem_jepa_on"] = bool(sem_enable and getattr(opt, "jepa_on_content", 0) and getattr(opt, "jepa_tokens", False))
 
-    cfg["jepa_on"] = jepa_on_style or jepa_on_content
+    cfg["jepa_on_style_maps"] = bool(getattr(opt, "jepa_on_style_maps", False) and mode == "auto")
+    cfg["jepa_on"] = jepa_on_style or jepa_on_content or cfg["jepa_on_style_maps"]
     cfg["jepa_mask_ratio"] = float(getattr(opt, "jepa_mask_ratio", 0.6))
     cfg["lambda_jepa_style"] = float(getattr(opt, "lambda_jepa_style", getattr(opt, "lambda_jepa", 0.15)))
     cfg["lambda_jepa_content"] = float(getattr(opt, "lambda_jepa_content", 0.15))
+    cfg["lambda_jepa_map"] = float(getattr(opt, "lambda_jepa_map", 0.0))
+    cfg["lambda_cross_scale"] = float(getattr(opt, "lambda_cross_scale", 0.0))
+    cfg["jepa_map_levels"] = str(getattr(opt, "jepa_map_levels", ""))
     cfg["lambda_jepa_var"] = float(getattr(opt, "lambda_jepa_var", 0.05))
     cfg["lambda_jepa_cov"] = float(getattr(opt, "lambda_jepa_cov", 0.05))
     cfg["lambda_jepa_kd"] = float(getattr(opt, "lambda_jepa_kd", 0.05))
@@ -968,6 +972,14 @@ def train_alternating(opt):
     except Exception:
         jepa_scale_w = torch.tensor([2.0, 2.0, 1.5, 1.0, 0.75, 0.5], dtype=torch.float32, device=dev)
     cfg["jepa_scale_w"] = jepa_scale_w
+    def _parse_csv_floats(v: str, default=None):
+        try:
+            vals=[float(x) for x in str(v).split(",") if str(x).strip()]
+            return vals if vals else (default or [])
+        except Exception:
+            return default or []
+    cfg["jepa_map_scale_weights"] = _parse_csv_floats(getattr(opt, "jepa_map_scale_weights", ""), default=[])
+    cfg["cross_scale_weights"] = _parse_csv_floats(getattr(opt, "cross_scale_weights", ""), default=[])
 
     cfg["feat_switch_epoch"] = int(getattr(opt, "feat_switch_epoch", getattr(opt, "recon_epochs", 2)))
     cfg["ema_every"] = int(getattr(opt, "ema_update_every", 1))

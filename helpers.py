@@ -237,6 +237,7 @@ def run_sup_freeze_mode(
     Gestion des sup_feat_type :
       - 'tok6', 'tok6_w' : on utilise des delta_weights de longueur 6
       - 'tokG', 'style_tok', 'tok6_mean' : delta_weights de longueur 5
+      - 'mapL_w' : delta_weights de longueur L
       - 'cont_tok', 'cont_tok_vit' (et variantes) : pas de delta_weights → None
     """
     from copy import deepcopy
@@ -495,6 +496,8 @@ def run_sup_freeze_mode(
         δw_str = _parse_dw(δw_raw, 6)
     elif feat_type in ("tokG", "style_tok", "tok6_mean"):
         δw_str = _parse_dw(δw_raw, 5)
+    elif feat_type in ("mapL_w",):
+        δw_str = _parse_dw(δw_raw, int(getattr(G_sup, "style_levels", 5)))
     # Cas contenu tokens (ViT / JEPA…) : PAS de delta_weights
     elif feat_type.startswith("cont_tok"):
         δw_str = None
@@ -544,7 +547,7 @@ def run_sup_freeze_mode(
                 "multi6"
                 if feat_type in ("tok6",)
                 else "single"
-                if feat_type in ("tokG", "style_tok", "tok6_mean", "tok6_w")
+                if feat_type in ("tokG", "style_tok", "tok6_mean", "tok6_w", "mapG", "mapL_mean", "mapL_w")
                 else "flat"
             )
             G_sup.sup_fusion = None
@@ -1545,6 +1548,7 @@ def train_step_phase_A(
     # --- JEPA config ---
     jepa_on_style = bool(cfg.get("jepa_on_style", False))
     jepa_on_content = bool(cfg.get("jepa_on_content", False))
+    jepa_on_style_maps = bool(cfg.get("jepa_on_style_maps", False))
     jepa_every = int(cfg["jepa_every"])
     jepa_scale_base = cfg["jepa_scale_w"]
     jepa_mask_ratio = float(cfg["jepa_mask_ratio"])
@@ -1552,10 +1556,13 @@ def train_step_phase_A(
     jepa_use_teacher = bool(cfg["jepa_use_teacher"])
     λ_jepa_style = float(cfg.get("lambda_jepa_style", cfg.get("lambda_jepa", 0.0)))
     λ_jepa_content = float(cfg.get("lambda_jepa_content", 0.0))
+    λ_jepa_map = float(cfg.get("lambda_jepa_map", 0.0))
+    λ_cross_scale = float(cfg.get("lambda_cross_scale", 0.0))
     λ_jepa_kd = float(cfg.get("lambda_jepa_kd", 0.0))
 
     tok_jepa_A_style = state.get("tok_jepa_A_style", None)
     tok_jepa_A_content = state.get("tok_jepa_A_content", None)
+    map_jepa_A_style = state.get("map_jepa_A_style", None)
 
     use_B_feats = (state.get("epoch", 0) >= cfg["feat_switch_epoch"])
 
@@ -1568,6 +1575,49 @@ def train_step_phase_A(
             return w_vec.mean().repeat(S)
         val = float(base)
         return torch.full((S,), val, device=device)
+
+
+    def _parse_level_list(raw: str, max_level: int):
+        try:
+            vals = [int(x) for x in str(raw).split(",") if str(x).strip()]
+        except Exception:
+            vals = []
+        vals = [v for v in vals if 1 <= v <= max_level]
+        return vals if vals else list(range(max_level, 0, -1))
+
+    def _weights_for_n(n: int, raw_list, device, default: float = 1.0):
+        vals = list(raw_list) if isinstance(raw_list, (list, tuple)) else []
+        if len(vals) == n:
+            out = vals
+        elif len(vals) == 1:
+            out = vals * n
+        elif len(vals) == 0:
+            out = [default] * n
+        elif len(vals) < n:
+            out = vals + [vals[-1]] * (n - len(vals))
+        else:
+            out = vals[:n]
+        return torch.tensor(out, dtype=torch.float32, device=device)
+
+    def _cross_scale_style_loss(maps_s, maps_t, levels, weights):
+        if maps_s is None or maps_t is None:
+            return x.new_tensor(0.0)
+        pooled_s = []
+        pooled_t = []
+        for lvl in levels:
+            idx = max(0, min(len(maps_s) - 1, int(getattr(G_A, 'style_levels', len(maps_s))) - int(lvl)))
+            ms = maps_s[idx].mean(dim=(2, 3))
+            mt = maps_t[idx].mean(dim=(2, 3))
+            pooled_s.append(F.normalize(ms, dim=1))
+            pooled_t.append(F.normalize(mt, dim=1))
+        if len(pooled_s) <= 1:
+            return pooled_s[0].new_tensor(0.0) if pooled_s else x.new_tensor(0.0)
+        losses = []
+        for i, vs in enumerate(pooled_s):
+            others = [pooled_t[j] for j in range(len(pooled_t)) if j != i]
+            target = torch.stack(others, dim=0).mean(dim=0)
+            losses.append(weights[i] * (vs - target.detach()).pow(2).mean())
+        return torch.stack(losses).mean()
 
     def stack_content_tokens_multiscale_for_jepa(feat_dict, ref_key="bot"):
         if not feat_dict:
@@ -1721,15 +1771,17 @@ def train_step_phase_A(
     # ----------------------------
     jepa_styleA = torch.tensor(0.0, device=dev)
     jepa_styleA_kd = torch.tensor(0.0, device=dev)
+    jepa_style_mapA = torch.tensor(0.0, device=dev)
+    jepa_cross_mapA = torch.tensor(0.0, device=dev)
     jepa_contentA = torch.tensor(0.0, device=dev)
     jepa_contentA_kd = torch.tensor(0.0, device=dev)
 
     jepa_attn_styleA_H = None
     jepa_attn_contentA_H = None
 
-    do_jepa = (jepa_on_style or jepa_on_content) and ((global_step % jepa_every) == 0)
+    do_jepa = (jepa_on_style or jepa_on_content or jepa_on_style_maps) and ((global_step % jepa_every) == 0)
     if do_jepa:
-        from models.jepa import TokenJEPA
+        from models.jepa import TokenJEPA, MapJEPA
 
         if jepa_on_style:
             style_sigma = float(tex_sigma)
@@ -1776,6 +1828,43 @@ def train_step_phase_A(
                             H = -(p * p.log()).sum(-1).mean()
                     if H is not None:
                         jepa_attn_styleA_H = _to_float(H, None)
+
+        if jepa_on_style_maps:
+            style_sigma = float(tex_sigma)
+            style_gamma = float(tex_gamma)
+            y_v1m, y_v2m = two_style_views(y, sigma=style_sigma, gamma=style_gamma, flip_p=0.5)
+            with torch.no_grad():
+                if jepa_use_teacher:
+                    maps_tA, _, _ = T_A.style_enc(y_v2m)
+                else:
+                    maps_tA, _, _ = G_A.style_enc(y_v2m)
+            maps_sA, _, _ = G_A.style_enc(y_v1m)
+            if maps_sA is not None and maps_tA is not None:
+                sel_levels = _parse_level_list(cfg.get("jepa_map_levels", ""), len(maps_sA))
+                λi = _weights_for_n(len(sel_levels), cfg.get("jepa_map_scale_weights", []), dev, 1.0)
+                μi = _weights_for_n(len(sel_levels), cfg.get("cross_scale_weights", []), dev, 1.0)
+                if map_jepa_A_style is None or not isinstance(map_jepa_A_style, dict):
+                    map_jepa_A_style = {}
+                    state["map_jepa_A_style"] = map_jepa_A_style
+                map_losses = []
+                for pos, lvl in enumerate(sel_levels):
+                    idx = max(0, min(len(maps_sA) - 1, int(getattr(G_A, 'style_levels', len(maps_sA))) - int(lvl)))
+                    Ms = maps_sA[idx]
+                    Mt = maps_tA[idx]
+                    Bm, Cm, Hm, Wm = Ms.shape
+                    Smap = int(Hm * Wm)
+                    key = f"L{int(lvl)}_{Smap}_{Cm}"
+                    if key not in map_jepa_A_style:
+                        map_jepa_A_style[key] = MapJEPA(S=Smap, C=Cm,
+                            hidden_mult=cfg["jepa_hidden_mult"], heads=cfg["jepa_heads"],
+                            use_norm=cfg["jepa_norm"], var_lambda=cfg["lambda_jepa_var"], cov_lambda=cfg["lambda_jepa_cov"]).to(dev)
+                    mask_m = bias_mask(Bm, Smap, jepa_mask_ratio, jepa_bias_high, device=dev)
+                    Lj_m, _ = map_jepa_A_style[key](Ms, Mt.detach(), mask_m, w=None)
+                    map_losses.append(λi[pos] * Lj_m)
+                if map_losses:
+                    jepa_style_mapA = torch.stack(map_losses).sum()
+                if λ_cross_scale > 0:
+                    jepa_cross_mapA = _cross_scale_style_loss(maps_sA, maps_tA, sel_levels, μi)
 
         if jepa_on_content:
             x_v1c, x_v2c = two_style_views(x, sigma=0.0, gamma=1.0, flip_p=0.5)
@@ -1825,6 +1914,8 @@ def train_step_phase_A(
     jepa_totalA = (
         λ_jepa_style * jepa_styleA
         + λ_jepa_content * jepa_contentA
+        + λ_jepa_map * jepa_style_mapA
+        + λ_cross_scale * jepa_cross_mapA
         + λ_jepa_kd * (jepa_styleA_kd + jepa_contentA_kd)
     )
 
@@ -1868,6 +1959,10 @@ def train_step_phase_A(
     epoch_meters["A"]["style_gain_A"].add(float(style_gain_A))
     epoch_meters["A"]["λ_style_A"].add(float(λ_style_A))
     epoch_meters["A"]["JEPA_style"].add(float(jepa_styleA.item()))
+    if "JEPA_style_maps" in epoch_meters["A"]:
+        epoch_meters["A"]["JEPA_style_maps"].add(float(jepa_style_mapA.item()))
+    if "JEPA_cross_scale" in epoch_meters["A"]:
+        epoch_meters["A"]["JEPA_cross_scale"].add(float(jepa_cross_mapA.item()))
     epoch_meters["A"]["JEPA_content"].add(float(jepa_contentA.item()))
     if torch.is_tensor(totalA):
         epoch_meters["A"]["total"].add(float(totalA.item()))

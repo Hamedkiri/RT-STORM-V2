@@ -58,6 +58,7 @@ class UNetGenerator(nn.Module):
         self.ngf = int(ngf)
         self.hid_dim = int(token_dim)  # dim tokens style + contenu
         self.nc = int(nc)
+        self.style_map_ch = int(spade_ch)
 
         # ---------------- architecture scaling ----------------
         base_levels = 5
@@ -207,6 +208,37 @@ class UNetGenerator(nn.Module):
     @torch.no_grad()
     def _gap(self, x: torch.Tensor) -> torch.Tensor:
         return F.adaptive_avg_pool2d(x, 1).flatten(1)
+
+    def _attn_pool_map(self, m: torch.Tensor) -> torch.Tensor:
+        """
+        Pooling spatial attentif sans paramètres appris.
+
+        Pour une carte de style m \in R^{B \times C \times H \times W}, on calcule :
+          1) une carte de saillance scalaire par moyenne absolue sur les canaux ;
+          2) une softmax spatiale ;
+          3) une moyenne pondérée des canaux par cette attention.
+
+        Cela améliore l'usage de mapL/mapL_mean/mapL_w en favorisant
+        les régions spatialement saillantes sans introduire de nouveaux
+        paramètres qui casseraient la compatibilité des checkpoints.
+        """
+        B, C, H, W = m.shape
+        score = m.abs().mean(dim=1, keepdim=True)
+        attn = F.softmax(score.flatten(2), dim=-1).view(B, 1, H, W)
+        return (m * attn).sum(dim=(2, 3))
+
+    def _scale_gate_maps(self, vecs: list[torch.Tensor]) -> torch.Tensor:
+        """
+        Gating inter-échelles sans paramètres appris.
+
+        Chaque échelle est pondérée par la norme moyenne absolue de son vecteur
+        puis normalisée par softmax sur les niveaux. Retourne un tenseur (B, L).
+        """
+        if len(vecs) == 0:
+            raise ValueError('vecs must be non-empty')
+        scores = [v.abs().mean(dim=1, keepdim=True) for v in vecs]
+        scores = torch.cat(scores, dim=1)
+        return F.softmax(scores, dim=1)
 
     @staticmethod
     def _trace_shape(enabled: bool, name: str, t: torch.Tensor) -> None:
@@ -453,6 +485,12 @@ class UNetGenerator(nn.Module):
         # --- STYLE-BIASED ---
         if feat_type in ("style_tok", "tokG"):
             return self.hid_dim
+        if feat_type in ("mapG",):
+            return self.style_map_ch
+        if feat_type in ("mapL",):
+            return self.style_levels * self.style_map_ch
+        if feat_type in ("mapL_mean", "mapL_w"):
+            return self.style_map_ch
         if feat_type in ("tok6", "tokL"):
             return (1 + self.style_levels) * self.hid_dim
         if feat_type in ("tok6_mean", "tok6_w", "tokL_mean", "tokL_w"):
@@ -524,7 +562,43 @@ class UNetGenerator(nn.Module):
             if tokG is None:
                 # fallback: bot si tokG indispo
                 return self._gap(z)
-            return self._l2_norm_rows(tokG)  # (B,D)        # --- concat multi-tokens (tokG + tL..t1) ---
+            return self._l2_norm_rows(tokG)  # (B,D)        # --- cartes de style poolées avec attention spatiale + gating inter-échelles ---
+        if feat_type in ("mapG", "mapL", "mapL_mean", "mapL_w"):
+            if maps is None or len(maps) == 0:
+                return self._gap(z)
+
+            maps_list = list(maps) if isinstance(maps, (list, tuple)) else []
+            if len(maps_list) < self.style_levels:
+                pad = maps_list[-1] if len(maps_list) else None
+                if pad is not None:
+                    maps_list = (maps_list + [pad] * self.style_levels)[: self.style_levels]
+            elif len(maps_list) > self.style_levels:
+                maps_list = maps_list[: self.style_levels]
+
+            pooled = [self._attn_pool_map(m) for m in maps_list]  # [(B,Cm)] deep->shallow
+            gates = self._scale_gate_maps(pooled)                 # (B,L)
+            gated = [v * gates[:, i:i+1] for i, v in enumerate(pooled)]
+
+            if feat_type == "mapG":
+                return self._l2_norm_rows(gated[0])
+
+            if feat_type == "mapL":
+                return torch.cat([self._l2_norm_rows(v) for v in gated], dim=1)
+
+            if feat_type == "mapL_mean":
+                S = torch.stack([self._l2_norm_rows(v) for v in gated], dim=1)
+                return S.mean(dim=1)
+
+            # mapL_w : combine poids manuels + gating inter-échelles appris sans paramètres
+            ws = self._parse_delta_weights(delta_weights, self.style_levels)
+            W = torch.tensor(ws, device=imgs.device, dtype=gated[0].dtype).view(1, -1)
+            W = W / (W.sum(dim=1, keepdim=True) + 1e-8)
+            W = W * gates
+            W = W / (W.sum(dim=1, keepdim=True) + 1e-8)
+            S = torch.stack([self._l2_norm_rows(v) for v in pooled], dim=1)  # (B,L,C)
+            return (S * W.unsqueeze(-1)).sum(dim=1)
+
+        # --- concat multi-tokens (tokG + tL..t1) ---
         if feat_type in ("tok6", "tokL"):
             # tolère l’absence des tokens locaux
             if tokG is None and (toks is None or len(toks) == 0):

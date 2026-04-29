@@ -106,14 +106,19 @@ python -m test_fastrnn_detection   --ckpt runs/coco_fastrnn_resnet50_semckpt_fro
 
 python main.py   --data /media/sti-innovators/HDD_4TO_1/coco/coco_datasets/trainImage2017/train   --epochs 200   --save_freq 10   --save_dir ST-TORM-CoCo   --tb --tb_freq 1000  --k_folds 2   --nce_layers "bot,skip64,skip32"   --nce_layer_weights "1,1,1"   --ema_tau 0.00   --adv_boost 0   --b_boost 0   --style_lambda 10   --lambda_nce_a_mix 0   --lambda_nce_b 10   --lambda_reg_a_mix 0.0   --lambda_idt_b 10   --nce_intra   --nce_inter   --skip_amix   --nce_max_patches 100   --lambda_nce_a_adv 0.2   --lambda_reg_a_adv 0.05   --fold_epochs 4   --mode auto   --sup_feat_type tok6   --feat_switch_epoch 4     --tex_enable   --tex_apply_A   --tex_sigma 2   --tex_gamma 3   --tex_use_fft   --tex_use_swd     --adv_enable_A    --jepa_tokens    --lambda_jepa 0.5    --jepa_on_style    --adv_type "lsgan" --style_lambda 50 --style_lambda_min 5 --style_lambda_sched "linear" --jepa_on_style --jepa_on_content --content_nce_enable --lambda_content_nce 10 --replay_size 1000 --replay_ratio 0.2   --sem_content --sem_use_aug --sem_crop 224 --sem_min_scale 0.5 --sem_color_jitter 0.4 --sem_gray 0.2 --sem_blur 0.1 --epoch_ckpt_interval 10 --lambda_sem 1 --epoch_ckpt_interval 10 --sem_two_styles --sem_pretrained 1 --resume_dir ST-TORM-CoCo --sem_pretrained_path /home/sti-innovators/Models_Hamed/Second_generation_Algorithms-main/moco_weights_ResNet50/r-50-1000ep.pth.tar --sem_pretrained_strict 1 --sem_queue 6000
 
-python main.py   --mode sup_freeze  --sup_feat_source "generator"  --det_
-feat_source unet_style      --batch_size 8   --save_dir Cancer_Melanoma_classification_tok_6_250 --epochs 500 --epoch_ckpt_interval 250 --data /media/hamed/8TO_2/cancer_detection/isic-2024-challenge/Equilibre-Melanoma-To-Train/train --resume_dir Poids-melanoma --strict_load 1 --k_folds 1 --sup_feat_type "tok6" save_freq "epoch:250"
+python main.py   --mode sup_freeze  --sup_feat_source "generator"  --det_feat_source unet_style      --batch_size 8   --save_dir Cancer_Melanoma_classification_tok_6_250 --epochs 500 --epoch_ckpt_interval 250 --data /media/hamed/8TO_2/cancer_detection/isic-2024-challenge/Equilibre-Melanoma-To-Train/train --resume_dir Poids-melanoma --strict_load 1 --k_folds 1 --sup_feat_type "tok6" save_freq "epoch:250"
 
 
 python test.py --data /media/hamed/8TO_2/cancer_detection/isic-2024-challenge/Equilibre-Melanoma-To-Train/test --weights_dir runs/Cancer_Melanoma_classification_tok_6_  --out_dir runs/Cancer_Melanoma_classification/results --cfg runs/Cancer_Melanoma_classification_tok_6_/train_cfg.json --mode "sup_predict"  --feature_mode "style"  --sem_pretrained_path runs/Cancer_Melanoma_classifier_sem_resnet50/SemBackbone_epoch4.pt  --sem_pretrained_strict 1  --metrics "knn" --embed_type "tok6_w" --delta_weights "0,1,1,1,1,1" --tsne_use_supheads
 python main.py   --mode sup_freeze  --sup_feat_source "sem_resnet50"  --det_feat_source "sem_resnet50"      --batch_size 8   --save_dir Cancer_Melanoma_classification_sem_50_200_epochs_ --epochs 200 --epoch_ckpt_interval 10 --data /media/hamed/8TO_2/cancer_detection/isic-2024-challenge/Equilibre-Melanoma-To-Train/train --resume_dir Poids-melanoma --strict_load 1 --k_folds 1 --sup_feat_type "tok6" --sup_sem_imagenet_norm 1
 
+mapG : GAP de la carte profonde
 
+
+mapL : concaténation des GAP des cartes
+
+mapL_mean : moyenne des GAP des cartes
+mapL_w : moyenne pondérée des GAP des cartes
 
 -------------------Baseline------------------:
 python main.py --mode auto --data_json /media/sti-innovators/HDD_4TO_1/dataset_principal/Weather_detection/training_13052025/Annotations_new_20062025/All/train_test_heterogeneity/train_50000_train.json --save_dir /media/sti-innovators/HDD_4TO_1/Experimentation_ST-STORM/Baseline --epochs 41 --k_folds 2 --fold_epochs 4 --tb --tb_freq 1000 --nce_layers "bot,skip64,skip32" --nce_layer_weights "1,1,1" --nce_intra --nce_inter --nce_max_patches 100 --lambda_nce_a_adv 0.2 --lambda_reg_a_adv 0.05 --lambda_nce_a_mix 0 --lambda_reg_a_mix 0.0 --skip_amix --tex_enable --tex_apply_A --tex_use_fft --tex_use_swd --lambda_fft 0.1 --lambda_swd 0.05 --tex_sigma 2 --tex_gamma 3 --adv_enable_A --adv_type lsgan --jepa_tokens --jepa_on_style --jepa_every 1  --lambda_jepa 2 --content_nce_enable --lambda_content_nce 10 --sem_content --lambda_sem 1 --sem_two_styles --sem_pretrained 1 --sem_pretrained_path r-50-1000ep.pth.tar --sem_pretrained_strict 1 --sem_queue 6000 --sem_use_aug --sem_crop 224 --sem_min_scale 0.5  --sem_color_jitter 0.4 --sem_gray 0.2 --sem_blur 0.1 --style_lambda 50 --style_lambda_min 5 --style_lambda_sched linear --sup_feat_type tok6
@@ -121,6 +126,18 @@ python main.py --mode auto --data_json /media/sti-innovators/HDD_4TO_1/dataset_p
 
 Ablation
 
-SWD: python main.py --mode auto --data_json /media/hamed/8TO_2/Datasets_50000/50000_train_Ablat
-ions_Datasets/Good_path_Annotations/50000_annotations.json --save_dir Experimentation_ST-STORM/Ablation_SWD --epochs 41 --k_folds 2 --fold_epochs 4 --tb --tb_freq 1000 --nce_layers "bot,skip64,skip32" --nce_layer_weights "1,1,1" --nce_intra --nce_inter --nce_max_patches 100 --lambda_nce_a_adv 0.2 --lambda_reg_a_adv 0.05 --lambda_nce_a_mix 0 --lambda_reg_a_mix 0.0 --skip_amix --tex_enable --tex_apply_A --tex_use_fft  --lambda_fft 0.1 --lambda_swd 0.05 --tex_sigma 2 --tex_gamma 3 --adv_enable_A --adv_type lsgan --jepa_tokens --jepa_on_style --jepa_every 1  --lambda_jepa 2 --content_nce_enable --lambda_content_nce 10 --sem_content --lambda_sem 1 --sem_two_styles --sem_pretrained 1 --sem_pretrained_path /home/hamed/Modele_machine_learning/Modeles/code/weather_recognize/moco_classifier/checkpoints/r-50-1000ep.pth.tar --sem_pretrained_strict 1 --sem_queue 6000 --sem_use_aug --sem_crop 224 --sem_min_scale 0.5  --sem_color_jitter 0.4 --sem_gray 0.2 --sem_blur 0.1 --style_lambda 50 --style_lambda_min 5 --style_lambda_sched linear --sup_feat_type tok6
+SWD: python main.py --mode auto --data_json /media/hamed/8TO_2/Datasets_50000/50000_train_Ablations_Datasets/Good_path_Annotations/50000_annotations.json --save_dir Experimentation_ST-STORM/Ablation_SWD --epochs 41 --k_folds 2 --fold_epochs 4 --tb --tb_freq 1000 --nce_layers "bot,skip64,skip32" --nce_layer_weights "1,1,1" --nce_intra --nce_inter --nce_max_patches 100 --lambda_nce_a_adv 0.2 --lambda_reg_a_adv 0.05 --lambda_nce_a_mix 0 --lambda_reg_a_mix 0.0 --skip_amix --tex_enable --tex_apply_A --tex_use_fft  --lambda_fft 0.1 --lambda_swd 0.05 --tex_sigma 2 --tex_gamma 3 --adv_enable_A --adv_type lsgan --jepa_tokens --jepa_on_style --jepa_every 1  --lambda_jepa 2 --content_nce_enable --lambda_content_nce 10 --sem_content --lambda_sem 1 --sem_two_styles --sem_pretrained 1 --sem_pretrained_path /home/hamed/Modele_machine_learning/Modeles/code/weather_recognize/moco_classifier/checkpoints/r-50-1000ep.pth.tar --sem_pretrained_strict 1 --sem_queue 6000 --sem_use_aug --sem_crop 224 --sem_min_scale 0.5  --sem_color_jitter 0.4 --sem_gray 0.2 --sem_blur 0.1 --style_lambda 50 --style_lambda_min 5 --style_lambda_sched linear --sup_feat_type tok6
 FFT et SWD: python main.py --mode auto --data_json /media/hamed/8TO_2/Datasets_50000/50000_train_Ablations_Datasets/Good_path_Annotations/50000_annotations.json --save_dir /media/hamed/8TO_2/Experimentation_ST-STORM/Ablation_SWD_FFT --save_freq 10  --epochs 41 --k_folds 2 --fold_epochs 4 --tb --tb_freq 1000 --nce_layers "bot,skip64,skip32" --nce_layer_weights "1,1,1" --nce_intra --nce_inter --nce_max_patches 100 --lambda_nce_a_adv 0.2 --lambda_reg_a_adv 0.05 --lambda_nce_a_mix 0 --lambda_reg_a_mix 0.0 --skip_amix --tex_enable --tex_apply_A   --lambda_fft 0.1 --lambda_swd 0.05 --tex_sigma 2 --tex_gamma 3 --adv_enable_A --adv_type lsgan --jepa_tokens --jepa_on_style --jepa_every 1  --lambda_jepa 2 --content_nce_enable --lambda_content_nce 10 --sem_content --lambda_sem 1 --sem_two_styles --sem_pretrained 1 --sem_pretrained_path /home/hamed/Modele_machine_learning/Modeles/code/weather_recognize/moco_classifier/checkpoints/r-50-1000ep.pth.tar --sem_pretrained_strict 1 --sem_queue 6000 --sem_use_aug --sem_crop 224 --sem_min_scale 0.5  --sem_color_jitter 0.4 --sem_gray 0.2 --sem_blur 0.1 --style_lambda 50 --style_lambda_min 5 --style_lambda_sched linear --sup_feat_type tok6  --tex_use_fft --tex_use_swd
+
+
+
+python main.py \
+  --mode auto \
+  ... \
+  --jepa_tokens \
+  --jepa_on_style \
+  --jepa_on_style_maps \
+  --lambda_jepa_style 0.5 \
+  --lambda_jepa_map 0.25 \
+  --lambda_cross_scale 0.1 \
+  --jepa_map_levels "5,4,3"
