@@ -1,40 +1,40 @@
 # RT-STORM-V2 / ST-STORM
 
-Ce dépôt contient un pipeline unifié pour :
-- l'apprentissage auto-supervisé du style et du contenu,
-- le fine-tuning supervisé avec backbones gelés ou dégelés,
-- l'évaluation, l'inférence et la webcam,
-- la classification multi-tâches,
-- et la détection d'objets.
+This repository contains a unified pipeline for:
+- self-supervised learning of style and content,
+- supervised fine-tuning with frozen or unfrozen backbones,
+- evaluation, inference, and webcam usage,
+- multi-task classification,
+- and object detection.
 
-L'idée générale est de séparer :
-- le **contenu sémantique** : structure, forme, disposition spatiale,
-- le **style** : texture, contraste, signatures fréquentielles, apparence locale et globale.
+The general idea is to separate:
+- **semantic content**: structure, shape, spatial layout,
+- **style**: texture, contrast, frequency signatures, local and global appearance.
 
-Le projet supporte notamment :
-- un chemin **générateur / style**,
-- un chemin **sem_resnet50 / contenu sémantique**,
-- une **fusion style + contenu** avec gating vectoriel.
+The project notably supports:
+- a **generator / style** pathway,
+- a **sem_resnet50 / semantic content** pathway,
+- a **style + content fusion** mechanism with vector gating.
 
 ---
 
-## 1. Structure générale
+## 1. General structure
 
-Les fichiers principaux sont :
-- `main.py` : point d'entrée entraînement
-- `train_style_disentangle.py` : orchestration des modes d'entraînement
-- `helpers.py` : cœur des losses, du fine-tuning supervisé et des sauvegardes
-- `test.py` : évaluation, inférence, webcam, t-SNE
-- `config.py` : ensemble des options CLI
-- `models/` : générateur, discriminateurs, JEPA, heads, fusion
-- `tests/functions_for_test.py` : chargement des modèles côté test
-- `scripts/` : exemples prêts à adapter
+The main files are:
+- `main.py`: training entry point
+- `train_style_disentangle.py`: orchestration of the training modes
+- `helpers.py`: core losses, supervised fine-tuning, and checkpoint saving
+- `test.py`: evaluation, inference, webcam, t-SNE
+- `config.py`: all CLI options
+- `models/`: generator, discriminators, JEPA, heads, fusion
+- `tests/functions_for_test.py`: model loading utilities for testing
+- `scripts/`: ready-to-adapt examples
 
 ---
 
 ## 2. Installation
 
-Créer un environnement Python puis installer les dépendances :
+Create a Python environment and install the dependencies:
 
 ```bash
 python -m venv .venv
@@ -42,81 +42,88 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Selon les usages, il faut aussi disposer de :
-- PyTorch compatible CUDA si entraînement GPU,
-- OpenCV avec backend GUI si webcam avec affichage OpenCV,
-- Tkinter si OpenCV est headless mais qu'un affichage webcam est souhaité.
+Depending on your use case, you may also need:
+- a CUDA-compatible PyTorch installation for GPU training,
+- OpenCV with a GUI backend if you want webcam display with OpenCV,
+- Tkinter if OpenCV is headless but webcam display is still required.
 
 ---
 
-## 3. Modes d'entraînement
+## 3. Training modes
 
-L'option centrale est `--mode` dans `main.py`.
+The central option is `--mode` in `main.py`.
 
 ### 3.1 `auto`
-Apprentissage auto-supervisé complet.
 
-Ce mode entraîne les composants de style et de contenu sans supervision explicite de classes.
-Il combine selon la configuration :
-- pertes adversariales,
-- pertes de cohérence de style par tokens,
-- pertes FFT / SWD,
+Full self-supervised learning.
+
+This mode trains the style and content components without explicit class supervision.
+Depending on the configuration, it combines:
+- adversarial losses,
+- token-based style consistency losses,
+- FFT / SWD losses,
 - Style-JEPA,
-- MoCo contenu,
+- MoCo content learning,
 - PatchNCE,
 - Content-NCE,
-- reconstruction guidée.
+- guided reconstruction.
 
-À utiliser pour préentraîner le modèle.
+Use this mode to pretrain the model.
 
 ### 3.2 `hybrid`
-Apprentissage mixte :
-- prétexte auto-supervisé A/B,
-- puis phase supervisée C avec `SupHeads`.
 
-À utiliser si l'on veut combiner self-supervision et apprentissage supervisé dans le même run.
+Mixed learning:
+- self-supervised A/B pretext phases,
+- followed by a supervised phase C with `SupHeads`.
+
+Use this mode when you want to combine self-supervision and supervised learning in the same run.
 
 ### 3.3 `sup_freeze`
-Fine-tuning supervisé avec extracteurs gelés.
 
-Ce mode entraîne principalement :
+Supervised fine-tuning with frozen feature extractors.
+
+This mode mainly trains:
 - `SupHeads`,
-- `FusionHead` si `--sup_feat_source fusion`.
+- `FusionHead` if `--sup_feat_source fusion` is used.
 
-Les extracteurs de features restent gelés. Ce mode sert à mesurer la réutilisabilité des représentations apprises.
+The feature extractors remain frozen. This mode is used to measure how reusable the learned representations are.
 
 ### 3.4 `sup_unfreeze`
-Fine-tuning supervisé end-to-end.
 
-Même logique supervisée que `sup_freeze`, mais les extracteurs réellement utilisés pour produire les features sont dégelés et mis à jour par la perte supervisée.
+End-to-end supervised fine-tuning.
 
-Selon `--sup_feat_source` :
-- `generator` : le backbone style utilisé pour produire `tok6`, `tokG`, `mapL`, etc. est finetuné ;
-- `sem_resnet50` : le ResNet sémantique est finetuné ;
-- `fusion` : les deux extracteurs, plus `FusionHead`, sont finetunés.
+This mode follows the same supervised logic as `sup_freeze`, but the feature extractors actually used to produce the features are unfrozen and updated using the supervised loss.
 
-Les extracteurs finetunés sont sauvegardés explicitement pour être rechargés au test.
+Depending on `--sup_feat_source`:
+- `generator`: the style backbone used to produce `tok6`, `tokG`, `mapL`, etc. is fine-tuned;
+- `sem_resnet50`: the semantic ResNet is fine-tuned;
+- `fusion`: both feature extractors, plus `FusionHead`, are fine-tuned.
+
+The fine-tuned extractors are explicitly saved so that they can be reloaded during testing.
 
 ### 3.5 `cls_tokens`
-Classification supervisée à partir de tokens multi-échelles.
+
+Supervised classification from multi-scale tokens.
 
 ### 3.6 `detect_transformer`
-Mode détection d'objets.
+
+Object detection mode.
 
 ---
 
-## 4. Sources de features supervisées
+## 4. Supervised feature sources
 
-L'option centrale pour les tâches supervisées est :
+The central option for supervised tasks is:
 
 ```bash
 --sup_feat_source {generator,sem_resnet50,fusion}
 ```
 
 ### 4.1 `generator`
-Les features sont extraites par le générateur, typiquement via des représentations de style.
 
-Exemples de `--sup_feat_type` utiles :
+Features are extracted by the generator, usually through style representations.
+
+Useful examples of `--sup_feat_type`:
 - `tokG`
 - `tok6`
 - `tok6_mean`
@@ -130,26 +137,28 @@ Exemples de `--sup_feat_type` utiles :
 - `mapL_w`
 
 ### 4.2 `sem_resnet50`
-Les features proviennent du backbone sémantique ResNet, après agrégation spatiale.
+
+Features come from the semantic ResNet backbone after spatial aggregation.
 
 ### 4.3 `fusion`
-Les features de style et de contenu sémantique sont fusionnées via un module léger :
-- normalisation,
-- projection dans une dimension commune,
-- gating vectoriel,
-- `SupHeads` derrière.
+
+Style and semantic content features are fused through a lightweight module:
+- normalization,
+- projection into a common dimension,
+- vector gating,
+- followed by `SupHeads`.
 
 ---
 
-## 5. Commandes d'entraînement typiques
+## 5. Typical training commands
 
-### 5.1 Préentraînement auto-supervisé
+### 5.1 Self-supervised pretraining
 
 ```bash
 python main.py \
   --mode auto \
-  --data_json /chemin/train.json \
-  --save_dir /chemin/output_auto \
+  --data_json /path/to/train.json \
+  --save_dir /path/to/output_auto \
   --epochs 40 \
   --k_folds 2 \
   --fold_epochs 4 \
@@ -161,177 +170,180 @@ python main.py \
   --adv_enable_A
 ```
 
-Fortement recommandé : 
+Strongly recommended:
 
 ```bash
 python main.py --mode auto --data ""  --save_dir "/Baseline" --epochs 41 --k_folds 2 --fold_epochs 4 --tb --tb_freq 1000 --nce_layers "bot,skip64,skip32" --nce_layer_weights "1,1,1" --nce_intra --nce_inter --nce_max_patches 100 --lambda_nce_a_adv 0.2 --lambda_reg_a_adv 0.05 --lambda_nce_a_mix 0 --lambda_reg_a_mix 0.0 --skip_amix --tex_enable --tex_apply_A --tex_use_fft --tex_use_swd --lambda_fft 0.1 --lambda_swd 0.05 --tex_sigma 2 --tex_gamma 3 --adv_enable_A --adv_type lsgan --jepa_tokens --jepa_on_style --jepa_every 1  --lambda_jepa 2 --content_nce_enable --lambda_content_nce 10 --sem_content --lambda_sem 1 --sem_two_styles --sem_pretrained 1 --sem_pretrained_path r-50-1000ep.pth.tar --sem_pretrained_strict 1 --sem_queue 6000 --sem_use_aug --sem_crop 224 --sem_min_scale 0.5  --sem_color_jitter 0.4 --sem_gray 0.2 --sem_blur 0.1 --style_lambda 50 --style_lambda_min 5 --style_lambda_sched linear --sup_feat_type tok6
 
 ```
 
-### 5.2 `sup_freeze` avec style
+### 5.2 `sup_freeze` with style features
 
 ```bash
 python main.py \
   --mode sup_freeze \
-  --data /chemin/train \
-  --save_dir /chemin/output_sup_freeze \
+  --data /path/to/train \
+  --save_dir /path/to/output_sup_freeze \
   --sup_feat_source generator \
   --sup_feat_type tok6 \
   --classes_json data/Tasks.json \
-  --resume_dir /chemin/pretrain_style
+  --resume_dir /path/to/pretrain_style
 ```
 
-### 5.3 `sup_freeze` avec ResNet sémantique
+### 5.3 `sup_freeze` with semantic ResNet
 
 ```bash
 python main.py \
   --mode sup_freeze \
-  --data /chemin/train \
-  --save_dir /chemin/output_sup_freeze_sem \
+  --data /path/to/train \
+  --save_dir /path/to/output_sup_freeze_sem \
   --sup_feat_source sem_resnet50 \
   --classes_json data/Tasks.json \
-  --sem_pretrained_path /chemin/SemBackbone_epoch199.pt \
+  --sem_pretrained_path /path/to/SemBackbone_epoch199.pt \
   --sem_pretrained_strict 1
 ```
 
-### 5.4 `sup_freeze` avec fusion
+### 5.4 `sup_freeze` with fusion
 
 ```bash
 python main.py \
   --mode sup_freeze \
-  --data /chemin/train \
-  --save_dir /chemin/output_sup_freeze_fusion \
+  --data /path/to/train \
+  --save_dir /path/to/output_sup_freeze_fusion \
   --sup_feat_source fusion \
   --sup_feat_type tok6 \
   --fusion_dim 1024 \
   --classes_json data/Tasks.json \
-  --resume_dir /chemin/pretrain_style \
-  --sem_pretrained_path /chemin/SemBackbone_epoch199.pt \
+  --resume_dir /path/to/pretrain_style \
+  --sem_pretrained_path /path/to/SemBackbone_epoch199.pt \
   --sem_pretrained_strict 1
 ```
 
-### 5.5 `sup_unfreeze` end-to-end
+### 5.5 End-to-end `sup_unfreeze`
 
 ```bash
 python main.py \
   --mode sup_unfreeze \
-  --data /chemin/train \
-  --save_dir /chemin/output_sup_unfreeze \
+  --data /path/to/train \
+  --save_dir /path/to/output_sup_unfreeze \
   --sup_feat_source fusion \
   --sup_feat_type tok6 \
   --fusion_dim 1024 \
   --classes_json data/Tasks.json \
-  --resume_dir /chemin/pretrain_style \
-  --sem_pretrained_path /chemin/SemBackbone_epoch199.pt \
+  --resume_dir /path/to/pretrain_style \
+  --sem_pretrained_path /path/to/SemBackbone_epoch199.pt \
   --sem_pretrained_strict 1
 ```
 
 ---
 
-## 6. ImageNet : entraînement et test
+## 6. ImageNet: training and testing
 
-Le projet gère ImageNet CLS-LOC via `--data`, `--imagenet_split`, `--imagenet_ann_dir`, `--imagenet_synset_mapping`.
+The project supports ImageNet CLS-LOC through `--data`, `--imagenet_split`, `--imagenet_ann_dir`, and `--imagenet_synset_mapping`.
 
-### 6.1 Exemple entraînement supervisé ImageNet
+### 6.1 Example: supervised ImageNet training
 
 ```bash
 python main.py \
   --mode sup_freeze \
-  --data /chemin/ILSVRC/Data/CLS-LOC/train \
+  --data /path/to/ILSVRC/Data/CLS-LOC/train \
   --imagenet_split train \
-  --imagenet_synset_mapping /chemin/LOC_synset_mapping.txt \
-  --imagenet_ann_dir /chemin/ILSVRC/Annotations/CLS-LOC/train \
-  --save_dir /chemin/output_imagenet \
+  --imagenet_synset_mapping /path/to/LOC_synset_mapping.txt \
+  --imagenet_ann_dir /path/to/ILSVRC/Annotations/CLS-LOC/train \
+  --save_dir /path/to/output_imagenet \
   --sup_feat_source sem_resnet50 \
   --classes_json data/Tasks.json
 ```
 
-### 6.2 Exemple validation ImageNet
+### 6.2 Example: ImageNet validation
 
 ```bash
 python test.py \
   --mode sup_predict \
-  --data /chemin/ILSVRC/Data/CLS-LOC/val \
+  --data /path/to/ILSVRC/Data/CLS-LOC/val \
   --imagenet_split val \
-  --imagenet_ann_dir /chemin/ILSVRC/Annotations/CLS-LOC \
-  --imagenet_synset_mapping /chemin/LOC_synset_mapping.txt \
-  --weights_dir /chemin/fold_00 \
-  --out_dir /chemin/fold_00/results_val \
-  --cfg /chemin/train_cfg.json \
-  --sup_ckpt /chemin/fold_00/SupHeads_last_epoch99.pt \
+  --imagenet_ann_dir /path/to/ILSVRC/Annotations/CLS-LOC \
+  --imagenet_synset_mapping /path/to/LOC_synset_mapping.txt \
+  --weights_dir /path/to/fold_00 \
+  --out_dir /path/to/fold_00/results_val \
+  --cfg /path/to/train_cfg.json \
+  --sup_ckpt /path/to/fold_00/SupHeads_last_epoch99.pt \
   --feature_mode sem_resnet50 \
   --sup_feat_source sem_resnet50 \
-  --sem_pretrained_path /chemin/fold_00/SemBackbone_best_fold0.pt \
+  --sem_pretrained_path /path/to/fold_00/SemBackbone_best_fold0.pt \
   --sem_pretrained_strict 1
 ```
 
-Pour `fusion`, il faut en plus :
-- `FusionHead_best_fold0.pth` ou `FusionHead_last_fold0.pth`,
-- le générateur finetuné,
-- le `SemBackbone` finetuné.
+For `fusion`, you also need:
+- `FusionHead_best_fold0.pth` or `FusionHead_last_fold0.pth`,
+- the fine-tuned generator,
+- the fine-tuned `SemBackbone`.
 
 ---
 
-## 7. Modes de test et d'évaluation
+## 7. Testing and evaluation modes
 
-Le point d'entrée est `test.py`.
+The entry point is `test.py`.
 
 ### 7.1 `sup_predict`
-Évaluation supervisée.
 
-Sorties typiques :
+Supervised evaluation.
+
+Typical outputs:
 - `accuracy`
 - `top1_accuracy`
 - `precision`
 - `recall`
 - `f1`
-- `confusion_matrix` si GT disponibles
-- `submission_*.csv` si split sans annotations
+- `confusion_matrix` if ground truth is available
+- `submission_*.csv` if the split has no annotations
 
-Exemple :
+Example:
 
 ```bash
 python test.py \
   --mode sup_predict \
-  --cfg /chemin/train_cfg.json \
-  --weights_dir /chemin/fold_00 \
-  --sup_ckpt /chemin/fold_00/SupHeads_best_fold0.pth \
-  --data /chemin/val \
+  --cfg /path/to/train_cfg.json \
+  --weights_dir /path/to/fold_00 \
+  --sup_ckpt /path/to/fold_00/SupHeads_best_fold0.pth \
+  --data /path/to/val \
   --feature_mode style \
   --embed_type tok6
 ```
 
 ### 7.2 `inference`
-Inférence pure, sans métriques.
 
-Ce mode produit seulement les prédictions du modèle.
-Il supporte aussi un simple dossier d'images plat via `--data`.
+Pure inference, without metrics.
 
-Exemple :
+This mode only produces model predictions.
+It also supports a simple flat folder of images through `--data`.
+
+Example:
 
 ```bash
 python test.py \
   --mode inference \
-  --cfg /chemin/train_cfg.json \
-  --weights_dir /chemin/fold_00 \
-  --sup_ckpt /chemin/fold_00/SupHeads_best_fold0.pth \
-  --data /chemin/images \
+  --cfg /path/to/train_cfg.json \
+  --weights_dir /path/to/fold_00 \
+  --sup_ckpt /path/to/fold_00/SupHeads_best_fold0.pth \
+  --data /path/to/images \
   --feature_mode style \
   --embed_type tok6 \
   --inference_save_csv
 ```
 
 ### 7.3 `backbone_camera`
-Webcam / caméra avec affichage des prédictions.
 
-Exemple :
+Webcam / camera mode with live prediction display.
+
+Example:
 
 ```bash
 python test.py \
   --mode backbone_camera \
-  --cfg /chemin/train_cfg.json \
-  --weights_dir /chemin/fold_00 \
-  --sup_ckpt /chemin/fold_00/SupHeads_best_fold0.pth \
+  --cfg /path/to/train_cfg.json \
+  --weights_dir /path/to/fold_00 \
+  --sup_ckpt /path/to/fold_00/SupHeads_best_fold0.pth \
   --feature_mode fusion \
   --sup_feat_source fusion \
   --embed_type tok6 \
@@ -339,92 +351,101 @@ python test.py \
 ```
 
 ### 7.4 `tsne_interactive`
-Visualisation t-SNE des représentations.
+
+t-SNE visualization of learned representations.
 
 ### 7.5 `passe_by_metrics`
-Évaluation exploratoire avec métriques de clusters, KNN, séparabilité, etc.
+
+Exploratory evaluation with clustering metrics, KNN, separability, etc.
 
 ### 7.6 `style_transfer`
-Visualisation de transfert de style.
+
+Style transfer visualization.
 
 ### 7.7 `detect_transformer`
-Évaluation ou inférence en détection d'objets.
+
+Object detection evaluation or inference.
 
 ---
 
-## 8. Checkpoints importants à recharger
+## 8. Important checkpoints to reload
 
-### 8.1 En `sup_freeze`
-À recharger au test selon le cas :
-- toujours : `SupHeads_*.pth`
-- si `generator` : `G_A_*.pt` / `G_B_*.pt` selon le backbone utilisé
-- si `sem_resnet50` : `SemBackbone_*.pt`
-- si `fusion` :
+### 8.1 In `sup_freeze`
+
+During testing, reload the following depending on the case:
+- always: `SupHeads_*.pth`
+- if `generator`: `G_A_*.pt` / `G_B_*.pt`, depending on the backbone used
+- if `sem_resnet50`: `SemBackbone_*.pt`
+- if `fusion`:
   - `SupHeads_*.pth`
   - `FusionHead_*.pth`
   - `SemBackbone_*.pt`
   - `G_A_*.pt` / `G_B_*.pt`
 
-### 8.2 En `sup_unfreeze`
-Même logique, mais il faut impérativement recharger les extracteurs **finetunés**, pas les checkpoints de préentraînement plus anciens.
+### 8.2 In `sup_unfreeze`
+
+The same logic applies, but you must reload the **fine-tuned** feature extractors, not older pretraining checkpoints.
 
 ---
 
-## 9. Ablations recommandées
+## 9. Recommended ablations
 
-Le protocole conseillé est :
-- définir une baseline complète,
-- puis enlever un seul composant à la fois.
+The recommended protocol is:
+- define a complete baseline,
+- then remove one component at a time.
 
-Ablations prioritaires :
-- sans FFT
-- sans SWD
-- sans bloc texture complet
-- sans JEPA
-- JEPA style seul
-- JEPA contenu seul
-- sans adversarial
-- sans PatchNCE
-- sans Content-NCE
-- sans branche sémantique
-- sans reconstruction B
+Priority ablations:
+- without FFT
+- without SWD
+- without the full texture block
+- without JEPA
+- style-only JEPA
+- content-only JEPA
+- without adversarial learning
+- without PatchNCE
+- without Content-NCE
+- without the semantic branch
+- without reconstruction B
 
-La comparaison se fait ensuite sur :
+The comparison is then performed using:
 - F1
 - accuracy
 - top-1
 - precision / recall
-- métriques par tâche si multitâche
+- task-level metrics in the multi-task setting
 
 ---
 
-## 10. Dossier `scripts/`
+## 10. `scripts/` folder
 
-Le dépôt contient désormais des scripts d'exemple dans :
+The repository now contains example scripts in:
 - `scripts/train/`
 - `scripts/test/`
 - `scripts/ablations/`
 
-Chaque script est un point de départ à adapter aux chemins locaux.
+Each script is a starting point that should be adapted to your local paths.
 
 ---
 
-## 11. Scripts disponibles
+## 11. Available scripts
 
-### Entraînement
+### Training
+
 - `scripts/train/train_auto_example.sh`
 - `scripts/train/train_sup_freeze_generator.sh`
 - `scripts/train/train_sup_freeze_sem.sh`
 - `scripts/train/train_sup_freeze_fusion.sh`
 - `scripts/train/train_sup_unfreeze_fusion.sh`
 
-### Test
+### Testing
+
 - `scripts/test/test_sup_predict_imagenet_val.sh`
 - `scripts/test/test_inference_folder.sh`
 - `scripts/test/test_backbone_camera_fusion.sh`
 - `scripts/test/test_tsne_style.sh`
 
 ### Ablations
+
 - `scripts/ablations/ablation_full.sh`
 - `scripts/ablations/ablation_no_fft.sh`
 - `scripts/ablations/ablation_no_swd.sh`
@@ -439,27 +460,27 @@ Chaque script est un point de départ à adapter aux chemins locaux.
 
 ---
 
-## 12. Conseils pratiques
+## 12. Practical advice
 
-- En `sup_unfreeze`, vérifie que tu testes bien les extracteurs finetunés du dossier de fold.
-- En `fusion`, assure-toi que `FusionHead_*.pth` est bien retrouvé et chargé.
-- Pour ImageNet `val`, si les annotations XML existent, donne `--imagenet_ann_dir` ou laisse l'auto-détection fonctionner.
-- Pour les splits sans annotations, le test bascule en mode soumission CSV.
-- Pour la webcam, si OpenCV est headless, le code peut basculer vers Tkinter selon l'environnement.
+- In `sup_unfreeze`, make sure you are testing the fine-tuned extractors from the fold directory.
+- In `fusion`, make sure that `FusionHead_*.pth` is correctly found and loaded.
+- For ImageNet `val`, if XML annotations exist, provide `--imagenet_ann_dir` or let auto-detection handle it.
+- For splits without annotations, testing switches to CSV submission mode.
+- For webcam usage, if OpenCV is headless, the code may switch to Tkinter depending on the environment.
 
 ---
 
-## 13. Résumé rapide
+## 13. Quick summary
 
-- `auto` : préentraînement auto-supervisé
-- `hybrid` : auto + supervision
-- `sup_freeze` : supervision avec extracteurs gelés
-- `sup_unfreeze` : supervision end-to-end
-- `generator` : features de style
-- `sem_resnet50` : features sémantiques
-- `fusion` : style + contenu
-- `sup_predict` : évaluer
-- `inference` : prédire sans métriques
-- `backbone_camera` : webcam
+- `auto`: self-supervised pretraining
+- `hybrid`: self-supervision + supervision
+- `sup_freeze`: supervision with frozen extractors
+- `sup_unfreeze`: end-to-end supervision
+- `generator`: style features
+- `sem_resnet50`: semantic features
+- `fusion`: style + content
+- `sup_predict`: evaluation
+- `inference`: prediction without metrics
+- `backbone_camera`: webcam
 
-Ce README donne une vue d'ensemble. Pour un usage reproductible, partir des scripts du dossier `scripts/` est la méthode la plus simple.
+This README provides an overview. For reproducible usage, the simplest approach is to start from the scripts in the `scripts/` folder.
